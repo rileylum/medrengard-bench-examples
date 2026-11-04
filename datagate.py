@@ -574,13 +574,77 @@ def parse_xls(data):
     return table_from_cells(cells)
 
 
-def ingest(data, charset):
+def ingest(data, charset, with_format=False):
     fmt = detect_format(data)
     if fmt == "xlsx":
-        return parse_xlsx(data)
-    if fmt == "xls":
-        return parse_xls(data)
-    return parse_csv(decode(data, charset))
+        result = parse_xlsx(data)
+    elif fmt == "xls":
+        result = parse_xls(data)
+    else:
+        result = parse_csv(decode(data, charset))
+    if with_format:
+        return fmt, result
+    return result
+
+
+def is_missing(v):
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
+
+def column_type(values):
+    """Classify a column from its (typed) non-missing values."""
+    has_int = has_float = False
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return "text"
+        if isinstance(v, int):
+            has_int = True
+        else:
+            has_float = True
+    if has_int and has_float:
+        return "number"
+    if has_float:
+        return "float"
+    if has_int:
+        return "integer"
+    return "text"
+
+
+def compute_enrichment(fmt, columns, rows, raw):
+    """Return the enrichment metadata dict for a freshly ingested dataset."""
+    try:
+        summary = {
+            "filetype": "csv" if fmt == "csv" else "excel",
+            "row_count": len(rows),
+            "column_count": len(columns),
+        }
+        meta = {"dataset_summary": summary}
+        if fmt == "csv":
+            details = {}
+            for ci, name in enumerate(columns):
+                if name in details:
+                    continue  # duplicate header: keep first
+                typed, distinct, missing = [], set(), 0
+                for ri, row in enumerate(rows):
+                    v = row[ci] if ci < len(row) else None
+                    rv = raw[ri][ci] if ci < len(raw[ri]) else None
+                    if is_missing(v) or is_missing(rv):
+                        missing += 1
+                        continue
+                    typed.append(v)
+                    distinct.add(rv)
+                details[name] = {
+                    "type": column_type(typed),
+                    "distinct_count": len(distinct),
+                    "missing_count": missing,
+                }
+            meta["column_details"] = details
+        json.dumps(meta)  # must be serialisable for storage
+        return meta
+    except ApiError:
+        raise
+    except Exception as e:
+        raise ApiError(500, "Enrichment failed: %s" % e)
 
 
 def parse_multipart(content_type, body):
@@ -846,28 +910,35 @@ class Handler(BaseHTTPRequestHandler):
         force = forces is not None
         charset = params.get("charset", [None])[0]
         charset = validate_charset(charset) if charset is not None else None
+        # only a single, exact `enrich=yes` turns enrichment on
+        enrich = params.get("enrich") == ["yes"]
         did = dataset_id(source)
         key = (source, charset)
         response = {"ok": True, "endpoint": self.endpoint(did)}
         use_cache = CACHE_ENABLED and not force
-        if use_cache:
+
+        def cache_hit():
             with LOCK:
-                if CACHE.get(key) == did and did in DATASETS:
-                    hit = True
-                else:
-                    hit = False
-            if hit:
-                return self.send_json(200, response)
+                if CACHE.get(key) != did:
+                    return False
+                ds = DATASETS.get(did)
+                if ds is None:
+                    return False
+                # a non-enriched cached dataset cannot satisfy an enrich request
+                return not enrich or "dataset_summary" in ds
+
+        if use_cache and cache_hit():
+            return self.send_json(200, response)
         with ingest_lock(key):
-            if use_cache:
+            if use_cache and cache_hit():
                 # another request may have populated the cache meanwhile
-                with LOCK:
-                    hit = CACHE.get(key) == did and did in DATASETS
-                if hit:
-                    return self.send_json(200, response)
+                return self.send_json(200, response)
             data = fetch(source)
-            columns, rows, raw = ingest(data, charset)
-            store_dataset(did, {"columns": columns, "rows": rows, "raw": raw})
+            fmt, (columns, rows, raw) = ingest(data, charset, with_format=True)
+            ds = {"columns": columns, "rows": rows, "raw": raw}
+            if enrich:
+                ds.update(compute_enrichment(fmt, columns, rows, raw))
+            store_dataset(did, ds)
             with LOCK:
                 # the dataset id is per-source; drop entries for other charsets
                 for k in [k for k, v in CACHE.items() if v == did]:
@@ -946,6 +1017,10 @@ class Handler(BaseHTTPRequestHandler):
         if not opts["hide_total"]:
             payload["total"] = total
         payload["query_ms"] = round(elapsed, 3)
+        if isinstance(ds.get("dataset_summary"), dict):
+            payload["dataset_summary"] = ds["dataset_summary"]
+            if isinstance(ds.get("column_details"), dict):
+                payload["column_details"] = ds["column_details"]
         self.send_json(200, payload)
 
 
