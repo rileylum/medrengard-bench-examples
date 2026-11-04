@@ -11,6 +11,7 @@ import email.utils
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -30,6 +31,34 @@ csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 DATASETS = {}
 LOCK = threading.Lock()
+
+# Cache of /convert results: cache key (source, charset) -> dataset id.
+CACHE_ENABLED = True
+CACHE = {}
+INGEST_LOCKS = {}
+
+TRUE_VALUES = ("1", "true", "yes", "on")
+FALSE_VALUES = ("0", "false", "no", "off")
+
+
+def parse_bool_env(name, raw, default):
+    if raw is None:
+        return default
+    v = raw.lower()
+    if v in TRUE_VALUES:
+        return True
+    if v in FALSE_VALUES:
+        return False
+    raise ValueError("Invalid value for %s: %r (expected one of %s)"
+                     % (name, raw, ", ".join(TRUE_VALUES + FALSE_VALUES)))
+
+
+def ingest_lock(key):
+    with LOCK:
+        lk = INGEST_LOCKS.get(key)
+        if lk is None:
+            lk = INGEST_LOCKS[key] = threading.Lock()
+        return lk
 
 
 class ApiError(Exception):
@@ -583,14 +612,41 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Missing required parameter: source")
         source = sources[0]
         validate_url(source)
+        forces = params.get("force")
+        if forces is not None and len(forces) > 1:
+            raise ApiError(400, "Parameter force may only be given once")
+        force = forces is not None
         charset = params.get("charset", [None])[0]
         charset = validate_charset(charset) if charset is not None else None
-        data = fetch(source)
-        columns, rows, raw = ingest(data, charset)
         did = dataset_id(source)
-        with LOCK:
-            DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw}
-        self.send_json(200, {"ok": True, "endpoint": "/datasets/%s" % did})
+        key = (source, charset)
+        response = {"ok": True, "endpoint": "/datasets/%s" % did}
+        use_cache = CACHE_ENABLED and not force
+        if use_cache:
+            with LOCK:
+                if CACHE.get(key) == did and did in DATASETS:
+                    hit = True
+                else:
+                    hit = False
+            if hit:
+                return self.send_json(200, response)
+        with ingest_lock(key):
+            if use_cache:
+                # another request may have populated the cache meanwhile
+                with LOCK:
+                    hit = CACHE.get(key) == did and did in DATASETS
+                if hit:
+                    return self.send_json(200, response)
+            data = fetch(source)
+            columns, rows, raw = ingest(data, charset)
+            with LOCK:
+                DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw}
+                # the dataset id is per-source; drop entries for other charsets
+                for k in [k for k, v in CACHE.items() if v == did]:
+                    del CACHE[k]
+                if CACHE_ENABLED:
+                    CACHE[key] = did
+        self.send_json(200, response)
 
     def query(self, did, params, start):
         with LOCK:
@@ -830,6 +886,12 @@ def main(argv=None):
     start.add_argument("--address", default="127.0.0.1")
     args = parser.parse_args(argv)
     if args.command == "start":
+        global CACHE_ENABLED
+        try:
+            CACHE_ENABLED = parse_bool_env("CACHE_ENABLED", os.environ.get("CACHE_ENABLED"), True)
+        except ValueError as e:
+            print("datagate: %s" % e, file=sys.stderr, flush=True)
+            sys.exit(2)
         ThreadingHTTPServer.daemon_threads = True
         ThreadingHTTPServer.allow_reuse_address = True
         server = ThreadingHTTPServer((args.address, args.port), Handler)
