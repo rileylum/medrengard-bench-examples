@@ -13,6 +13,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from textdrop_markdown import render_markdown
+
 ALPHABET = string.ascii_letters + string.digits
 ID_LENGTH = 8
 NOTE_RE = re.compile(r"^/n/([A-Za-z0-9]{4,12})$")
@@ -25,15 +27,20 @@ class NoteStore:
         self._notes = {}
         self._lock = threading.Lock()
 
-    def add(self, content):
+    def add(self, content, mode=""):
         with self._lock:
             while True:
                 nid = "".join(secrets.choice(ALPHABET) for _ in range(ID_LENGTH))
                 if nid not in self._notes:
-                    self._notes[nid] = content
+                    self._notes[nid] = (content, mode)
                     return nid
 
     def get(self, nid):
+        with self._lock:
+            entry = self._notes.get(nid)
+            return entry[0] if entry else None
+
+    def get_entry(self, nid):
         with self._lock:
             return self._notes.get(nid)
 
@@ -67,7 +74,9 @@ EDITOR_PAGE = page(
     '<form method="post" action="/submit" enctype="application/x-www-form-urlencoded">\n'
     '<p><label for="content">Text</label></p>\n'
     '<textarea id="content" name="content" required></textarea>\n'
-    '<input type="hidden" name="mode" value="">\n'
+    '<p><label for="mode">Format</label> <select id="mode" name="mode">'
+    '<option value="">Plain text</option><option value="markdown">Markdown</option>'
+    '</select></p>\n'
     '<p><button type="submit">Submit</button></p>\n'
     "</form>",
 )
@@ -79,6 +88,15 @@ def error_page(code, title, message):
         f"<h1>{code} {html.escape(title)}</h1>\n<p>{html.escape(message)}</p>\n"
         '<p><a href="/">Back to editor</a></p>',
     )
+
+
+def _valid_utf8(s):
+    """Reject strings containing lone surrogates (e.g. from JSON \\ud800 escapes)."""
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -140,15 +158,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, body, "application/json")
         m = NOTE_RE.match(path)
         if m:
-            content = STORE.get(m.group(1))
-            if content is None:
+            entry = STORE.get_entry(m.group(1))
+            if entry is None:
                 return self._error(404, "Not Found", "That note does not exist.")
+            content, mode = entry
             nid = m.group(1)
-            body = (
-                f"<h1>Note {html.escape(nid)}</h1>\n"
-                f'<p><a href="/n/{nid}/text">Raw text</a> | <a href="/">New note</a></p>\n'
-                f"<pre><code>{html.escape(content, quote=True)}</code></pre>"
-            )
+            if mode == "markdown":
+                body = (
+                    f'<nav><p><strong>Note {html.escape(nid)}</strong> | '
+                    f'<a href="/n/{nid}/text">Raw text</a> | <a href="/">New note</a></p></nav>\n'
+                    f'<article class="markdown">\n{render_markdown(content)}\n</article>'
+                )
+            else:
+                body = (
+                    f"<h1>Note {html.escape(nid)}</h1>\n"
+                    f'<p><a href="/n/{nid}/text">Raw text</a> | <a href="/">New note</a></p>\n'
+                    f"<pre><code>{html.escape(content, quote=True)}</code></pre>"
+                )
             return self._html(200, page(f"Note {nid}", body))
         m = NOTE_TEXT_RE.match(path)
         if m:
@@ -185,19 +211,51 @@ class Handler(BaseHTTPRequestHandler):
         if raw is None:
             self.close_connection = True
             return self._error(413, "Payload Too Large", "The submitted text is too large.")
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype not in ("application/x-www-form-urlencoded", "application/json"):
+            return self._error(400, "Bad Request",
+                               "Unsupported Content-Type. Submit form data or JSON.")
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             return self._error(400, "Bad Request", "The submission is not valid UTF-8.")
-        fields = parse_qs(text, keep_blank_values=True, encoding="utf-8", errors="replace")
-        mode = fields.get("mode", [""])[0]
-        if mode != "":
+        if ctype == "application/json":
+            try:
+                data = json.loads(text) if text.strip() else None
+            except ValueError:
+                return self._error(400, "Bad Request", "The submission is not valid JSON.")
+            if not isinstance(data, dict):
+                return self._error(400, "Bad Request",
+                                   "The JSON submission must be an object.")
+            content = data.get("body", "")
+            mode = data.get("mode", "")
+            if content is None:
+                content = ""
+            if mode is None:
+                mode = ""
+            if not isinstance(content, str):
+                return self._error(400, "Bad Request", "The body field must be a string.")
+            if not isinstance(mode, str):
+                return self._error(400, "Bad Request", "Unsupported rendering mode.")
+        else:
+            try:
+                fields = parse_qs(text, keep_blank_values=True, encoding="utf-8",
+                                  errors="strict")
+            except UnicodeDecodeError:
+                return self._error(400, "Bad Request", "The submission is not valid UTF-8.")
+            mode = fields.get("mode", [""])[0]
+            if "content" in fields:
+                content = fields["content"][0]
+            else:
+                content = fields.get("body", [""])[0]
+        if not _valid_utf8(content) or not _valid_utf8(mode):
+            return self._error(400, "Bad Request", "The submission is not valid UTF-8.")
+        if mode not in ("", "markdown"):
             return self._error(400, "Bad Request",
-                               "Unsupported rendering mode. Leave mode empty for plain text.")
-        content = fields.get("content", [""])[0]
+                               "Unsupported rendering mode. Use plain text or markdown.")
         if not content.strip():
             return self._error(400, "Bad Request", "Content must not be empty.")
-        nid = STORE.add(content)
+        nid = STORE.add(content, mode)
         loc = f"/n/{nid}"
         self._html(302, page("Redirecting", f'<p>Redirecting to <a href="{loc}">{loc}</a>.</p>'),
                    {"Location": loc})
