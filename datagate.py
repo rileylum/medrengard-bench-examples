@@ -241,16 +241,96 @@ def handle_convert(params):
     return 200, {"ok": True, "endpoint": "/datasets/%s" % did}
 
 
-def handle_dataset(did):
+CONTROL_PARAMS = ("_size", "_offset", "_shape", "_sort", "_sort_desc", "_rowid", "_total")
+UINT_RE = re.compile(r"^[0-9]+$")
+
+
+def _sort_key(v):
+    if isinstance(v, bool):
+        return (0, int(v), "")
+    if isinstance(v, (int, float)):
+        return (0, v, "")
+    if v is None:
+        return (-1, 0, "")
+    return (1, 0, str(v))
+
+
+def handle_dataset(did, multi=None):
     start = time.perf_counter()
+    multi = multi or {}
     with LOCK:
         ds = DATASETS.get(did)
     if ds is None:
         raise ApiError(404, "Dataset not found")
-    rows = ds["rows"][:ROW_LIMIT]
+    columns = list(ds["columns"])
+
+    for name in CONTROL_PARAMS:
+        if len(multi.get(name, [])) > 1:
+            raise ApiError(400, "Parameter %s may only be specified once" % name)
+    ctl = {k: multi[k][0] for k in CONTROL_PARAMS if k in multi}
+
+    size = ROW_LIMIT
+    if "_size" in ctl:
+        v = ctl["_size"]
+        if not UINT_RE.match(v) or int(v) <= 0:
+            raise ApiError(400, "_size must be a positive integer")
+        size = int(v)
+    offset = 0
+    if "_offset" in ctl:
+        v = ctl["_offset"]
+        if not UINT_RE.match(v):
+            raise ApiError(400, "_offset must be a non-negative integer")
+        offset = int(v)
+    shape = ctl.get("_shape", "lists")
+    if shape not in ("lists", "objects"):
+        raise ApiError(400, "_shape must be 'lists' or 'objects'")
+    for name in ("_rowid", "_total"):
+        if name in ctl and ctl[name] != "hide":
+            raise ApiError(400, "%s only accepts the value 'hide'" % name)
+
+    sort_col = None
+    desc = False
+    for name in ("_sort", "_sort_desc"):
+        if name in ctl:
+            v = ctl[name]
+            if v == "":
+                raise ApiError(400, "%s requires a column name" % name)
+            if v not in columns:
+                raise ApiError(400, "Unknown column for %s: %s" % (name, v))
+    if "_sort_desc" in ctl:
+        sort_col, desc = ctl["_sort_desc"], True
+    elif "_sort" in ctl:
+        sort_col = ctl["_sort"]
+
+    indexed = list(enumerate(ds["rows"], start=1))
+    if sort_col is not None:
+        ci = columns.index(sort_col)
+        indexed.sort(key=lambda t: _sort_key(t[1][ci] if ci < len(t[1]) else None),
+                     reverse=desc)
+    total = len(indexed)
+    page = indexed[offset:offset + size]
+
+    show_rowid = ctl.get("_rowid") != "hide"
+    if shape == "objects":
+        rows = []
+        for rowid, r in page:
+            obj = {}
+            if show_rowid:
+                obj["rowid"] = rowid
+            for i, c in enumerate(columns):
+                if show_rowid and c == "rowid":
+                    continue
+                obj[c] = r[i] if i < len(r) else None
+            rows.append(obj)
+    else:
+        rows = [list(r) for _, r in page]
+
     elapsed = max(0.0, (time.perf_counter() - start) * 1000.0)
-    return 200, {"ok": True, "columns": list(ds["columns"]), "rows": rows,
-                 "query_ms": round(elapsed, 3)}
+    out = {"ok": True, "columns": columns, "rows": rows}
+    if ctl.get("_total") != "hide":
+        out["total"] = total
+    out["query_ms"] = round(elapsed, 3)
+    return 200, out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -282,13 +362,15 @@ class Handler(BaseHTTPRequestHandler):
         if len(path) > 1:
             path = path.rstrip("/")
         params = {}
+        multi = {}
         for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
             params.setdefault(k, v)
+            multi.setdefault(k, []).append(v)
         if path == "/convert":
             return handle_convert(params)
         m = re.match(r"^/datasets/([^/]+)$", path)
         if m:
-            return handle_dataset(urllib.parse.unquote(m.group(1)))
+            return handle_dataset(urllib.parse.unquote(m.group(1)), multi)
         raise ApiError(404, "Not found")
 
     def _handle(self, body=True):
