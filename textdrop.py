@@ -18,39 +18,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from textdrop_markdown import render_document
+from textdrop_storage import (NoteStore, StorageError, StoreConfigError,
+                              format_timestamp, open_store)
 
 ALPHABET = string.ascii_letters + string.digits
 ID_LENGTH = 8
 NOTE_RE = re.compile(r"^/n/([A-Za-z0-9]{4,12})$")
 NOTE_TEXT_RE = re.compile(r"^/n/([A-Za-z0-9]{4,12})/text$")
 MAX_BODY = 10 * 1024 * 1024
-
-
-class NoteStore:
-    def __init__(self):
-        self._notes = {}
-        self._lock = threading.Lock()
-
-    def add(self, content, mode="", user=None):
-        with self._lock:
-            while True:
-                nid = _make_id(content, user)
-                if nid not in self._notes:
-                    self._notes[nid] = (content, mode)
-                    return nid
-
-    def get(self, nid):
-        with self._lock:
-            entry = self._notes.get(nid)
-            return entry[0] if entry else None
-
-    def get_entry(self, nid):
-        with self._lock:
-            return self._notes.get(nid)
-
-    def count(self):
-        with self._lock:
-            return len(self._notes)
 
 
 def _make_id(content, user=None):
@@ -69,7 +44,7 @@ def _make_id(content, user=None):
     return "".join(out)
 
 
-STORE = NoteStore()
+STORE = None  # configured in main()
 START_TIME = time.time()
 
 
@@ -342,7 +317,7 @@ def _valid_utf8(s):
     return True
 
 
-def render_note_page(content, mode, nid=None):
+def render_note_page(content, mode, nid=None, created_at=None):
     """Render a full HTML page for content. nid=None means ephemeral preview."""
     if mode == "markdown":
         rendered, title, preview = render_document(content)
@@ -353,6 +328,10 @@ def render_note_page(content, mode, nid=None):
     if nid is not None:
         links = (f'<a href="/n/{nid}/text">Raw text</a> | <a href="/">New note</a>')
         label = f"Note {html.escape(nid)}"
+        stamp = format_timestamp(created_at) or (created_at or "")
+        if stamp:
+            ts = html.escape(stamp, quote=True)
+            links += f' | Created <time datetime="{ts}">{ts}</time>'
     else:
         links = '<a href="/">New note</a>'
         label = "Preview"
@@ -405,6 +384,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _error(self, code, title, message, headers=None):
         self._html(code, error_page(code, title, message), headers)
+
+    def _storage_error(self, exc):
+        sys.stderr.write(f"storage error: {exc}\n")
+        self._error(500, "Internal Server Error",
+                    "The note storage backend failed. Please try again later.")
 
     def _not_found(self):
         self._error(404, "Not Found", "The page you requested does not exist.")
@@ -467,14 +451,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._html(200, render_doc_page(doc))
         m = NOTE_RE.match(path)
         if m:
-            entry = STORE.get_entry(m.group(1))
+            try:
+                entry = STORE.get_entry(m.group(1))
+            except StorageError as exc:
+                return self._storage_error(exc)
             if entry is None:
                 return self._error(404, "Not Found", "That note does not exist.")
-            content, mode = entry
-            return self._html(200, render_note_page(content, mode, m.group(1)))
+            content, mode, created_at = entry
+            return self._html(200, render_note_page(content, mode, m.group(1), created_at))
         m = NOTE_TEXT_RE.match(path)
         if m:
-            content = STORE.get(m.group(1))
+            try:
+                content = STORE.get(m.group(1))
+            except StorageError as exc:
+                return self._storage_error(exc)
             if content is None:
                 return self._error(404, "Not Found", "That note does not exist.")
             return self._send(200, content, "text/plain; charset=utf-8")
@@ -534,7 +524,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/render":
             return self._html(200, render_note_page(content, mode, None))
         token, is_new = self._user_token()
-        nid = STORE.add(content, mode, token)
+        try:
+            nid = STORE.add(content, mode, token)
+        except StorageError as exc:
+            return self._storage_error(exc)
         loc = f"/n/{nid}"
         headers = {"Location": loc}
         if token is not None and is_new:
@@ -617,7 +610,23 @@ def main(argv=None):
                         help="bearer token for /_ops/drain (env: TEXTDROP_OPS_SECRET)")
     parser.add_argument("--id_seed", "--id-seed", dest="id_seed", default=None,
                         help="seed for user identity tokens (env: TEXTDROP_ID_SEED)")
+    parser.add_argument("--store", default=None,
+                        help="storage backend as <type>:<config>, e.g. local:./data or "
+                             "object:{json} (env: TEXTDROP_STORE, default: local:./)")
     args = parser.parse_args(argv)
+
+    if args.store is not None:
+        spec = args.store
+    else:
+        spec = os.environ.get("TEXTDROP_STORE") or "local:./"
+    global STORE
+    try:
+        backend = open_store(spec)
+    except StoreConfigError as exc:
+        sys.stderr.write(f"textdrop: storage configuration error: {exc}\n")
+        sys.stderr.flush()
+        sys.exit(2)
+    STORE = NoteStore(backend, _make_id)
 
     OPS.ops_secret = (args.ops_secret if args.ops_secret is not None
                       else os.environ.get("TEXTDROP_OPS_SECRET", ""))
