@@ -206,13 +206,15 @@ def parse_csv(text):
     if matching * 2 < len(data_rows):
         raise ApiError(400, "Content is not tabular: inconsistent column counts")
     out = []
+    raw = []
     for r in data_rows:
         if len(r) < n:
             r = r + [""] * (n - len(r))
         elif len(r) > n:
             r = r[:n]
+        raw.append(list(r))
         out.append([convert_value(c) for c in r])
-    return header, out
+    return header, out, raw
 
 
 def handle_convert(params):
@@ -234,11 +236,87 @@ def handle_convert(params):
             raise ApiError(400, "Content cannot be decoded with charset %s" % charset)
     else:
         text = detect_and_decode(data)
-    columns, rows = parse_csv(text)
+    columns, rows, raw = parse_csv(text)
     did = dataset_id(source)
     with LOCK:
-        DATASETS[did] = {"columns": columns, "rows": rows, "source": source}
+        DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw, "source": source}
     return 200, {"ok": True, "endpoint": "/datasets/%s" % did}
+
+
+COMPARATORS = ("exact", "contains", "less", "greater")
+QUERY_TIMEOUT = 5.0
+
+
+def _parse_number(s):
+    if not isinstance(s, str):
+        s = str(s)
+    try:
+        f = float(s)
+    except (ValueError, OverflowError):
+        return None
+    if f != f:
+        return None
+    return f
+
+
+def parse_filters(multi, columns):
+    """Return list of (column_index, comparator, value) from query params."""
+    filters = []
+    for key, values in multi.items():
+        if key.startswith("_") or "__" not in key:
+            continue
+        col, comp = key.rsplit("__", 1)
+        if comp not in COMPARATORS:
+            raise ApiError(400, "Invalid comparator '%s' for parameter %s; expected one of: %s"
+                           % (comp, key, ", ".join(COMPARATORS)))
+        if col not in columns:
+            raise ApiError(400, "Unknown filter column: %s" % col)
+        if len(values) > 1:
+            raise ApiError(400, "Duplicate filter parameter: %s" % key)
+        value = values[0]
+        if comp in ("less", "greater"):
+            num = _parse_number(value)
+            if num is None:
+                raise ApiError(400, "Filter %s requires a numeric value, got '%s'" % (key, value))
+            value = num
+        filters.append((columns.index(col), comp, value))
+    return filters
+
+
+def _match(cell, comp, value):
+    if cell is None:
+        return False
+    if comp == "exact":
+        return cell == value
+    if comp == "contains":
+        return value in cell
+    num = _parse_number(cell)
+    if num is None:
+        return False
+    if comp == "less":
+        return num < value
+    return num > value
+
+
+def apply_filters(indexed, raw_rows, filters, deadline):
+    if not filters:
+        return indexed
+    out = []
+    for n, (rowid, row) in enumerate(indexed):
+        if n % 1024 == 0 and time.perf_counter() > deadline:
+            raise ApiError(400, "Query timeout")
+        raw = raw_rows[rowid - 1]
+        ok = True
+        for ci, comp, value in filters:
+            cell = raw[ci] if ci < len(raw) else None
+            if not _match(cell, comp, value):
+                ok = False
+                break
+        if ok:
+            out.append((rowid, row))
+    if time.perf_counter() > deadline:
+        raise ApiError(400, "Query timeout")
+    return out
 
 
 CONTROL_PARAMS = ("_size", "_offset", "_shape", "_sort", "_sort_desc", "_rowid", "_total")
@@ -302,7 +380,12 @@ def handle_dataset(did, multi=None):
     elif "_sort" in ctl:
         sort_col = ctl["_sort"]
 
+    filters = parse_filters(multi, columns)
     indexed = list(enumerate(ds["rows"], start=1))
+    raw_rows = ds.get("raw")
+    if raw_rows is None:
+        raw_rows = [["" if v is None else str(v) for v in r] for r in ds["rows"]]
+    indexed = apply_filters(indexed, raw_rows, filters, start + QUERY_TIMEOUT)
     if sort_col is not None:
         ci = columns.index(sort_col)
         indexed.sort(key=lambda t: _sort_key(t[1][ci] if ci < len(t[1]) else None),
