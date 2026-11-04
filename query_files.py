@@ -1,0 +1,1180 @@
+#!/usr/bin/env python3
+"""Run read-only SQL queries over a directory of CSV files.
+
+Usage:
+    python query_files.py --data <dir> --sql <query or path> [--out <file.csv>]
+"""
+import argparse
+import csv
+import functools
+import os
+import re
+import sys
+from decimal import Decimal, InvalidOperation
+
+
+class QueryError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# Values / typing helpers
+# --------------------------------------------------------------------------
+
+INT_RE = re.compile(r'^[+-]?(0|[1-9]\d*)$')
+DEC_RE = re.compile(r'^[+-]?((0|[1-9]\d*)(\.\d+)?|\.\d+)$')
+
+
+def is_num(v):
+    return isinstance(v, (int, Decimal)) and not isinstance(v, bool)
+
+
+def to_number(s):
+    """Parse a string to int/Decimal, or return None if not numeric."""
+    if is_num(s):
+        return s
+    if not isinstance(s, str):
+        return None
+    t = s.strip()
+    if INT_RE.match(t):
+        return int(t)
+    if DEC_RE.match(t):
+        try:
+            return Decimal(t)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def cmp_values(a, b):
+    """Compare two non-null values; returns -1, 0, 1."""
+    if is_num(a) and is_num(b):
+        return (a > b) - (a < b)
+    if is_num(a) and isinstance(b, str):
+        nb = to_number(b)
+        if nb is not None:
+            return (a > nb) - (a < nb)
+        return -1  # numbers sort before strings
+    if isinstance(a, str) and is_num(b):
+        na = to_number(a)
+        if na is not None:
+            return (na > b) - (na < b)
+        return 1
+    sa, sb = str(a), str(b)
+    return (sa > sb) - (sa < sb)
+
+
+def hash_key(v):
+    """Normalise a value for hash-based equality (joins, grouping)."""
+    if isinstance(v, str):
+        n = to_number(v)
+        if n is not None:
+            return n
+    return v
+
+
+def fmt_value(v, null='NULL'):
+    if v is None:
+        return null
+    if isinstance(v, Decimal):
+        return format(v, 'f')
+    return str(v)
+
+
+# --------------------------------------------------------------------------
+# Tokenizer
+# --------------------------------------------------------------------------
+
+class Tok:
+    __slots__ = ('kind', 'value', 'start', 'end')
+
+    def __init__(self, kind, value, start, end):
+        self.kind, self.value, self.start, self.end = kind, value, start, end
+
+    def __repr__(self):
+        return 'Tok(%s,%r)' % (self.kind, self.value)
+
+
+def tokenize(sql):
+    toks = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c.isspace():
+            i += 1
+            continue
+        if sql.startswith('--', i):
+            j = sql.find('\n', i)
+            i = n if j < 0 else j + 1
+            continue
+        if sql.startswith('/*', i):
+            j = sql.find('*/', i + 2)
+            if j < 0:
+                raise QueryError('Unterminated comment')
+            i = j + 2
+            continue
+        if c == "'":
+            j = i + 1
+            buf = []
+            while True:
+                if j >= n:
+                    raise QueryError('Unterminated string literal')
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        buf.append("'")
+                        j += 2
+                        continue
+                    break
+                buf.append(sql[j])
+                j += 1
+            toks.append(Tok('STRING', ''.join(buf), i, j + 1))
+            i = j + 1
+            continue
+        if c in '"`[':
+            close = {'"': '"', '`': '`', '[': ']'}[c]
+            j = i + 1
+            buf = []
+            while True:
+                if j >= n:
+                    raise QueryError('Unterminated quoted identifier')
+                if sql[j] == close:
+                    if j + 1 < n and sql[j + 1] == close and close != ']':
+                        buf.append(close)
+                        j += 2
+                        continue
+                    break
+                buf.append(sql[j])
+                j += 1
+            toks.append(Tok('QIDENT', ''.join(buf), i, j + 1))
+            i = j + 1
+            continue
+        if c.isdigit() or (c == '.' and i + 1 < n and sql[i + 1].isdigit()
+                           and (not toks or toks[-1].kind not in ('IDENT', 'QIDENT'))):
+            m = re.compile(r'(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?').match(sql, i)
+            text = m.group(0)
+            j = m.end()
+            if j < n and (sql[j].isalpha() or sql[j] == '_'):
+                # identifier starting with digits (e.g. 2020_sales)
+                m2 = re.compile(r'[A-Za-z0-9_$]+').match(sql, i)
+                toks.append(Tok('IDENT', m2.group(0), i, m2.end()))
+                i = m2.end()
+                continue
+            if INT_RE.match(text) or re.match(r'^\d+$', text):
+                val = int(text)
+            else:
+                val = Decimal(text)
+            toks.append(Tok('NUMBER', val, i, j))
+            i = j
+            continue
+        if c.isalpha() or c == '_':
+            m = re.compile(r'[A-Za-z0-9_$]+', re.UNICODE).match(sql, i)
+            j = m.end()
+            while j < n and (sql[j].isalnum() or sql[j] == '_'):
+                j += 1
+            toks.append(Tok('IDENT', sql[i:j], i, j))
+            i = j
+            continue
+        two = sql[i:i + 2]
+        if two in ('!=', '<>', '<=', '>=', '=='):
+            toks.append(Tok('OP', {'<>': '!=', '==': '='}.get(two, two), i, i + 2))
+            i += 2
+            continue
+        if c in '=<>(),.*;+-':
+            toks.append(Tok('OP', c, i, i + 1))
+            i += 1
+            continue
+        raise QueryError('Unexpected character %r at position %d' % (c, i))
+    toks.append(Tok('EOF', None, n, n))
+    return toks
+
+
+# --------------------------------------------------------------------------
+# Parser
+# --------------------------------------------------------------------------
+
+RESERVED = {
+    'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'HAVING', 'ORDER', 'LIMIT',
+    'OFFSET', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'ON', 'AS',
+    'AND', 'OR', 'NOT', 'LIKE', 'IS', 'NULL', 'ASC', 'DESC', 'DISTINCT',
+    'CROSS', 'IN', 'UNION', 'ILIKE',
+}
+AGGREGATES = {'COUNT', 'SUM', 'MIN', 'MAX'}
+
+
+class Parser:
+    def __init__(self, sql):
+        self.sql = sql
+        self.toks = tokenize(sql)
+        self.pos = 0
+
+    # helpers
+    def peek(self, k=0):
+        return self.toks[min(self.pos + k, len(self.toks) - 1)]
+
+    def next(self):
+        t = self.toks[self.pos]
+        self.pos += 1
+        return t
+
+    def is_kw(self, kw, k=0):
+        t = self.peek(k)
+        return t.kind == 'IDENT' and t.value.upper() == kw
+
+    def accept_kw(self, *kws):
+        if self.peek().kind == 'IDENT' and self.peek().value.upper() in kws:
+            return self.next().value.upper()
+        return None
+
+    def expect_kw(self, kw):
+        if not self.accept_kw(kw):
+            raise QueryError('Expected %s near %s' % (kw, self.where()))
+
+    def is_op(self, op, k=0):
+        t = self.peek(k)
+        return t.kind == 'OP' and t.value == op
+
+    def accept_op(self, op):
+        if self.is_op(op):
+            return self.next()
+        return None
+
+    def expect_op(self, op):
+        if not self.accept_op(op):
+            raise QueryError("Expected '%s' near %s" % (op, self.where()))
+
+    def where(self):
+        t = self.peek()
+        if t.kind == 'EOF':
+            return 'end of query'
+        return repr(self.sql[t.start:t.start + 30])
+
+    def ident(self):
+        t = self.peek()
+        if t.kind == 'QIDENT':
+            self.next()
+            return t.value
+        if t.kind == 'IDENT' and t.value.upper() not in RESERVED:
+            self.next()
+            return t.value
+        raise QueryError('Expected identifier near %s' % self.where())
+
+    # grammar
+    def parse(self):
+        q = self.parse_select()
+        while self.accept_op(';'):
+            pass
+        if self.peek().kind != 'EOF':
+            raise QueryError('Unexpected input near %s' % self.where())
+        return q
+
+    def parse_select(self):
+        self.expect_kw('SELECT')
+        q = {'distinct': False, 'items': [], 'from': None, 'joins': [],
+             'where': None, 'group_by': [], 'having': None, 'order_by': [],
+             'limit': None, 'offset': None}
+        if self.accept_kw('DISTINCT'):
+            q['distinct'] = True
+        else:
+            self.accept_kw('ALL')
+        while True:
+            q['items'].append(self.parse_select_item())
+            if not self.accept_op(','):
+                break
+        self.expect_kw('FROM')
+        q['from'] = self.parse_table_ref()
+        while True:
+            jt = None
+            if self.accept_kw('INNER'):
+                jt = 'INNER'
+            elif self.is_kw('LEFT') or self.is_kw('RIGHT') or self.is_kw('FULL'):
+                jt = self.next().value.upper()
+                self.accept_kw('OUTER')
+            elif self.is_kw('CROSS'):
+                self.next()
+                jt = 'CROSS'
+            elif self.is_kw('JOIN'):
+                jt = 'INNER'
+            if jt is None:
+                break
+            self.expect_kw('JOIN')
+            tref = self.parse_table_ref()
+            on = None
+            if jt != 'CROSS':
+                self.expect_kw('ON')
+                on = self.parse_expr()
+            q['joins'].append((jt, tref, on))
+        if self.accept_kw('WHERE'):
+            q['where'] = self.parse_expr()
+        if self.accept_kw('GROUP'):
+            self.expect_kw('BY')
+            while True:
+                q['group_by'].append(self.parse_expr())
+                if not self.accept_op(','):
+                    break
+        if self.accept_kw('HAVING'):
+            q['having'] = self.parse_expr()
+        if self.accept_kw('ORDER'):
+            self.expect_kw('BY')
+            while True:
+                e = self.parse_expr()
+                desc = False
+                d = self.accept_kw('ASC', 'DESC')
+                if d == 'DESC':
+                    desc = True
+                nulls_first = None
+                if self.accept_kw('NULLS'):
+                    w = self.accept_kw('FIRST', 'LAST')
+                    if not w:
+                        raise QueryError('Expected FIRST or LAST after NULLS')
+                    nulls_first = (w == 'FIRST')
+                q['order_by'].append((e, desc, nulls_first))
+                if not self.accept_op(','):
+                    break
+        for _ in range(2):
+            if q['limit'] is None and self.accept_kw('LIMIT'):
+                q['limit'] = self.parse_nonneg_int('LIMIT')
+            elif q['offset'] is None and self.accept_kw('OFFSET'):
+                q['offset'] = self.parse_nonneg_int('OFFSET')
+                self.accept_kw('ROWS') or self.accept_kw('ROW')
+        return q
+
+    def parse_nonneg_int(self, what):
+        t = self.next()
+        if t.kind != 'NUMBER' or not isinstance(t.value, int) or t.value < 0:
+            raise QueryError('%s requires a non-negative integer' % what)
+        return t.value
+
+    def parse_select_item(self):
+        start = self.peek().start
+        if self.is_op('*'):
+            self.next()
+            return {'star': True, 'qual': None}
+        # qualified star: a.b.*
+        k = 0
+        parts = []
+        while self.peek(k).kind in ('IDENT', 'QIDENT') and self.is_op('.', k + 1):
+            parts.append(self.peek(k).value)
+            k += 2
+        if parts and self.is_op('*', k):
+            self.pos += k + 1
+            return {'star': True, 'qual': '.'.join(parts)}
+        e = self.parse_expr()
+        end = self.toks[self.pos - 1].end
+        alias = None
+        if self.accept_kw('AS'):
+            t = self.peek()
+            if t.kind == 'STRING':
+                self.next()
+                alias = t.value
+            else:
+                alias = self.ident()
+        elif self.peek().kind == 'QIDENT' or (
+                self.peek().kind == 'IDENT' and self.peek().value.upper() not in RESERVED):
+            alias = self.ident()
+        return {'star': False, 'expr': e, 'alias': alias,
+                'text': self.sql[start:end]}
+
+    def parse_table_ref(self):
+        parts = [self.ident()]
+        while self.accept_op('.'):
+            parts.append(self.ident())
+        alias = None
+        if self.accept_kw('AS'):
+            alias = self.ident()
+        elif self.peek().kind == 'QIDENT' or (
+                self.peek().kind == 'IDENT' and self.peek().value.upper() not in RESERVED):
+            alias = self.ident()
+        return {'name': '.'.join(parts), 'alias': alias}
+
+    # expressions
+    def parse_expr(self):
+        return self.parse_or()
+
+    def parse_or(self):
+        left = self.parse_and()
+        while self.accept_kw('OR'):
+            left = ('or', left, self.parse_and())
+        return left
+
+    def parse_and(self):
+        left = self.parse_not()
+        while self.accept_kw('AND'):
+            left = ('and', left, self.parse_not())
+        return left
+
+    def parse_not(self):
+        if self.accept_kw('NOT'):
+            return ('not', self.parse_not())
+        return self.parse_cmp()
+
+    def parse_cmp(self):
+        left = self.parse_primary()
+        t = self.peek()
+        if t.kind == 'OP' and t.value in ('=', '!=', '<', '<=', '>', '>='):
+            self.next()
+            return ('cmp', t.value, left, self.parse_primary())
+        neg = False
+        if self.is_kw('NOT') and (self.is_kw('LIKE', 1) or self.is_kw('ILIKE', 1)
+                                  or self.is_kw('IN', 1)):
+            self.next()
+            neg = True
+        kw = self.accept_kw('LIKE', 'ILIKE')
+        if kw:
+            return ('like', left, self.parse_primary(), neg, kw == 'ILIKE')
+        if self.accept_kw('IN'):
+            self.expect_op('(')
+            items = [self.parse_primary()]
+            while self.accept_op(','):
+                items.append(self.parse_primary())
+            self.expect_op(')')
+            return ('in', left, items, neg)
+        if self.accept_kw('IS'):
+            n = bool(self.accept_kw('NOT'))
+            self.expect_kw('NULL')
+            return ('isnull', left, n)
+        return left
+
+    def parse_primary(self):
+        t = self.peek()
+        if t.kind == 'OP' and t.value == '(':
+            self.next()
+            e = self.parse_expr()
+            self.expect_op(')')
+            return e
+        if t.kind == 'OP' and t.value in ('-', '+'):
+            self.next()
+            n = self.next()
+            if n.kind != 'NUMBER':
+                raise QueryError('Expected number after sign')
+            return ('lit', -n.value if t.value == '-' else n.value)
+        if t.kind == 'NUMBER':
+            self.next()
+            return ('lit', t.value)
+        if t.kind == 'STRING':
+            self.next()
+            return ('lit', t.value)
+        if t.kind == 'IDENT' and t.value.upper() == 'NULL':
+            self.next()
+            return ('lit', None)
+        if t.kind == 'IDENT' and t.value.upper() in ('TRUE', 'FALSE') \
+                and not self.is_op('.', 1):
+            self.next()
+            return ('lit', t.value.upper() == 'TRUE')
+        if t.kind == 'IDENT' and self.is_op('(', 1):
+            name = t.value.upper()
+            if name not in AGGREGATES:
+                raise QueryError('Unsupported function: %s' % t.value)
+            self.next()
+            self.next()
+            distinct = bool(self.accept_kw('DISTINCT'))
+            if self.is_op('*'):
+                if name != 'COUNT' or distinct:
+                    raise QueryError('%s(*) is not supported' % name)
+                self.next()
+                arg = '*'
+            else:
+                arg = self.parse_expr()
+            self.expect_op(')')
+            return ('agg', name, arg, distinct)
+        if t.kind in ('IDENT', 'QIDENT'):
+            parts = [self.ident()]
+            while self.is_op('.') and self.peek(1).kind in ('IDENT', 'QIDENT'):
+                self.next()
+                parts.append(self.next().value)
+            return ('col', parts)
+        raise QueryError('Unexpected token near %s' % self.where())
+
+
+# --------------------------------------------------------------------------
+# Data loading
+# --------------------------------------------------------------------------
+
+def infer_column(values):
+    """Convert a list of raw strings (None for empty) to typed values."""
+    kind = 'int'
+    for v in values:
+        if v is None:
+            continue
+        if kind == 'int' and not INT_RE.match(v):
+            kind = 'dec'
+        if kind == 'dec' and not DEC_RE.match(v):
+            kind = 'str'
+            break
+    if kind == 'int':
+        return [None if v is None else int(v) for v in values]
+    if kind == 'dec':
+        return [None if v is None else Decimal(v) for v in values]
+    return values
+
+
+class Catalog:
+    def __init__(self, root):
+        if not os.path.isdir(root):
+            raise QueryError('Data directory not found: %s' % root)
+        self.root = root
+        self.files = {}   # table name -> path
+        self.cache = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for fn in sorted(filenames):
+                if not fn.lower().endswith('.csv'):
+                    continue
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, root)
+                parts = rel.split(os.sep)
+                parts[-1] = parts[-1][:-4]
+                name = '.'.join(p.replace('.', '_') for p in parts)
+                self.files[name] = full
+
+    def resolve_name(self, name):
+        if name in self.files:
+            return name
+        low = {k.lower(): k for k in self.files}
+        if name.lower() in low:
+            return low[name.lower()]
+        # allow dotted file names written literally (my.file -> my_file)
+        alt = name.replace('.', '_')
+        if alt.lower() in low:
+            return low[alt.lower()]
+        # unique basename match
+        cands = [k for k in self.files if k.split('.')[-1].lower() == name.lower()]
+        if len(cands) == 1:
+            return cands[0]
+        raise QueryError('Table not found: %s' % name)
+
+    def load(self, name):
+        name = self.resolve_name(name)
+        if name in self.cache:
+            return name, self.cache[name]
+        path = self.files[name]
+        with open(path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.reader(f)
+            header = None
+            for row in reader:
+                if row and any(c.strip() for c in row):
+                    header = row
+                    break
+            if header is None:
+                raise QueryError('Invalid CSV file (no header): %s' % path)
+            header = [h.strip() for h in header]
+            if any(h == '' for h in header):
+                raise QueryError('Invalid CSV header in %s' % path)
+            width = len(header)
+            raw = []
+            for row in reader:
+                if not row:
+                    continue
+                if len(row) < width:
+                    row = row + [''] * (width - len(row))
+                elif len(row) > width:
+                    row = row[:width]
+                raw.append([None if c == '' else c for c in row])
+        cols = [infer_column([r[i] for r in raw]) for i in range(width)]
+        rows = [tuple(cols[i][j] for i in range(width)) for j in range(len(raw))]
+        self.cache[name] = (header, rows)
+        return name, (header, rows)
+
+
+# --------------------------------------------------------------------------
+# Binding (column resolution) and validation
+# --------------------------------------------------------------------------
+
+class Scope:
+    def __init__(self):
+        self.tables = []   # dicts: name, alias, columns, offset
+        self.width = 0
+
+    def add(self, name, alias, columns):
+        for t in self.tables:
+            if (alias or name).lower() == (t['alias'] or t['name']).lower():
+                raise QueryError('Duplicate table name/alias: %s' % (alias or name))
+        self.tables.append({'name': name, 'alias': alias, 'columns': columns,
+                            'offset': self.width})
+        self.width += len(columns)
+
+    def match_table(self, qual):
+        ql = qual.lower()
+        res = []
+        for t in self.tables:
+            names = {t['name'].lower(), t['name'].split('.')[-1].lower()}
+            if t['alias']:
+                names = {t['alias'].lower()}  # alias hides table name
+            if ql in names:
+                res.append(t)
+        if not res:
+            # fall back to the real table name even if aliased
+            res = [t for t in self.tables if t['name'].lower() == ql]
+        return res
+
+    @staticmethod
+    def find_col(t, col):
+        if col in t['columns']:
+            return t['columns'].index(col)
+        low = [c.lower() for c in t['columns']]
+        if low.count(col.lower()) == 1:
+            return low.index(col.lower())
+        return None
+
+    def resolve(self, parts):
+        """Return (index, column_name) or None."""
+        col = parts[-1]
+        if len(parts) > 1:
+            qual = '.'.join(parts[:-1])
+            ts = self.match_table(qual)
+            if not ts:
+                raise QueryError('Unknown table or alias: %s' % qual)
+            hits = []
+            for t in ts:
+                i = self.find_col(t, col)
+                if i is not None:
+                    hits.append((t['offset'] + i, t['columns'][i]))
+            if not hits:
+                raise QueryError('Unknown column: %s' % '.'.join(parts))
+            if len(hits) > 1:
+                raise QueryError('Ambiguous column: %s' % '.'.join(parts))
+            return hits[0]
+        hits = []
+        for t in self.tables:
+            i = self.find_col(t, col)
+            if i is not None:
+                hits.append((t['offset'] + i, t['columns'][i]))
+        if len(hits) > 1:
+            raise QueryError('Ambiguous column: %s' % col)
+        return hits[0] if hits else None
+
+
+def bind(expr, scope, aliases=None, alias_first=False, allow_agg=True, in_agg=False):
+    """Resolve column references to ('idx', i). aliases: name -> bound expr."""
+    k = expr[0]
+    if k == 'lit':
+        return expr
+    if k == 'col':
+        parts = expr[1]
+        if alias_first and aliases and len(parts) == 1 and not in_agg:
+            a = lookup_alias(aliases, parts[0])
+            if a is not None:
+                return a
+        r = scope.resolve(parts)
+        if r is None:
+            if aliases and len(parts) == 1 and not in_agg:
+                a = lookup_alias(aliases, parts[0])
+                if a is not None:
+                    return a
+            raise QueryError('Unknown column: %s' % '.'.join(parts))
+        return ('idx', r[0])
+    if k == 'agg':
+        if not allow_agg:
+            raise QueryError('Aggregate functions are not allowed here')
+        if in_agg:
+            raise QueryError('Nested aggregate functions are not allowed')
+        arg = expr[2]
+        if arg != '*':
+            arg = bind(arg, scope, None, False, allow_agg, True)
+        return ('agg', expr[1], arg, expr[3])
+    if k == 'cmp':
+        return ('cmp', expr[1], bind(expr[2], scope, aliases, alias_first, allow_agg, in_agg),
+                bind(expr[3], scope, aliases, alias_first, allow_agg, in_agg))
+    if k == 'like':
+        return ('like', bind(expr[1], scope, aliases, alias_first, allow_agg, in_agg),
+                bind(expr[2], scope, aliases, alias_first, allow_agg, in_agg), expr[3], expr[4])
+    if k == 'in':
+        return ('in', bind(expr[1], scope, aliases, alias_first, allow_agg, in_agg),
+                [bind(x, scope, aliases, alias_first, allow_agg, in_agg) for x in expr[2]],
+                expr[3])
+    if k == 'isnull':
+        return ('isnull', bind(expr[1], scope, aliases, alias_first, allow_agg, in_agg), expr[2])
+    if k in ('and', 'or'):
+        return (k, bind(expr[1], scope, aliases, alias_first, allow_agg, in_agg),
+                bind(expr[2], scope, aliases, alias_first, allow_agg, in_agg))
+    if k == 'not':
+        return ('not', bind(expr[1], scope, aliases, alias_first, allow_agg, in_agg))
+    if k == 'idx':
+        return expr
+    raise QueryError('Unsupported expression')
+
+
+def lookup_alias(aliases, name):
+    if name in aliases:
+        return aliases[name]
+    low = [(a, e) for a, e in aliases.items() if a.lower() == name.lower()]
+    if len(low) == 1:
+        return low[0][1]
+    return None
+
+
+def has_agg(expr):
+    k = expr[0]
+    if k == 'agg':
+        return True
+    if k in ('lit', 'idx', 'col'):
+        return False
+    if k == 'cmp':
+        return has_agg(expr[2]) or has_agg(expr[3])
+    if k == 'like':
+        return has_agg(expr[1]) or has_agg(expr[2])
+    if k == 'in':
+        return has_agg(expr[1]) or any(has_agg(x) for x in expr[2])
+    if k in ('isnull', 'not'):
+        return has_agg(expr[1])
+    if k in ('and', 'or'):
+        return has_agg(expr[1]) or has_agg(expr[2])
+    return False
+
+
+def check_grouped(expr, group_idx, group_exprs, what):
+    """Ensure every column outside aggregates is part of GROUP BY."""
+    if expr in group_exprs:
+        return
+    k = expr[0]
+    if k in ('lit', 'agg'):
+        return
+    if k == 'idx':
+        if expr[1] not in group_idx:
+            raise QueryError('Column in %s must appear in GROUP BY or be used in '
+                             'an aggregate function' % what)
+        return
+    if k == 'cmp':
+        check_grouped(expr[2], group_idx, group_exprs, what)
+        check_grouped(expr[3], group_idx, group_exprs, what)
+    elif k == 'like':
+        check_grouped(expr[1], group_idx, group_exprs, what)
+        check_grouped(expr[2], group_idx, group_exprs, what)
+    elif k == 'in':
+        check_grouped(expr[1], group_idx, group_exprs, what)
+        for x in expr[2]:
+            check_grouped(x, group_idx, group_exprs, what)
+    elif k in ('isnull', 'not'):
+        check_grouped(expr[1], group_idx, group_exprs, what)
+    elif k in ('and', 'or'):
+        check_grouped(expr[1], group_idx, group_exprs, what)
+        check_grouped(expr[2], group_idx, group_exprs, what)
+
+
+# --------------------------------------------------------------------------
+# Evaluation
+# --------------------------------------------------------------------------
+
+_like_cache = {}
+
+
+def like_regex(pattern, ci):
+    key = (pattern, ci)
+    r = _like_cache.get(key)
+    if r is None:
+        out = []
+        i = 0
+        while i < len(pattern):
+            c = pattern[i]
+            if c == '\\' and i + 1 < len(pattern):
+                out.append(re.escape(pattern[i + 1]))
+                i += 2
+                continue
+            if c == '%':
+                out.append('.*')
+            elif c == '_':
+                out.append('.')
+            else:
+                out.append(re.escape(c))
+            i += 1
+        r = re.compile(''.join(out), re.DOTALL | (re.IGNORECASE if ci else 0))
+        _like_cache[key] = r
+    return r
+
+
+def sql_compare(op, a, b):
+    if a is None or b is None:
+        return None
+    c = cmp_values(a, b)
+    if op == '=':
+        return c == 0
+    if op == '!=':
+        return c != 0
+    if op == '<':
+        return c < 0
+    if op == '<=':
+        return c <= 0
+    if op == '>':
+        return c > 0
+    return c >= 0
+
+
+def evaluate(expr, row, group):
+    k = expr[0]
+    if k == 'idx':
+        if row is None:
+            return None
+        return row[expr[1]]
+    if k == 'lit':
+        return expr[1]
+    if k == 'agg':
+        if group is None:
+            raise QueryError('Aggregate used outside of an aggregate context')
+        return eval_agg(expr, group)
+    if k == 'cmp':
+        return sql_compare(expr[1], evaluate(expr[2], row, group),
+                           evaluate(expr[3], row, group))
+    if k == 'and':
+        a = evaluate(expr[1], row, group)
+        if a is False:
+            return False
+        b = evaluate(expr[2], row, group)
+        if b is False:
+            return False
+        if a is None or b is None:
+            return None
+        return True
+    if k == 'or':
+        a = evaluate(expr[1], row, group)
+        if a is True:
+            return True
+        b = evaluate(expr[2], row, group)
+        if b is True:
+            return True
+        if a is None or b is None:
+            return None
+        return False
+    if k == 'not':
+        a = evaluate(expr[1], row, group)
+        return None if a is None else (not truthy(a))
+    if k == 'like':
+        v = evaluate(expr[1], row, group)
+        p = evaluate(expr[2], row, group)
+        if v is None or p is None:
+            return None
+        m = like_regex(fmt_value(p), expr[4]).fullmatch(fmt_value(v)) is not None
+        return (not m) if expr[3] else m
+    if k == 'in':
+        v = evaluate(expr[1], row, group)
+        if v is None:
+            return None
+        saw_null = False
+        for x in expr[2]:
+            xv = evaluate(x, row, group)
+            if xv is None:
+                saw_null = True
+            elif cmp_values(v, xv) == 0:
+                return not expr[3]
+        if saw_null:
+            return None
+        return expr[3]
+    if k == 'isnull':
+        v = evaluate(expr[1], row, group)
+        return (v is not None) if expr[2] else (v is None)
+    raise QueryError('Cannot evaluate expression')
+
+
+def truthy(v):
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if is_num(v):
+        return v != 0
+    return bool(v)
+
+
+def eval_agg(expr, group):
+    _, name, arg, distinct = expr
+    if arg == '*':
+        return len(group)
+    vals = [evaluate(arg, r, None) for r in group]
+    vals = [v for v in vals if v is not None]
+    if distinct:
+        seen = set()
+        uniq = []
+        for v in vals:
+            hk = hash_key(v)
+            if hk not in seen:
+                seen.add(hk)
+                uniq.append(v)
+        vals = uniq
+    if name == 'COUNT':
+        return len(vals)
+    if not vals:
+        return None
+    if name == 'SUM':
+        total = 0
+        for v in vals:
+            n = v if is_num(v) else to_number(v)
+            if n is None:
+                raise QueryError('SUM requires numeric values, got %r' % v)
+            total = total + n
+        return total
+    if name in ('MIN', 'MAX'):
+        best = vals[0]
+        for v in vals[1:]:
+            c = cmp_values(v, best)
+            if (name == 'MIN' and c < 0) or (name == 'MAX' and c > 0):
+                best = v
+        return best
+    raise QueryError('Unsupported aggregate %s' % name)
+
+
+# --------------------------------------------------------------------------
+# Execution
+# --------------------------------------------------------------------------
+
+def equi_join_keys(on, left_scope_width, right_offset, right_width):
+    """If ON is a simple col=col between left and right, return (li, ri)."""
+    if on[0] == 'cmp' and on[1] == '=' and on[2][0] == 'idx' and on[3][0] == 'idx':
+        a, b = on[2][1], on[3][1]
+        in_right = lambda i: right_offset <= i < right_offset + right_width
+        if a < left_scope_width and in_right(b):
+            return a, b - right_offset
+        if b < left_scope_width and in_right(a):
+            return b, a - right_offset
+    return None
+
+
+def do_join(left_rows, left_width, right_rows, right_width, jtype, on):
+    out = []
+    null_left = (None,) * left_width
+    null_right = (None,) * right_width
+    matched_right = set()
+    keys = equi_join_keys(on, left_width, left_width, right_width) if on else None
+    index = None
+    if keys:
+        index = {}
+        for j, r in enumerate(right_rows):
+            v = r[keys[1]]
+            if v is None:
+                continue
+            index.setdefault(hash_key(v), []).append(j)
+    for l in left_rows:
+        found = False
+        if jtype == 'CROSS':
+            cands = range(len(right_rows))
+        elif index is not None:
+            v = l[keys[0]]
+            cands = [] if v is None else index.get(hash_key(v), [])
+        else:
+            cands = range(len(right_rows))
+        for j in cands:
+            combined = l + right_rows[j]
+            if jtype == 'CROSS' or index is not None or evaluate(on, combined, None) is True:
+                out.append(combined)
+                found = True
+                matched_right.add(j)
+        if not found and jtype in ('LEFT', 'FULL'):
+            out.append(l + null_right)
+    if jtype in ('RIGHT', 'FULL'):
+        for j, r in enumerate(right_rows):
+            if j not in matched_right:
+                out.append(null_left + r)
+    return out
+
+
+def order_cmp(specs):
+    def cmp(a, b):
+        for (desc, nulls_first), x, y in zip(specs, a, b):
+            if x is None and y is None:
+                continue
+            if x is None or y is None:
+                nf = nulls_first if nulls_first is not None else False
+                if x is None:
+                    return -1 if nf else 1
+                return 1 if nf else -1
+            c = cmp_values(x, y)
+            if c:
+                return -c if desc else c
+        return 0
+    return cmp
+
+
+def execute(q, catalog):
+    scope = Scope()
+    name, (header, rows) = catalog.load(q['from']['name'])
+    scope.add(name, q['from']['alias'], header)
+    for jtype, tref, on in q['joins']:
+        jname, (jheader, jrows) = catalog.load(tref['name'])
+        left_width = scope.width
+        scope.add(jname, tref['alias'], jheader)
+        bon = bind(on, scope, allow_agg=False) if on is not None else None
+        rows = do_join(rows, left_width, jrows, len(jheader), jtype, bon)
+
+    # SELECT list
+    out_names = []
+    out_exprs = []
+    aliases = {}
+    for item in q['items']:
+        if item['star']:
+            tabs = scope.tables if item['qual'] is None else scope.match_table(item['qual'])
+            if not tabs:
+                raise QueryError('Unknown table or alias: %s' % item['qual'])
+            for t in tabs:
+                for i, c in enumerate(t['columns']):
+                    out_names.append(c)
+                    out_exprs.append(('idx', t['offset'] + i))
+            continue
+        e = bind(item['expr'], scope)
+        out_exprs.append(e)
+        if item['alias'] is not None:
+            out_names.append(item['alias'])
+            aliases.setdefault(item['alias'], e)
+        elif item['expr'][0] == 'col':
+            r = scope.resolve(item['expr'][1])
+            out_names.append(r[1] if r else item['expr'][1][-1])
+        else:
+            out_names.append(item['text'])
+    where = bind(q['where'], scope, allow_agg=False) if q['where'] is not None else None
+    group_exprs = []
+    for g in q['group_by']:
+        if g[0] == 'lit' and isinstance(g[1], int) and not isinstance(g[1], bool):
+            if not 1 <= g[1] <= len(out_exprs):
+                raise QueryError('GROUP BY position %d out of range' % g[1])
+            ge = out_exprs[g[1] - 1]
+        else:
+            ge = bind(g, scope, aliases, allow_agg=False)
+        if has_agg(ge):
+            raise QueryError('Aggregate functions are not allowed in GROUP BY')
+        group_exprs.append(ge)
+    having = bind(q['having'], scope, aliases) if q['having'] is not None else None
+
+    order_exprs = []
+    for e, desc, nf in q['order_by']:
+        if e[0] == 'lit' and isinstance(e[1], int) and not isinstance(e[1], bool):
+            if not 1 <= e[1] <= len(out_exprs):
+                raise QueryError('ORDER BY position %d out of range' % e[1])
+            be = out_exprs[e[1] - 1]
+        else:
+            be = bind(e, scope, aliases, alias_first=True)
+        order_exprs.append((be, desc, nf))
+
+    grouped = bool(group_exprs) or having is not None or \
+        any(has_agg(e) for e in out_exprs) or any(has_agg(e) for e, _, _ in order_exprs)
+
+    if where is not None:
+        rows = [r for r in rows if evaluate(where, r, None) is True]
+
+    contexts = []
+    if grouped:
+        group_idx = {e[1] for e in group_exprs if e[0] == 'idx'}
+        for e in out_exprs:
+            check_grouped(e, group_idx, group_exprs, 'SELECT')
+        if having is not None:
+            check_grouped(having, group_idx, group_exprs, 'HAVING')
+        for e, _, _ in order_exprs:
+            check_grouped(e, group_idx, group_exprs, 'ORDER BY')
+        if group_exprs:
+            groups = {}
+            keys_raw = {}
+            for r in rows:
+                kv = tuple(evaluate(g, r, None) for g in group_exprs)
+                hk = tuple(hash_key(v) for v in kv)
+                if hk not in groups:
+                    groups[hk] = []
+                    keys_raw[hk] = kv
+                groups[hk].append(r)
+            items = list(groups.items())
+            if not order_exprs:
+                spec = [(False, None)] * len(group_exprs)
+                c = order_cmp(spec)
+                items.sort(key=functools.cmp_to_key(
+                    lambda a, b: c(keys_raw[a[0]], keys_raw[b[0]])))
+            for hk, grows in items:
+                contexts.append((grows[0], grows))
+        else:
+            contexts.append((rows[0] if rows else None, rows))
+        if having is not None:
+            contexts = [c for c in contexts if evaluate(having, c[0], c[1]) is True]
+    else:
+        contexts = [(r, None) for r in rows]
+
+    results = []
+    for row, grp in contexts:
+        vals = tuple(evaluate(e, row, grp) for e in out_exprs)
+        okeys = tuple(evaluate(e, row, grp) for e, _, _ in order_exprs)
+        results.append((vals, okeys))
+
+    if q['distinct']:
+        seen = set()
+        uniq = []
+        for vals, okeys in results:
+            hk = tuple(hash_key(v) for v in vals)
+            if hk not in seen:
+                seen.add(hk)
+                uniq.append((vals, okeys))
+        results = uniq
+
+    if order_exprs:
+        c = order_cmp([(d, nf) for _, d, nf in order_exprs])
+        results.sort(key=functools.cmp_to_key(lambda a, b: c(a[1], b[1])))
+
+    out_rows = [v for v, _ in results]
+    if q['offset']:
+        out_rows = out_rows[q['offset']:]
+    if q['limit'] is not None:
+        out_rows = out_rows[:q['limit']]
+    return out_names, out_rows
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+def md_escape(s):
+    return s.replace('|', '\\|').replace('\r\n', ' ').replace('\n', ' ')
+
+
+def to_markdown(names, rows):
+    hdr = [md_escape(n) for n in names]
+    body = [[md_escape(fmt_value(v)) for v in r] for r in rows]
+    widths = [max([len(h)] + [len(r[i]) for r in body] + [3]) for i, h in enumerate(hdr)]
+    lines = ['| ' + ' | '.join(h.ljust(w) for h, w in zip(hdr, widths)) + ' |',
+             '|' + '|'.join('-' * (w + 2) for w in widths) + '|']
+    for r in body:
+        lines.append('| ' + ' | '.join(c.ljust(w) for c, w in zip(r, widths)) + ' |')
+    return '\n'.join(lines)
+
+
+def write_csv(path, names, rows):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f, lineterminator='\n')
+        w.writerow(names)
+        for r in rows:
+            w.writerow([fmt_value(v, null='') for v in r])
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def read_sql(arg):
+    if os.path.isfile(arg):
+        with open(arg, encoding='utf-8-sig') as f:
+            return f.read()
+    return arg
+
+
+def run(data, sql_arg, out=None):
+    sql = read_sql(sql_arg).strip()
+    if not sql:
+        raise QueryError('Empty SQL query')
+    q = Parser(sql).parse()
+    return execute(q, Catalog(data))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='Run read-only SQL over CSV files.')
+    ap.add_argument('--data', required=True, help='Directory containing CSV files')
+    ap.add_argument('--sql', required=True, help='SQL query string or path to .sql file')
+    ap.add_argument('--out', help='Optional output CSV path')
+    args = ap.parse_args(argv)
+    try:
+        names, rows = run(args.data, args.sql)
+        if args.out:
+            write_csv(args.out, names, rows)
+    except QueryError as e:
+        print('Error: %s' % e, file=sys.stderr)
+        return 1
+    except (OSError, UnicodeDecodeError, csv.Error) as e:
+        print('Error: %s' % e, file=sys.stderr)
+        return 1
+    print(to_markdown(names, rows))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
