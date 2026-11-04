@@ -2,6 +2,7 @@
 """TextDrop - self-hosted text sharing service."""
 import argparse
 import base64
+import datetime
 import hashlib
 import hmac
 import html
@@ -14,8 +15,10 @@ import string
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 ALPHABET = string.ascii_letters + string.digits
 ID_LEN = 8
@@ -55,7 +58,51 @@ def valid_user_token(seed, token):
     return hmac.compare_digest(sig.encode("ascii", "replace"), _user_sig(seed, uid).encode("ascii"))
 
 
+class StoreError(Exception):
+    """Raised when a storage backend operation fails (configuration or runtime)."""
+
+
+def _new_id(content, user):
+    digest = hashlib.sha256(
+        secrets.token_bytes(16) + b"\0" + user.encode("utf-8") + b"\0"
+        + content.encode("utf-8")).digest()
+    return "".join(ALPHABET[b % len(ALPHABET)] for b in digest[:ID_LEN])
+
+
+def format_ts(ts):
+    """Format a POSIX timestamp as ISO 8601 UTC without fractional seconds."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts)))
+
+
+def parse_ts(value):
+    """Normalize a stored created_at value into the display format; None if unusable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return format_ts(value)
+        except (OverflowError, ValueError, OSError):
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", s):
+        return s
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00") if s.endswith("Z") else s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    dt = dt.astimezone(datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class Store:
+    """Local file-backed store (SQLite database inside a directory)."""
+
+    DB_NAME = "textdrop.db"
+
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
@@ -67,36 +114,244 @@ class Store:
             )
             self.conn.commit()
 
+    @classmethod
+    def for_directory(cls, directory):
+        if not directory:
+            raise StoreError("local storage requires a directory path")
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as e:
+            raise StoreError(f"cannot create storage directory {directory!r}: {e}")
+        if not os.path.isdir(directory):
+            raise StoreError(f"storage path {directory!r} is not a directory")
+        try:
+            return cls(os.path.join(directory, cls.DB_NAME))
+        except sqlite3.Error as e:
+            raise StoreError(f"cannot open storage in {directory!r}: {e}")
+
     def create(self, content, mode="", user=""):
-        with self.lock:
-            while True:
-                digest = hashlib.sha256(
-                    secrets.token_bytes(16) + b"\0" + user.encode("utf-8") + b"\0"
-                    + content.encode("utf-8")).digest()
-                nid = "".join(ALPHABET[b % len(ALPHABET)] for b in digest[:ID_LEN])
-                try:
-                    self.conn.execute(
-                        "INSERT INTO notes (id, content, mode, created) VALUES (?, ?, ?, ?)",
-                        (nid, content, mode, time.time()),
-                    )
-                    self.conn.commit()
-                    return nid
-                except sqlite3.IntegrityError:
-                    continue
+        try:
+            with self.lock:
+                while True:
+                    nid = _new_id(content, user)
+                    try:
+                        self.conn.execute(
+                            "INSERT INTO notes (id, content, mode, created) VALUES (?, ?, ?, ?)",
+                            (nid, content, mode, time.time()),
+                        )
+                        self.conn.commit()
+                        return nid
+                    except sqlite3.IntegrityError:
+                        continue
+        except sqlite3.Error as e:
+            raise StoreError(str(e))
+
+    def _row(self, nid):
+        try:
+            with self.lock:
+                return self.conn.execute(
+                    "SELECT content, mode, created FROM notes WHERE id = ?", (nid,)).fetchone()
+        except sqlite3.Error as e:
+            raise StoreError(str(e))
 
     def get(self, nid):
-        with self.lock:
-            row = self.conn.execute("SELECT content FROM notes WHERE id = ?", (nid,)).fetchone()
+        row = self._row(nid)
         return row[0] if row else None
 
     def get_note(self, nid):
-        with self.lock:
-            row = self.conn.execute("SELECT content, mode FROM notes WHERE id = ?", (nid,)).fetchone()
-        return (row[0], row[1] or "") if row else None
+        row = self._row(nid)
+        if not row:
+            return None
+        return row[0], row[1] or "", parse_ts(row[2])
 
     def count(self):
         with self.lock:
             return self.conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+class ObjectStore:
+    """S3-compatible object store using path-style addressing and SigV4 signing."""
+
+    TIMEOUT = 15
+
+    def __init__(self, url, key_id, key_secret, container):
+        self.url = url.rstrip("/")
+        self.key_id = key_id
+        self.key_secret = key_secret
+        self.container = container
+        parts = urlsplit(self.url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise StoreError(f"invalid object storage url {url!r}")
+        self.scheme = parts.scheme
+        self.host = parts.netloc
+        self.base_path = parts.path.rstrip("/")
+        self.region = self._region(parts.hostname or "")
+        self.lock = threading.Lock()
+        self.created = 0
+
+    @staticmethod
+    def _region(host):
+        host = host.lower()
+        m = re.search(r"(?:^|\.)s3[.-]([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?$", host)
+        if m and m.group(1) not in ("external-1", "accelerate", "dualstack"):
+            return m.group(1)
+        m = re.search(r"\.([a-z]{2}-[a-z]+-\d)\.", "." + host + ".")
+        if m:
+            return m.group(1)
+        if host.endswith("googleapis.com"):
+            return "auto"
+        return "us-east-1"
+
+    def _path(self, key=None):
+        p = self.base_path + "/" + quote(self.container, safe="-_.~")
+        if key is not None:
+            p += "/" + quote(key, safe="-_.~")
+        return p
+
+    def _sign(self, method, path, payload, extra):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date = now.strftime("%Y%m%d")
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        headers = {"host": self.host, "x-amz-date": amz_date, "x-amz-content-sha256": payload_hash}
+        for k, v in extra.items():
+            headers[k.lower()] = v
+        names = sorted(headers)
+        canonical_headers = "".join(f"{n}:{' '.join(str(headers[n]).split())}\n" for n in names)
+        signed = ";".join(names)
+        canonical = "\n".join([method, path, "", canonical_headers, signed, payload_hash])
+        scope = f"{date}/{self.region}/s3/aws4_request"
+        to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope,
+                             hashlib.sha256(canonical.encode("utf-8")).hexdigest()])
+
+        def h(key, msg):
+            return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+        k = h(("AWS4" + self.key_secret).encode("utf-8"), date)
+        k = h(k, self.region)
+        k = h(k, "s3")
+        k = h(k, "aws4_request")
+        sig = hmac.new(k, to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        out = {n: headers[n] for n in names if n != "host"}
+        out["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={self.key_id}/{scope}, "
+                                f"SignedHeaders={signed}, Signature={sig}")
+        return out
+
+    def _request(self, method, key=None, body=b"", extra=None):
+        """Perform a request; return (status, body bytes). Raises StoreError on connectivity errors."""
+        path = self._path(key)
+        extra = dict(extra or {})
+        headers = self._sign(method, path, body, extra)
+        req = urllib.request.Request(f"{self.scheme}://{self.host}{path}",
+                                     data=body if method in ("PUT", "POST") else None,
+                                     method=method)
+        for k, v in headers.items():
+            req.add_header(k, v)
+        if method in ("PUT", "POST"):
+            req.add_header("Content-Length", str(len(body)))
+        try:
+            with _OPENER.open(req, timeout=self.TIMEOUT) as resp:
+                return resp.status, (resp.read() if method != "HEAD" else b"")
+        except urllib.error.HTTPError as e:
+            try:
+                data = e.read()
+            except Exception:
+                data = b""
+            return e.code, data
+        except Exception as e:
+            raise StoreError(f"object storage request failed: {e}")
+
+    def check(self):
+        status, _ = self._request("HEAD")
+        if status != 200:
+            if status in (401, 403):
+                raise StoreError(f"object storage rejected credentials for container "
+                                 f"{self.container!r} (HTTP {status})")
+            raise StoreError(f"object storage container {self.container!r} is not accessible "
+                             f"(HTTP {status})")
+
+    def create(self, content, mode="", user=""):
+        nid = _new_id(content, user)
+        record = {"id": nid, "content": content, "mode": mode,
+                  "created_at": format_ts(time.time())}
+        body = json.dumps(record, ensure_ascii=False).encode("utf-8")
+        status, _ = self._request("PUT", nid + ".json", body,
+                                  {"Content-Type": "application/json"})
+        if not 200 <= status < 300:
+            raise StoreError(f"object storage write failed (HTTP {status})")
+        with self.lock:
+            self.created += 1
+        return nid
+
+    def _record(self, nid):
+        status, data = self._request("GET", nid + ".json")
+        if status == 404:
+            return None
+        if status != 200:
+            raise StoreError(f"object storage read failed (HTTP {status})")
+        try:
+            rec = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            raise StoreError("object storage returned an invalid record")
+        if not isinstance(rec, dict) or not isinstance(rec.get("content"), str):
+            raise StoreError("object storage returned an invalid record")
+        return rec
+
+    def get(self, nid):
+        rec = self._record(nid)
+        return rec["content"] if rec is not None else None
+
+    def get_note(self, nid):
+        rec = self._record(nid)
+        if rec is None:
+            return None
+        mode = rec.get("mode")
+        return rec["content"], mode if isinstance(mode, str) else "", parse_ts(rec.get("created_at"))
+
+    def count(self):
+        with self.lock:
+            return self.created
+
+
+OBJECT_KEYS = ("url", "key_id", "key_secret", "container")
+
+
+def open_store(spec):
+    """Parse a '<type>:<config>' storage spec, validate it and return a ready store."""
+    if not isinstance(spec, str) or ":" not in spec:
+        raise StoreError(f"malformed storage spec {spec!r}: expected '<type>:<config>'")
+    kind, _, config = spec.partition(":")
+    if kind == "local":
+        return Store.for_directory(config)
+    if kind == "object":
+        try:
+            cfg = json.loads(config)
+        except (ValueError, RecursionError) as e:
+            raise StoreError(f"invalid JSON in object storage config: {e}")
+        if not isinstance(cfg, dict):
+            raise StoreError("object storage config must be a JSON object")
+        missing = [k for k in OBJECT_KEYS if k not in cfg]
+        if missing:
+            raise StoreError("object storage config missing keys: " + ", ".join(missing))
+        extra = [k for k in cfg if k not in OBJECT_KEYS]
+        if extra:
+            raise StoreError("object storage config has unexpected keys: " + ", ".join(extra))
+        bad = [k for k in OBJECT_KEYS if not isinstance(cfg[k], str)]
+        if bad:
+            raise StoreError("object storage config values must be strings: " + ", ".join(bad))
+        if not cfg["container"]:
+            raise StoreError("object storage container must not be empty")
+        store = ObjectStore(cfg["url"], cfg["key_id"], cfg["key_secret"], cfg["container"])
+        store.check()
+        return store
+    raise StoreError(f"unknown storage type {kind!r}: expected 'local' or 'object'")
 
 
 STORE = None
@@ -810,6 +1065,11 @@ class Handler(BaseHTTPRequestHandler):
     def not_found(self):
         self.error_page(404, "Not Found", "The page you requested could not be found.")
 
+    def store_failure(self, err):
+        sys.stderr.write(f"storage error: {err}\n")
+        return self.error_page(500, "Internal Server Error",
+                               "The note storage backend failed. Please try again later.")
+
     def path_only(self):
         return urlsplit(self.path).path
 
@@ -827,17 +1087,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.drain()
         m = NOTE_TEXT_RE.match(path)
         if m:
-            content = STORE.get(m.group(1))
+            try:
+                content = STORE.get(m.group(1))
+            except StoreError as e:
+                return self.store_failure(e)
             if content is None:
                 return self.error_page(404, "Not Found", "That note does not exist.")
             return self.send(200, content, "text/plain; charset=utf-8")
         m = NOTE_RE.match(path)
         if m:
             nid = m.group(1)
-            note = STORE.get_note(nid)
+            try:
+                note = STORE.get_note(nid)
+            except StoreError as e:
+                return self.store_failure(e)
             if note is None:
                 return self.error_page(404, "Not Found", "That note does not exist.")
-            content, mode = note
+            content, mode, created = note
             rendered, title, preview = render_content(content, mode)
             if mode == "markdown":
                 header = f"<p><strong>Note {html.escape(nid)}</strong> | "
@@ -846,7 +1112,9 @@ class Handler(BaseHTTPRequestHandler):
             body = (
                 header +
                 f"<a href=\"/n/{nid}/text\">Raw text</a> | <a href=\"/\">New note</a></p>\n"
-                f"{rendered}"
+                + (f"<p class=\"created\">Created <time datetime=\"{created}\">{created}</time></p>\n"
+                   if created else "")
+                + f"{rendered}"
             )
             return self.send_html(200, page(title or "TextDrop", body, raw_title=True,
                                             head=og_head(title, preview)))
@@ -980,7 +1248,10 @@ class Handler(BaseHTTPRequestHandler):
                 user = make_user_token(ID_SEED)
                 headers["Set-Cookie"] = (f"{USER_COOKIE}={user}; Path=/; Max-Age=31536000; "
                                          "HttpOnly; SameSite=Lax")
-        nid = STORE.create(content, mode, user.split(".", 1)[0])
+        try:
+            nid = STORE.create(content, mode, user.split(".", 1)[0])
+        except StoreError as e:
+            return self.store_failure(e)
         loc = f"/n/{nid}"
         headers["Location"] = loc
         self.send_html(302, page("Redirect", f"<p>Redirecting to <a href=\"{loc}\">{loc}</a></p>"),
@@ -1015,6 +1286,9 @@ def main(argv=None):
     p.add_argument("--host", default=None)
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--db", default=None, help="SQLite database path")
+    p.add_argument("--store", default=None,
+                   help="storage backend '<type>:<config>': local:<dir> or object:<json> "
+                        "(env: TEXTDROP_STORE, default local:./)")
     p.add_argument("--debug", action="store_true",
                    help="load templates, static assets and docs from ./templates, ./static and ./docs")
     p.add_argument("--ops_secret", "--ops-secret", dest="ops_secret", default=None,
@@ -1033,10 +1307,17 @@ def main(argv=None):
     if port is None:
         env = os.environ.get("TEXTDROP_PORT", "").strip()
         port = int(env) if env else 8080
-    db = a.db or os.environ.get("TEXTDROP_DB") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "textdrop.db")
+    spec = a.store if a.store is not None else os.environ.get("TEXTDROP_STORE")
     global STORE
-    STORE = Store(db)
+    try:
+        if spec is None and (a.db or os.environ.get("TEXTDROP_DB")):
+            STORE = Store(a.db or os.environ.get("TEXTDROP_DB"))
+        else:
+            STORE = open_store("local:./" if spec is None else spec)
+    except (StoreError, sqlite3.Error) as e:
+        sys.stderr.write(f"textdrop: storage configuration error: {e}\n")
+        sys.stderr.flush()
+        sys.exit(1)
     ThreadingHTTPServer.allow_reuse_address = True
     ThreadingHTTPServer.daemon_threads = True
     srv = ThreadingHTTPServer((host, port), Handler)
