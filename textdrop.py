@@ -66,11 +66,13 @@ class Store:
 STORE = None
 
 
-def page(title, body):
+def page(title, body, raw_title=False, head=""):
+    full_title = title if raw_title else f"{title} - TextDrop"
     return (
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-        f"<title>{html.escape(title)} - TextDrop</title>\n"
+        f"<title>{html.escape(full_title)}</title>\n"
+        f"{head}"
         "<style>body{font-family:sans-serif;max-width:900px;margin:2em auto;padding:0 1em}"
         "textarea{width:100%;min-height:20em;font-family:monospace}"
         "pre{background:#f4f4f4;padding:1em;overflow:auto;white-space:pre-wrap}</style>\n"
@@ -117,6 +119,7 @@ HR_RE = re.compile(r"^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})
 BQ_RE = re.compile(r"^ {0,3}> ?(.*)$")
 UL_RE = re.compile(r"^( {0,3})([-*+])(?:[ \t]+(.*)|[ \t]*)$")
 OL_RE = re.compile(r"^( {0,3})(\d{1,9})([.)])(?:[ \t]+(.*)|[ \t]*)$")
+TOC_RE = re.compile(r"^ {0,3}\{\{[ \t]*toc(?:[ \t]+([1-6])[ \t]+([1-6]))?[ \t]*\}\}[ \t]*$")
 TABLE_SEP_RE = re.compile(r"^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$")
 
 
@@ -187,6 +190,10 @@ class MarkdownRenderer:
 
     def __init__(self):
         self._ph = []
+        self.title = None
+        self.preview = None
+        self.headings = []  # (level, id, plain text)
+        self.tocs = []
 
     # -- inline -----------------------------------------------------------
     def _hold(self, s):
@@ -285,6 +292,13 @@ class MarkdownRenderer:
             if _blank(line):
                 i += 1
                 continue
+            m = TOC_RE.match(line)
+            if m and (i == 0 or _blank(lines[i - 1])) and (i + 1 >= n or _blank(lines[i + 1])):
+                lo, hi = (int(m.group(1)), int(m.group(2))) if m.group(1) else (1, 6)
+                self.tocs.append((lo, hi))
+                out.append(f"\x00TOC{len(self.tocs) - 1}\x00")
+                i += 1
+                continue
             m = FENCE_RE.match(line)
             if m:
                 fence = m.group(1)
@@ -317,6 +331,9 @@ class MarkdownRenderer:
                 rendered = self.inline(content)
                 plain = html.unescape(re.sub(r"<[^>]*>", "", rendered))
                 hid = slugify(plain)
+                self.headings.append((level, hid, plain_text(rendered)))
+                if self.title is None:
+                    self.title = plain_text(rendered)
                 out.append(f"<h{level} id=\"{hid}\">{rendered}</h{level}>")
                 i += 1
                 continue
@@ -373,6 +390,8 @@ class MarkdownRenderer:
                 i += 1
             para[0] = line.lstrip()
             content = self.inline("\n".join(para).rstrip())
+            if not tight and self.preview is None:
+                self.preview = plain_text(content)
             out.append(content if tight else f"<p>{content}</p>")
         return "\n".join(out)
 
@@ -474,12 +493,76 @@ class MarkdownRenderer:
         return "\n".join(parts), i
 
     def render(self, text):
-        text = text.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4)
-        return self.blocks(text.split("\n"))
+        text = text.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4).replace("\x00", "\ufffd")
+        out = self.blocks(text.split("\n"))
+        out = re.sub(r"\x00TOC(\d+)\x00", lambda m: self._toc(*self.tocs[int(m.group(1))]), out)
+        return out
+
+    def _toc(self, lo, hi):
+        items = [h for h in self.headings if lo <= h[0] <= hi]
+        if not items:
+            return ""
+
+        def link(h):
+            return f"<li><a href=\"#{html.escape(h[1], quote=True)}\">{html.escape(h[2], quote=False)}</a>"
+        out = ["<nav class=\"table-of-contents\">", "<ul>", link(items[0])]
+        stack = [items[0][0]]
+        for h in items[1:]:
+            lvl = h[0]
+            if lvl > stack[-1]:
+                out.append("<ul>")
+                stack.append(lvl)
+            else:
+                out.append("</li>")
+                while len(stack) > 1 and lvl <= stack[-2]:
+                    stack.pop()
+                    out.append("</ul>")
+                    out.append("</li>")
+                stack[-1] = lvl
+            out.append(link(h))
+        out.append("</li>")
+        for _ in range(len(stack) - 1):
+            out.append("</ul>")
+            out.append("</li>")
+        out.append("</ul>")
+        out.append("</nav>")
+        return "\n".join(out)
+
+
+def plain_text(fragment):
+    """Strip inline HTML formatting, returning plain text content."""
+    def img(m):
+        a = re.search(r'\balt="([^"]*)"', m.group(0))
+        return a.group(1) if a else ""
+    s = re.sub(r"<img\b[^>]*>", img, fragment)
+    s = re.sub(r"<br\s*/?>", "", s)
+    s = re.sub(r"<[^>]*>", "", s)
+    s = html.unescape(s)
+    s = re.sub(r"[ \t]*\n[ \t]*", " ", s)
+    return s.strip()
 
 
 def render_markdown(text):
     return MarkdownRenderer().render(text)
+
+
+def render_content(content, mode):
+    """Return (html, title or None, preview string)."""
+    if mode == "markdown":
+        r = MarkdownRenderer()
+        try:
+            rendered = r.render(content)
+            title, preview = r.title, r.preview or ""
+        except Exception:
+            rendered = f"<pre><code>{html.escape(content, quote=True)}</code></pre>"
+            title, preview = None, ""
+        return f"<div class=\"markdown\">\n{rendered}\n</div>", title, preview
+    return f"<pre><code>{html.escape(content, quote=True)}</code></pre>", None, ""
+
+
+def og_head(title, preview):
+    return (f"<meta property=\"og:title\" content=\"{html.escape(title or 'TextDrop', quote=True)}\">\n"
+            f"<meta property=\"og:description\" content=\"{html.escape(preview or '', quote=True)}\">\n")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -533,14 +616,7 @@ class Handler(BaseHTTPRequestHandler):
             if note is None:
                 return self.error_page(404, "Not Found", "That note does not exist.")
             content, mode = note
-            if mode == "markdown":
-                try:
-                    rendered = render_markdown(content)
-                except Exception:
-                    rendered = f"<pre><code>{html.escape(content, quote=True)}</code></pre>"
-                rendered = f"<div class=\"markdown\">\n{rendered}\n</div>"
-            else:
-                rendered = f"<pre><code>{html.escape(content, quote=True)}</code></pre>"
+            rendered, title, preview = render_content(content, mode)
             if mode == "markdown":
                 header = f"<p><strong>Note {html.escape(nid)}</strong> | "
             else:
@@ -550,7 +626,8 @@ class Handler(BaseHTTPRequestHandler):
                 f"<a href=\"/n/{nid}/text\">Raw text</a> | <a href=\"/\">New note</a></p>\n"
                 f"{rendered}"
             )
-            return self.send_html(200, page(f"Note {nid}", body))
+            return self.send_html(200, page(title or "TextDrop", body, raw_title=True,
+                                            head=og_head(title, preview)))
         return self.not_found()
 
     do_HEAD = do_GET
@@ -569,7 +646,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path_only()
-        if path != "/submit":
+        if path not in ("/submit", "/render"):
             if self._known(path):
                 self.read_body()
                 return self.error_page(405, "Method Not Allowed", "This method is not allowed here.",
@@ -624,6 +701,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.error_page(400, "Bad Request", "Unsupported rendering mode.")
         if not content.strip():
             return self.error_page(400, "Bad Request", "Content must not be empty.")
+        if path == "/render":
+            rendered, title, preview = render_content(content, mode)
+            body = ("<p><strong>Preview</strong> | <a href=\"/\">New note</a></p>\n"
+                    f"{rendered}")
+            return self.send_html(200, page(f"{title or 'TextDrop'} - Preview", body, raw_title=True,
+                                            head=og_head(title, preview)))
         nid = STORE.create(content, mode)
         loc = f"/n/{nid}"
         self.send_html(302, page("Redirect", f"<p>Redirecting to <a href=\"{loc}\">{loc}</a></p>"),
