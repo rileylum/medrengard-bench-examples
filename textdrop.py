@@ -13,7 +13,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from textdrop_markdown import render_markdown
+from textdrop_markdown import render_document
 
 ALPHABET = string.ascii_letters + string.digits
 ID_LENGTH = 8
@@ -53,12 +53,19 @@ STORE = NoteStore()
 START_TIME = time.time()
 
 
-def page(title, body):
+def page(title, body, og=None):
+    og_tags = ""
+    if og is not None:
+        og_tags = (
+            f'<meta property="og:title" content="{html.escape(og[0], quote=True)}">\n'
+            f'<meta property="og:description" content="{html.escape(og[1], quote=True)}">\n'
+        )
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"<title>{html.escape(title)}</title>\n"
+        f"{og_tags}"
         "<style>body{font-family:sans-serif;max-width:60em;margin:2em auto;padding:0 1em}"
         "textarea{width:100%;min-height:20em;font-family:monospace}"
         "pre{background:#f4f4f4;padding:1em;overflow:auto;white-space:pre-wrap}</style>\n"
@@ -97,6 +104,34 @@ def _valid_utf8(s):
     except UnicodeEncodeError:
         return False
     return True
+
+
+def render_note_page(content, mode, nid=None):
+    """Render a full HTML page for content. nid=None means ephemeral preview."""
+    if mode == "markdown":
+        rendered, title, preview = render_document(content)
+    else:
+        rendered, title, preview = None, None, ""
+    og_title = title if title else "TextDrop"
+    page_title = og_title if nid is not None else f"{og_title} - Preview"
+    if nid is not None:
+        links = (f'<a href="/n/{nid}/text">Raw text</a> | <a href="/">New note</a>')
+        label = f"Note {html.escape(nid)}"
+    else:
+        links = '<a href="/">New note</a>'
+        label = "Preview"
+    if rendered is not None:
+        body = (
+            f"<nav><p><strong>{label}</strong> | {links}</p></nav>\n"
+            f'<article class="markdown">\n{rendered}\n</article>'
+        )
+    else:
+        body = (
+            f"<h1>{label}</h1>\n"
+            f"<p>{links}</p>\n"
+            f"<pre><code>{html.escape(content, quote=True)}</code></pre>"
+        )
+    return page(page_title, body, (og_title, preview))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -162,20 +197,7 @@ class Handler(BaseHTTPRequestHandler):
             if entry is None:
                 return self._error(404, "Not Found", "That note does not exist.")
             content, mode = entry
-            nid = m.group(1)
-            if mode == "markdown":
-                body = (
-                    f'<nav><p><strong>Note {html.escape(nid)}</strong> | '
-                    f'<a href="/n/{nid}/text">Raw text</a> | <a href="/">New note</a></p></nav>\n'
-                    f'<article class="markdown">\n{render_markdown(content)}\n</article>'
-                )
-            else:
-                body = (
-                    f"<h1>Note {html.escape(nid)}</h1>\n"
-                    f'<p><a href="/n/{nid}/text">Raw text</a> | <a href="/">New note</a></p>\n'
-                    f"<pre><code>{html.escape(content, quote=True)}</code></pre>"
-                )
-            return self._html(200, page(f"Note {nid}", body))
+            return self._html(200, render_note_page(content, mode, m.group(1)))
         m = NOTE_TEXT_RE.match(path)
         if m:
             content = STORE.get(m.group(1))
@@ -201,12 +223,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self._path()
-        if path != "/submit":
+        if path not in ("/submit", "/render"):
             raw = self._read_body()  # drain
             kind = self._route_kind(path)
             if kind is None:
                 return self._not_found()
             return self._method_not_allowed("GET, HEAD")
+        parsed = self._parse_submission()
+        if parsed is None:
+            return
+        content, mode = parsed
+        if path == "/render":
+            return self._html(200, render_note_page(content, mode, None))
+        nid = STORE.add(content, mode)
+        loc = f"/n/{nid}"
+        self._html(302, page("Redirecting", f'<p>Redirecting to <a href="{loc}">{loc}</a>.</p>'),
+                   {"Location": loc})
+
+    def _parse_submission(self):
+        """Return (content, mode), or None after sending an error response."""
         raw = self._read_body()
         if raw is None:
             self.close_connection = True
@@ -255,10 +290,7 @@ class Handler(BaseHTTPRequestHandler):
                                "Unsupported rendering mode. Use plain text or markdown.")
         if not content.strip():
             return self._error(400, "Bad Request", "Content must not be empty.")
-        nid = STORE.add(content, mode)
-        loc = f"/n/{nid}"
-        self._html(302, page("Redirecting", f'<p>Redirecting to <a href="{loc}">{loc}</a>.</p>'),
-                   {"Location": loc})
+        return content, mode
 
     def _other(self):
         path = self._path()

@@ -8,6 +8,7 @@ pipe tables.
 """
 import html
 import re
+import secrets
 
 try:  # optional dependency; a built-in fallback highlighter is used otherwise
     from pygments import highlight as _pyg_highlight
@@ -17,7 +18,7 @@ try:  # optional dependency; a built-in fallback highlighter is used otherwise
 except Exception:  # pragma: no cover
     _pyg_highlight = None
 
-__all__ = ["render_markdown", "slugify"]
+__all__ = ["render_markdown", "render_document", "slugify"]
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -375,9 +376,59 @@ def _starts_block(lines, i):
                 or _BQ_RE.match(line) or _list_match(line) or _is_table_start(lines, i))
 
 
+_TOC_RE = re.compile(r"^ {0,3}\{\{[ \t]*toc(?:[ \t]+([1-6])[ \t]+([1-6]))?[ \t]*\}\}[ \t]*$")
+
+
 class _Renderer:
     def __init__(self):
-        pass
+        self.headings = []      # (level, slug, plain text)
+        self.preview = None     # plain text of first paragraph
+        self.tocs = []          # (placeholder, from, to)
+        self._token = secrets.token_hex(8)
+
+    def _toc_directive(self, lines, i):
+        m = _TOC_RE.match(lines[i])
+        if not m:
+            return None
+        if i > 0 and not _is_blank(lines[i - 1]):
+            return None
+        if i + 1 < len(lines) and not _is_blank(lines[i + 1]):
+            return None
+        lo = int(m.group(1)) if m.group(1) else 1
+        hi = int(m.group(2)) if m.group(2) else 6
+        return lo, hi
+
+    def build_toc(self, lo, hi):
+        hs = [h for h in self.headings if lo <= h[0] <= hi]
+        if not hs:
+            return ""
+        parts = ['<nav class="table-of-contents">\n']
+        stack = []
+        for level, slug, text in hs:
+            if not stack:
+                parts.append("<ul>\n<li>")
+                stack.append(level)
+            elif level > stack[-1]:
+                parts.append("\n<ul>\n<li>")
+                stack.append(level)
+            else:
+                parts.append("</li>\n")
+                while len(stack) > 1 and level <= stack[-2]:
+                    stack.pop()
+                    parts.append("</ul>\n</li>\n")
+                stack[-1] = level
+                parts.append("<li>")
+            parts.append('<a href="#%s">%s</a>' % (_esc(slug), _esc(text)))
+        parts.append("</li>\n")
+        for _ in range(len(stack) - 1):
+            parts.append("</ul>\n</li>\n")
+        parts.append("</ul>\n</nav>")
+        return "".join(parts)
+
+    def finalize(self, rendered):
+        for placeholder, lo, hi in self.tocs:
+            rendered = rendered.replace(placeholder, self.build_toc(lo, hi))
+        return rendered
 
     def blocks(self, lines, tight=False):
         out = []
@@ -415,7 +466,9 @@ class _Renderer:
             if m:
                 level = len(m.group(1))
                 inner = render_inline(m.group(2) or "")
-                slug = slugify(_strip_tags(inner))
+                plain = _strip_tags(inner)
+                slug = slugify(plain)
+                self.headings.append((level, slug, plain.strip()))
                 out.append('<h%d id="%s">%s</h%d>' % (level, _esc(slug), inner, level))
                 i += 1
                 continue
@@ -449,6 +502,14 @@ class _Renderer:
                 i = self._list(lines, i, lm, out)
                 continue
 
+            toc = self._toc_directive(lines, i)
+            if toc:
+                placeholder = "\x02TOC%s-%d\x02" % (self._token, len(self.tocs))
+                self.tocs.append((placeholder, toc[0], toc[1]))
+                out.append(placeholder)
+                i += 1
+                continue
+
             # paragraph
             para = [line]
             i += 1
@@ -457,6 +518,8 @@ class _Renderer:
                 i += 1
             text = "\n".join(l.lstrip() for l in para)
             inner = render_inline(text)
+            if not tight and self.preview is None:
+                self.preview = _strip_tags(inner).strip()
             out.append(inner if tight else "<p>%s</p>" % inner)
         return "\n".join(out)
 
@@ -565,8 +628,16 @@ class _Renderer:
         return i
 
 
-def render_markdown(text):
+def render_document(text):
+    """Render markdown; return (html, title or None, preview string)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "\ufffd")
     text = text.expandtabs(4)
     lines = text.split("\n")
-    return _Renderer().blocks(lines)
+    r = _Renderer()
+    rendered = r.finalize(r.blocks(lines))
+    title = (r.headings[0][2] or None) if r.headings else None
+    return rendered, title, r.preview or ""
+
+
+def render_markdown(text):
+    return render_document(text)[0]
