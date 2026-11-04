@@ -311,14 +311,102 @@ class Handler(BaseHTTPRequestHandler):
             ds = DATASETS.get(did)
         if ds is None:
             raise ApiError(404, "Dataset not found")
-        rows = ds["rows"][:DEFAULT_LIMIT]
+        columns = list(ds["columns"])
+        opts = parse_controls(params, columns)
+        indexed = list(enumerate(ds["rows"], start=1))
+        if opts["sort_col"] is not None:
+            ci = columns.index(opts["sort_col"])
+            def key(item):
+                return sort_key(item[1][ci] if ci < len(item[1]) else None)
+            filled = [it for it in indexed if key(it)[0] != 2]
+            blank = [it for it in indexed if key(it)[0] == 2]
+            filled.sort(key=key, reverse=opts["sort_desc"])  # stable either way
+            indexed = filled + blank  # blanks always last, in source order
+        total = len(indexed)
+        off, size = opts["offset"], opts["size"]
+        page = indexed[off:off + size]
+        if opts["shape"] == "objects":
+            out_rows = []
+            for rowid, row in page:
+                obj = {}
+                if not opts["hide_rowid"]:
+                    obj["rowid"] = rowid
+                for i, c in enumerate(columns):
+                    if c in obj and c != "rowid":
+                        continue  # duplicate header: keep first
+                    obj[c] = row[i] if i < len(row) else None
+                out_rows.append(obj)
+        else:
+            out_rows = [list(row) for _, row in page]
         elapsed = max(0.0, (time.perf_counter() - start) * 1000.0)
-        self.send_json(200, {
-            "ok": True,
-            "columns": list(ds["columns"]),
-            "rows": rows,
-            "query_ms": round(elapsed, 3),
-        })
+        payload = {"ok": True, "columns": columns, "rows": out_rows}
+        if not opts["hide_total"]:
+            payload["total"] = total
+        payload["query_ms"] = round(elapsed, 3)
+        self.send_json(200, payload)
+
+
+CONTROL_PARAMS = ("_size", "_offset", "_shape", "_sort", "_sort_desc", "_rowid", "_total")
+UINT_RE = re.compile(r"[0-9]+")
+
+
+def parse_controls(params, columns):
+    for name in CONTROL_PARAMS:
+        if len(params.get(name, [])) > 1:
+            raise ApiError(400, "Parameter %s may only be given once" % name)
+
+    def one(name):
+        vals = params.get(name)
+        return vals[0] if vals else None
+
+    opts = {}
+    v = one("_size")
+    if v is None:
+        opts["size"] = DEFAULT_LIMIT
+    else:
+        if not UINT_RE.fullmatch(v) or int(v) <= 0:
+            raise ApiError(400, "_size must be a positive integer")
+        opts["size"] = int(v)
+    v = one("_offset")
+    if v is None:
+        opts["offset"] = 0
+    else:
+        if not UINT_RE.fullmatch(v):
+            raise ApiError(400, "_offset must be a non-negative integer")
+        opts["offset"] = int(v)
+    v = one("_shape")
+    if v is None:
+        v = "lists"
+    if v not in ("lists", "objects"):
+        raise ApiError(400, "_shape must be 'lists' or 'objects'")
+    opts["shape"] = v
+    for name, key in (("_rowid", "hide_rowid"), ("_total", "hide_total")):
+        v = one(name)
+        if v is not None and v != "hide":
+            raise ApiError(400, "%s only accepts the value 'hide'" % name)
+        opts[key] = v == "hide"
+    asc, desc = one("_sort"), one("_sort_desc")
+    for name, v in (("_sort", asc), ("_sort_desc", desc)):
+        if v is not None and (v == "" or v not in columns):
+            raise ApiError(400, "%s: unknown column %r" % (name, v))
+    if desc is not None:
+        opts["sort_col"], opts["sort_desc"] = desc, True
+    elif asc is not None:
+        opts["sort_col"], opts["sort_desc"] = asc, False
+    else:
+        opts["sort_col"], opts["sort_desc"] = None, False
+    return opts
+
+
+def sort_key(v):
+    # numbers < non-empty strings < empty/missing values
+    if isinstance(v, bool):
+        v = int(v)
+    if isinstance(v, (int, float)):
+        return (0, v, "")
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return (2, 0, "")
+    return (1, 0, v)
 
 
 def main(argv=None):
