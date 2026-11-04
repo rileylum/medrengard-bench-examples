@@ -757,13 +757,60 @@ def load_file(path, fmt, comp):
     return load_json(path, comp)
 
 
+def is_blank_file(path, comp):
+    try:
+        with open_binary(path, comp) as f:
+            data = f.read()
+    except (OSError, EOFError):
+        return False
+    if not data:
+        return True
+    try:
+        return data.decode('utf-8-sig').strip() == ''
+    except UnicodeDecodeError:
+        return False
+
+
+def parse_sharded(spec):
+    if '=' not in spec:
+        raise QueryError('Invalid --sharded value (expected <table>=<glob>): %s' % spec)
+    name, pattern = spec.split('=', 1)
+    name = name.strip()
+    if not name or not pattern:
+        raise QueryError('Invalid --sharded value (expected <table>=<glob>): %s' % spec)
+    return name, pattern
+
+
 class Catalog:
-    def __init__(self, root):
-        if not os.path.isdir(root):
-            raise QueryError('Data directory not found: %s' % root)
+    def __init__(self, root, sharded=None):
         self.root = root
         self.files = {}   # table name -> list of (path, fmt, comp)
         self.cache = {}
+        self.sharded = set()
+        if root is not None:
+            if not os.path.isdir(root):
+                raise QueryError('Data directory not found: %s' % root)
+            self._scan(root)
+        for spec in sharded or ():
+            self.add_sharded(*parse_sharded(spec))
+
+    def add_sharded(self, name, pattern):
+        import glob as _glob
+        paths = sorted(p for p in _glob.glob(pattern, recursive=True) if os.path.isfile(p))
+        entries = []
+        for p in paths:
+            info = split_data_name(os.path.basename(p))
+            if info is None:
+                continue
+            entries.append((p, info[1], info[2]))
+        # sharded table overrides any same-named (case-insensitive) table
+        for k in [k for k in self.files if k.lower() == name.lower()]:
+            del self.files[k]
+            self.sharded.discard(k)
+        self.files[name] = entries
+        self.sharded.add(name)
+
+    def _scan(self, root):
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames.sort()
             for fn in sorted(filenames):
@@ -800,8 +847,13 @@ class Catalog:
         header = None
         first_path = None
         raw = []
+        is_sharded = name in self.sharded
         for path, fmt, comp in self.files[name]:
+            if is_sharded and is_blank_file(path, comp):
+                continue
             h, r = load_file(path, fmt, comp)
+            if is_sharded and not h and not r:
+                continue
             if len(set(h)) != len(h):
                 raise QueryError('Duplicate column names in %s' % path)
             if header is None:
@@ -817,8 +869,10 @@ class Catalog:
                 pos = [h.index(c) for c in header]
                 r = [[row[i] for i in pos] for row in r]
             raw.extend(r)
+        if header is None:
+            header = []
         width = len(header)
-        if width == 0:
+        if width == 0 and not is_sharded:
             raise QueryError('No columns found for table %s' % name)
         cols = [infer_column([r[i] for r in raw]) for i in range(width)]
         rows = [tuple(cols[i][j] for i in range(width)) for j in range(len(raw))]
@@ -1399,22 +1453,26 @@ def read_sql(arg):
     return arg
 
 
-def run(data, sql_arg, out=None):
+def run(data, sql_arg, out=None, sharded=None):
     sql = read_sql(sql_arg).strip()
     if not sql:
         raise QueryError('Empty SQL query')
     q = Parser(sql).parse()
-    return execute(q, Catalog(data))
+    return execute(q, Catalog(data, sharded))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description='Run read-only SQL over data files (CSV, TSV, Parquet, JSON, JSONL).')
-    ap.add_argument('--data', required=True, help='Directory containing data files')
+    ap.add_argument('--data', help='Directory containing data files')
+    ap.add_argument('--sharded', action='append', default=[], metavar='TABLE=GLOB',
+                    help='Merge files matching GLOB into table TABLE (repeatable)')
     ap.add_argument('--sql', required=True, help='SQL query string or path to .sql file')
     ap.add_argument('--out', help='Optional output CSV path')
     args = ap.parse_args(argv)
     try:
-        names, rows = run(args.data, args.sql)
+        if args.data is None and not args.sharded:
+            ap.error('one of --data or --sharded is required')
+        names, rows = run(args.data, args.sql, sharded=args.sharded)
         if args.out:
             write_csv(args.out, names, rows)
     except QueryError as e:
