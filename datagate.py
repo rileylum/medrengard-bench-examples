@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -44,13 +45,203 @@ FALSE_VALUES = ("0", "false", "no", "off")
 def parse_bool_env(name, raw, default):
     if raw is None:
         return default
-    v = raw.lower()
+    v = raw.strip().lower()
     if v in TRUE_VALUES:
         return True
     if v in FALSE_VALUES:
         return False
     raise ValueError("Invalid value for %s: %r (expected one of %s)"
                      % (name, raw, ", ".join(TRUE_VALUES + FALSE_VALUES)))
+
+
+# ---------------------------------------------------------------- config
+
+MAX_SOURCE_SIZE = None     # int bytes, None = unlimited
+ORIGIN_ALLOWLIST = None    # list of lower-case domain suffixes, None = all allowed
+REQUIRE_TLS = False
+STORAGE_DIR = None
+DEFAULT_STORAGE_DIR = os.path.join(tempfile.gettempdir(), "datagate-storage")
+CONFIG_KEYS = ("MAX_SOURCE_SIZE", "ORIGIN_ALLOWLIST", "REQUIRE_TLS", "STORAGE_DIR", "CACHE_ENABLED")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def read_config_file(path):
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError("Cannot read config file %r: %s" % (path, e))
+    values = {}
+    for lineno, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith(";"):
+            continue
+        if s.startswith("export "):
+            s = s[7:].lstrip()
+        if "=" not in s:
+            raise ConfigError("Config file %r line %d: expected KEY=VALUE" % (path, lineno))
+        key, value = s.split("=", 1)
+        key = key.strip().upper()
+        if not key or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
+            raise ConfigError("Config file %r line %d: invalid key %r" % (path, lineno, key))
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def parse_size(raw):
+    s = raw.strip()
+    if s == "":
+        return None
+    if not re.fullmatch(r"\+?[0-9]+", s):
+        raise ConfigError("Invalid value for MAX_SOURCE_SIZE: %r (expected a non-negative integer)" % raw)
+    return int(s)
+
+
+def normalise_suffix(entry):
+    e = entry.strip().lower()
+    if "://" in e:
+        try:
+            e = urllib.parse.urlsplit(e).hostname or ""
+        except ValueError:
+            e = ""
+    if e.startswith("*"):
+        e = e[1:]
+    e = e.strip(".")
+    if not e or any(c.isspace() or c in "/?#@" for c in e):
+        raise ConfigError("Invalid ORIGIN_ALLOWLIST entry: %r" % entry)
+    return e
+
+
+def parse_allowlist(raw):
+    entries = [p for p in raw.split(",") if p.strip() != ""]
+    if not entries:
+        return None
+    return [normalise_suffix(p) for p in entries]
+
+
+def load_config(environ=None):
+    environ = os.environ if environ is None else environ
+    values = {}
+    path = environ.get("DATAGATE_CONFIG")
+    if path is not None and path.strip() != "":
+        for k, v in read_config_file(path).items():
+            values[k] = v
+    for k in CONFIG_KEYS:
+        if k in environ:
+            values[k] = environ[k]
+    cfg = {"MAX_SOURCE_SIZE": None, "ORIGIN_ALLOWLIST": None, "REQUIRE_TLS": False,
+           "STORAGE_DIR": DEFAULT_STORAGE_DIR, "CACHE_ENABLED": True}
+    try:
+        if "MAX_SOURCE_SIZE" in values:
+            cfg["MAX_SOURCE_SIZE"] = parse_size(values["MAX_SOURCE_SIZE"])
+        if "ORIGIN_ALLOWLIST" in values:
+            cfg["ORIGIN_ALLOWLIST"] = parse_allowlist(values["ORIGIN_ALLOWLIST"])
+        for k in ("REQUIRE_TLS", "CACHE_ENABLED"):
+            if k in values:
+                cfg[k] = parse_bool_env(k, values[k], cfg[k])
+    except ValueError as e:
+        raise ConfigError(str(e))
+    if "STORAGE_DIR" in values and values["STORAGE_DIR"].strip() != "":
+        cfg["STORAGE_DIR"] = os.path.expanduser(values["STORAGE_DIR"].strip())
+    return cfg
+
+
+def apply_config(cfg):
+    global MAX_SOURCE_SIZE, ORIGIN_ALLOWLIST, REQUIRE_TLS, STORAGE_DIR, CACHE_ENABLED
+    MAX_SOURCE_SIZE = cfg["MAX_SOURCE_SIZE"]
+    ORIGIN_ALLOWLIST = cfg["ORIGIN_ALLOWLIST"]
+    REQUIRE_TLS = cfg["REQUIRE_TLS"]
+    CACHE_ENABLED = cfg["CACHE_ENABLED"]
+    path = os.path.abspath(cfg["STORAGE_DIR"])
+    try:
+        os.makedirs(path, exist_ok=True)
+        if not os.path.isdir(path) or not os.access(path, os.W_OK | os.X_OK):
+            raise OSError("not a writable directory")
+    except OSError as e:
+        raise ConfigError("Cannot use STORAGE_DIR %r: %s" % (path, e))
+    STORAGE_DIR = path
+
+
+def origin_allowed(referer):
+    if not referer or not referer.strip():
+        return False
+    try:
+        host = urllib.parse.urlsplit(referer.strip()).hostname
+    except ValueError:
+        host = None
+    if not host:
+        return False
+    host = host.lower().rstrip(".")
+    for suffix in ORIGIN_ALLOWLIST:
+        if host == suffix or host.endswith("." + suffix):
+            return True
+    return False
+
+
+def check_size(n):
+    if MAX_SOURCE_SIZE is not None and n > MAX_SOURCE_SIZE:
+        raise ApiError(400, "Source size %d bytes exceeds maximum of %d bytes" % (n, MAX_SOURCE_SIZE))
+
+
+# ---------------------------------------------------------------- storage
+
+ID_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def dataset_path(did):
+    if STORAGE_DIR is None or not ID_RE.fullmatch(did):
+        return None
+    return os.path.join(STORAGE_DIR, did + ".json")
+
+
+def store_dataset(did, ds):
+    with LOCK:
+        DATASETS[did] = ds
+    path = dataset_path(did)
+    if path is None:
+        return
+    body = json.dumps(ds, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=STORAGE_DIR, prefix="." + did, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def get_dataset(did):
+    with LOCK:
+        ds = DATASETS.get(did)
+    if ds is not None:
+        return ds
+    path = dataset_path(did)
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as f:
+            ds = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(ds, dict) or "columns" not in ds or "rows" not in ds:
+        return None
+    with LOCK:
+        DATASETS.setdefault(did, ds)
+        return DATASETS[did]
+
+
+def has_dataset(did):
+    return get_dataset(did) is not None
 
 
 def ingest_lock(key):
@@ -105,11 +296,13 @@ def fetch(source):
     req = urllib.request.Request(source, headers={"User-Agent": "datagate/1.0", "Accept": "text/csv, text/plain, */*"})
     try:
         with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
-            data = resp.read(MAX_BYTES + 1)
+            cap = MAX_BYTES if MAX_SOURCE_SIZE is None else min(MAX_BYTES, MAX_SOURCE_SIZE)
+            data = resp.read(cap + 1)
     except urllib.error.HTTPError as e:
         raise ApiError(404, "Remote source returned HTTP %d" % e.code)
     except Exception as e:  # URLError, timeouts, connection errors, ...
         raise ApiError(404, "Source unreachable: %s" % (getattr(e, "reason", None) or e))
+    check_size(len(data))
     if len(data) > MAX_BYTES:
         raise ApiError(400, "Source too large")
     return data
@@ -465,7 +658,34 @@ class Handler(BaseHTTPRequestHandler):
     def error(self, status, message):
         self.send_json(status, {"ok": False, "error": message})
 
+    def gate(self):
+        """Origin allowlist check; returns True if the request may proceed."""
+        if ORIGIN_ALLOWLIST is None:
+            return True
+        referer = self.headers.get("Referer")
+        if referer is None or not referer.strip():
+            msg = "Missing Referer header"
+        elif not origin_allowed(referer):
+            msg = "Referer origin not allowed"
+        else:
+            return True
+        self.discard_body()
+        self.error(403, msg)
+        return False
+
+    def endpoint(self, did):
+        rel = "/datasets/%s" % did
+        if not REQUIRE_TLS:
+            return rel
+        host = (self.headers.get("Host") or "").strip()
+        if not host:
+            addr = self.server.server_address
+            host = "%s:%d" % (addr[0], addr[1])
+        return "https://%s%s" % (host, rel)
+
     def do_OPTIONS(self):
+        if not self.gate():
+            return
         self.send_response(204)
         self.cors()
         self.send_header("Content-Length", "0")
@@ -490,6 +710,8 @@ class Handler(BaseHTTPRequestHandler):
         return None, None, params
 
     def do_GET(self):
+        if not self.gate():
+            return
         try:
             kind, arg, params = self.route()
             if kind == "convert":
@@ -510,6 +732,8 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def _other(self):
+        if not self.gate():
+            return
         self.discard_body()
         kind, _, _ = self.route()
         if kind is None:
@@ -520,12 +744,16 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_PATCH = _other
 
     def do_POST(self):
+        if not self.gate():
+            return
         try:
             kind, _, params = self.route()
             if kind == "upload":
                 self.handle_upload(params)
             else:
-                self._other()
+                self.discard_body()
+                self.error(404 if kind is None else 405,
+                           "Not found" if kind is None else "Method not allowed")
         except ApiError as e:
             self.error(e.status, e.message)
         except Exception as e:  # pragma: no cover
@@ -596,15 +824,15 @@ class Handler(BaseHTTPRequestHandler):
         if not files:
             raise ApiError(400, "Missing file field ('file' or 'attachment')")
         data = files[0]
+        check_size(len(data))
         charset = params.get("charset", [None])[0]
         if charset is None and fields.get("charset"):
             charset = fields["charset"][0].decode("utf-8", "replace")
         charset = validate_charset(charset) if charset is not None else None
         columns, rows, raw = ingest(data, charset)
         did = hashlib.sha256(data).hexdigest()[:16]
-        with LOCK:
-            DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw}
-        self.send_json(200, {"ok": True, "endpoint": "/datasets/%s" % did})
+        store_dataset(did, {"columns": columns, "rows": rows, "raw": raw})
+        self.send_json(200, {"ok": True, "endpoint": self.endpoint(did)})
 
     def handle_convert(self, params):
         sources = params.get("source")
@@ -620,7 +848,7 @@ class Handler(BaseHTTPRequestHandler):
         charset = validate_charset(charset) if charset is not None else None
         did = dataset_id(source)
         key = (source, charset)
-        response = {"ok": True, "endpoint": "/datasets/%s" % did}
+        response = {"ok": True, "endpoint": self.endpoint(did)}
         use_cache = CACHE_ENABLED and not force
         if use_cache:
             with LOCK:
@@ -639,8 +867,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, response)
             data = fetch(source)
             columns, rows, raw = ingest(data, charset)
+            store_dataset(did, {"columns": columns, "rows": rows, "raw": raw})
             with LOCK:
-                DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw}
                 # the dataset id is per-source; drop entries for other charsets
                 for k in [k for k, v in CACHE.items() if v == did]:
                     del CACHE[k]
@@ -649,8 +877,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, response)
 
     def query(self, did, params, start):
-        with LOCK:
-            ds = DATASETS.get(did)
+        ds = get_dataset(did)
         if ds is None:
             raise ApiError(404, "Dataset not found")
         columns = list(ds["columns"])
@@ -886,10 +1113,9 @@ def main(argv=None):
     start.add_argument("--address", default="127.0.0.1")
     args = parser.parse_args(argv)
     if args.command == "start":
-        global CACHE_ENABLED
         try:
-            CACHE_ENABLED = parse_bool_env("CACHE_ENABLED", os.environ.get("CACHE_ENABLED"), True)
-        except ValueError as e:
+            apply_config(load_config())
+        except ConfigError as e:
             print("datagate: %s" % e, file=sys.stderr, flush=True)
             sys.exit(2)
         ThreadingHTTPServer.daemon_threads = True
