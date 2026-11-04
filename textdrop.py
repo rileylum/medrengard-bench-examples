@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """TextDrop - self-hosted text sharing service."""
 import argparse
+import base64
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -20,6 +23,36 @@ NOTE_RE = re.compile(r"^/n/([A-Za-z0-9]{4,12})$")
 NOTE_TEXT_RE = re.compile(r"^/n/([A-Za-z0-9]{4,12})/text$")
 MAX_BODY = 10 * 1024 * 1024
 START_TIME = time.time()
+OPS_SECRET = ""
+ID_SEED = ""
+DRAINED = False
+USER_COOKIE = "user_id"
+
+
+def _b64u(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _user_sig(seed, uid):
+    return _b64u(hmac.new(seed.encode("utf-8"), b"textdrop-user:" + uid.encode("ascii"),
+                          hashlib.sha256).digest())
+
+
+def make_user_token(seed):
+    uid = _b64u(secrets.token_bytes(16))
+    return f"{uid}.{_user_sig(seed, uid)}"
+
+
+def valid_user_token(seed, token):
+    if not seed or not token or not isinstance(token, str):
+        return False
+    parts = token.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return False
+    uid, sig = parts
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", uid):
+        return False
+    return hmac.compare_digest(sig.encode("ascii", "replace"), _user_sig(seed, uid).encode("ascii"))
 
 
 class Store:
@@ -34,10 +67,13 @@ class Store:
             )
             self.conn.commit()
 
-    def create(self, content, mode=""):
+    def create(self, content, mode="", user=""):
         with self.lock:
             while True:
-                nid = "".join(secrets.choice(ALPHABET) for _ in range(ID_LEN))
+                digest = hashlib.sha256(
+                    secrets.token_bytes(16) + b"\0" + user.encode("utf-8") + b"\0"
+                    + content.encode("utf-8")).digest()
+                nid = "".join(ALPHABET[b % len(ALPHABET)] for b in digest[:ID_LEN])
                 try:
                     self.conn.execute(
                         "INSERT INTO notes (id, content, mode, created) VALUES (?, ?, ?, ?)",
@@ -781,10 +817,14 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path_only()
         if path in ("/", "/submit"):
             return self.send_html(200, editor_page())
-        if path == "/health":
+        if path in ("/health", "/_health"):
+            if DRAINED:
+                return self.send(404, '{"status":"drained"}', "application/json")
             body = json.dumps({"status": "active", "notes": STORE.count(),
                                "uptime": round(time.time() - START_TIME, 3)})
             return self.send(200, body, "application/json")
+        if path == "/_ops/drain":
+            return self.drain()
         m = NOTE_TEXT_RE.match(path)
         if m:
             content = STORE.get(m.group(1))
@@ -833,6 +873,29 @@ class Handler(BaseHTTPRequestHandler):
         return self.not_found()
 
     do_HEAD = do_GET
+
+    def drain(self):
+        global DRAINED
+        auth = self.headers.get_all("Authorization") or []
+        ok = (bool(OPS_SECRET) and len(auth) == 1
+              and hmac.compare_digest(auth[0].encode("utf-8", "surrogateescape"),
+                                      ("Bearer " + OPS_SECRET).encode("utf-8", "surrogateescape")))
+        if not ok:
+            return self.send(401, '{"error":"unauthorized"}', "application/json")
+        DRAINED = True
+        return self.send(200, '{"status":"ok"}', "application/json")
+
+    def user_cookie(self):
+        for raw in self.headers.get_all("Cookie") or []:
+            for part in raw.split(";"):
+                name, sep, val = part.strip().partition("=")
+                if sep and name.strip() == USER_COOKIE:
+                    val = val.strip()
+                    if len(val) >= 2 and val[0] == val[-1] == '"':
+                        val = val[1:-1]
+                    if valid_user_token(ID_SEED, val):
+                        return val
+        return None
 
     def read_body(self):
         length = self.headers.get("Content-Length")
@@ -909,13 +972,22 @@ class Handler(BaseHTTPRequestHandler):
                     f"{rendered}")
             return self.send_html(200, page(f"{title or 'TextDrop'} - Preview", body, raw_title=True,
                                             head=og_head(title, preview)))
-        nid = STORE.create(content, mode)
+        headers = {}
+        user = ""
+        if ID_SEED:
+            user = self.user_cookie()
+            if user is None:
+                user = make_user_token(ID_SEED)
+                headers["Set-Cookie"] = (f"{USER_COOKIE}={user}; Path=/; Max-Age=31536000; "
+                                         "HttpOnly; SameSite=Lax")
+        nid = STORE.create(content, mode, user.split(".", 1)[0])
         loc = f"/n/{nid}"
+        headers["Location"] = loc
         self.send_html(302, page("Redirect", f"<p>Redirecting to <a href=\"{loc}\">{loc}</a></p>"),
-                       {"Location": loc})
+                       headers)
 
     def _known(self, path):
-        if path in ("/", "/submit", "/health", "/robots.txt") or path in DOC_ROUTES:
+        if path in ("/", "/submit", "/health", "/_health", "/_ops/drain", "/robots.txt") or path in DOC_ROUTES:
             return True
         if path == "/favicon.ico":
             return get_static("favicon.ico") is not None
@@ -945,7 +1017,14 @@ def main(argv=None):
     p.add_argument("--db", default=None, help="SQLite database path")
     p.add_argument("--debug", action="store_true",
                    help="load templates, static assets and docs from ./templates, ./static and ./docs")
+    p.add_argument("--ops_secret", "--ops-secret", dest="ops_secret", default=None,
+                   help="bearer token for /_ops/drain (env: TEXTDROP_OPS_SECRET)")
+    p.add_argument("--id_seed", "--id-seed", dest="id_seed", default=None,
+                   help="seed for signing user_id cookies (env: TEXTDROP_ID_SEED)")
     a = p.parse_args(argv)
+    global OPS_SECRET, ID_SEED
+    OPS_SECRET = a.ops_secret if a.ops_secret is not None else os.environ.get("TEXTDROP_OPS_SECRET", "")
+    ID_SEED = a.id_seed if a.id_seed is not None else os.environ.get("TEXTDROP_ID_SEED", "")
     global DEBUG
     DEBUG = bool(a.debug)
     init_docs()
