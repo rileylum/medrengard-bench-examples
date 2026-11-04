@@ -196,10 +196,11 @@ def parse_csv(text):
             raise ApiError(400, "Content is not tabular CSV data")
     _, _, rows = best
     header = [h.strip() for h in rows[0]]
-    data = [[convert_value(v) for v in r] for r in rows[1:]]
+    raw = [list(r) for r in rows[1:]]
+    data = [[convert_value(v) for v in r] for r in raw]
     if not data:
         raise ApiError(400, "CSV must contain a header row and at least one data row")
-    return header, data
+    return header, data, raw
 
 
 INT_RE = re.compile(r"[+-]?(0|[1-9][0-9]*)")
@@ -299,10 +300,10 @@ class Handler(BaseHTTPRequestHandler):
         charset = validate_charset(charset) if charset is not None else None
         data = fetch(source)
         text = decode(data, charset)
-        columns, rows = parse_csv(text)
+        columns, rows, raw = parse_csv(text)
         did = dataset_id(source)
         with LOCK:
-            DATASETS[did] = {"columns": columns, "rows": rows}
+            DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw}
         self.send_json(200, {"ok": True, "endpoint": "/datasets/%s" % did})
 
     def handle_dataset(self, did, params):
@@ -313,15 +314,19 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(404, "Dataset not found")
         columns = list(ds["columns"])
         opts = parse_controls(params, columns)
-        indexed = list(enumerate(ds["rows"], start=1))
+        filters = parse_filters(params, columns)
+        deadline = start + QUERY_TIMEOUT
+        indexed = apply_filters(ds, filters, deadline)
         if opts["sort_col"] is not None:
             ci = columns.index(opts["sort_col"])
             def key(item):
                 return sort_key(item[1][ci] if ci < len(item[1]) else None)
             filled = [it for it in indexed if key(it)[0] != 2]
             blank = [it for it in indexed if key(it)[0] == 2]
+            check_deadline(deadline)
             filled.sort(key=key, reverse=opts["sort_desc"])  # stable either way
             indexed = filled + blank  # blanks always last, in source order
+            check_deadline(deadline)
         total = len(indexed)
         off, size = opts["offset"], opts["size"]
         page = indexed[off:off + size]
@@ -396,6 +401,99 @@ def parse_controls(params, columns):
     else:
         opts["sort_col"], opts["sort_desc"] = None, False
     return opts
+
+
+QUERY_TIMEOUT = 5.0  # seconds
+COMPARATORS = ("exact", "contains", "less", "greater")
+
+
+def parse_filters(params, columns):
+    """Collect `<column>__<comparator>=<value>` filters (non-control params only)."""
+    filters = []
+    for key, vals in params.items():
+        if key.startswith("_") or "__" not in key:
+            continue
+        column, comparator = key.rsplit("__", 1)
+        if comparator not in COMPARATORS:
+            raise ApiError(400, "Invalid comparator %r in filter %r (expected one of: %s)"
+                           % (comparator, key, ", ".join(COMPARATORS)))
+        if len(vals) > 1:
+            raise ApiError(400, "Duplicate filter key %r" % key)
+        if column not in columns:
+            raise ApiError(400, "Unknown filter column %r" % column)
+        value = vals[0]
+        target = value
+        if comparator in ("less", "greater"):
+            target = to_number(value)
+            if target is None:
+                raise ApiError(400, "Filter %r requires a numeric value, got %r" % (key, value))
+        filters.append((columns.index(column), comparator, value, target))
+    return filters
+
+
+def to_number(v):
+    if isinstance(v, bool):
+        return float(v)
+    if isinstance(v, (int, float)):
+        return float(v)
+    if not isinstance(v, str):
+        return None
+    try:
+        f = float(v.strip())
+    except ValueError:
+        return None
+    if f != f:  # NaN never compares meaningfully
+        return None
+    return f
+
+
+def display(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    return json.dumps(v)
+
+
+def check_deadline(deadline):
+    if time.perf_counter() > deadline:
+        raise ApiError(400, "Query timed out")
+
+
+def match(stored, raw, comparator, value, target):
+    if comparator == "exact":
+        return raw == value or display(stored) == value
+    if comparator == "contains":
+        d = display(stored)
+        return (raw is not None and value in raw) or (d is not None and value in d)
+    n = to_number(stored)
+    if n is None and raw is not None:
+        n = to_number(raw)
+    if n is None:
+        return False
+    return n < target if comparator == "less" else n > target
+
+
+def apply_filters(ds, filters, deadline):
+    rows, raws = ds["rows"], ds.get("raw") or ds["rows"]
+    out = []
+    for i, row in enumerate(rows):
+        if filters and i % 1024 == 0:
+            check_deadline(deadline)
+        ok = True
+        raw = raws[i]
+        for ci, comparator, value, target in filters:
+            stored = row[ci] if ci < len(row) else None
+            r = raw[ci] if ci < len(raw) else None
+            if not isinstance(r, str):
+                r = display(r)
+            if not match(stored, r, comparator, value, target):
+                ok = False
+                break
+        if ok:
+            out.append((i + 1, row))
+    check_deadline(deadline)
+    return out
 
 
 def sort_key(v):
