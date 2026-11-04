@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """TextDrop: a small self-hosted text sharing service (stdlib only)."""
 import argparse
+import base64
+import hashlib
+import hmac
 import html
 import json
 import mimetypes
@@ -28,10 +31,10 @@ class NoteStore:
         self._notes = {}
         self._lock = threading.Lock()
 
-    def add(self, content, mode=""):
+    def add(self, content, mode="", user=None):
         with self._lock:
             while True:
-                nid = "".join(secrets.choice(ALPHABET) for _ in range(ID_LENGTH))
+                nid = _make_id(content, user)
                 if nid not in self._notes:
                     self._notes[nid] = (content, mode)
                     return nid
@@ -50,8 +53,82 @@ class NoteStore:
             return len(self._notes)
 
 
+def _make_id(content, user=None):
+    """Generate a note ID from a random salt mixed with the user identity."""
+    h = hashlib.sha256()
+    h.update(secrets.token_bytes(16))
+    h.update(b"\0")
+    h.update((user or "").encode("utf-8", "replace"))
+    h.update(b"\0")
+    h.update(content.encode("utf-8", "replace"))
+    n = int.from_bytes(h.digest(), "big")
+    out = []
+    for _ in range(ID_LENGTH):
+        n, r = divmod(n, len(ALPHABET))
+        out.append(ALPHABET[r])
+    return "".join(out)
+
+
 STORE = NoteStore()
 START_TIME = time.time()
+
+
+class OpsState:
+    """Operational configuration and lifecycle state."""
+
+    def __init__(self):
+        self.ops_secret = ""
+        self.id_seed = ""
+        self.drained = False
+        self._lock = threading.Lock()
+
+    def drain(self):
+        with self._lock:
+            self.drained = True
+
+
+OPS = OpsState()
+
+
+def _b64(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _user_sig(seed, nonce):
+    return _b64(hmac.new(seed.encode("utf-8"), b"textdrop-user:" + nonce.encode("ascii"),
+                         hashlib.sha256).digest())
+
+
+def new_user_token(seed):
+    nonce = _b64(secrets.token_bytes(18))
+    return f"{nonce}.{_user_sig(seed, nonce)}"
+
+
+_TOKEN_RE = re.compile(r"^([A-Za-z0-9_-]{16,64})\.([A-Za-z0-9_-]{43})$")
+
+
+def valid_user_token(seed, token):
+    if not seed or not token:
+        return False
+    m = _TOKEN_RE.match(token)
+    if not m:
+        return False
+    return hmac.compare_digest(m.group(2), _user_sig(seed, m.group(1)))
+
+
+def parse_cookies(header_values):
+    cookies = {}
+    for value in header_values:
+        for part in value.split(";"):
+            if "=" not in part:
+                continue
+            name, val = part.split("=", 1)
+            name = name.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            cookies.setdefault(name, []).append(val)
+    return cookies
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -336,7 +413,8 @@ class Handler(BaseHTTPRequestHandler):
         return unquote(urlsplit(self.path).path)
 
     def _route_kind(self, path):
-        if path in ("/", "/submit", "/health", "/robots.txt", "/favicon.ico"):
+        if path in ("/", "/submit", "/health", "/_health", "/_ops/drain",
+                    "/robots.txt", "/favicon.ico"):
             return path
         if path in RESOURCES.doc_routes:
             return "doc"
@@ -358,13 +436,17 @@ class Handler(BaseHTTPRequestHandler):
         path = self._path()
         if path in ("/", "/submit"):
             return self._html(200, editor_page())
-        if path == "/health":
+        if path in ("/health", "/_health"):
+            if OPS.drained:
+                return self._send(404, '{"status":"drained"}', "application/json")
             body = json.dumps({
                 "status": "active",
                 "notes": STORE.count(),
                 "uptime_seconds": round(time.time() - START_TIME, 3),
             })
             return self._send(200, body, "application/json")
+        if path == "/_ops/drain":
+            return self._drain()
         if path == "/robots.txt":
             return self._send(200, ROBOTS_TXT, "text/plain; charset=utf-8")
         if path == "/favicon.ico":
@@ -398,6 +480,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, content, "text/plain; charset=utf-8")
         return self._not_found()
 
+    def _drain(self):
+        secret = OPS.ops_secret
+        auth = self.headers.get_all("Authorization") or []
+        ok = False
+        if secret and len(auth) == 1:
+            expected = ("Bearer " + secret).encode("utf-8")
+            got = auth[0].encode("latin-1", "replace")
+            ok = hmac.compare_digest(got, expected)
+        if not ok:
+            return self._send(401, '{"error":"unauthorized"}', "application/json")
+        OPS.drain()
+        return self._send(200, '{"status":"ok"}', "application/json")
+
+    def _user_token(self):
+        """Return (token, is_new) for the current request, or (None, False)."""
+        seed = OPS.id_seed
+        if not seed:
+            return None, False
+        cookies = parse_cookies(self.headers.get_all("Cookie") or [])
+        for val in cookies.get("user_id", []):
+            if valid_user_token(seed, val):
+                return val, False
+        return new_user_token(seed), True
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -427,10 +533,15 @@ class Handler(BaseHTTPRequestHandler):
         content, mode = parsed
         if path == "/render":
             return self._html(200, render_note_page(content, mode, None))
-        nid = STORE.add(content, mode)
+        token, is_new = self._user_token()
+        nid = STORE.add(content, mode, token)
         loc = f"/n/{nid}"
+        headers = {"Location": loc}
+        if token is not None and is_new:
+            headers["Set-Cookie"] = (f"user_id={token}; Path=/; Max-Age=31536000; "
+                                     "HttpOnly; SameSite=Lax")
         self._html(302, page("Redirecting", f'<p>Redirecting to <a href="{loc}">{loc}</a>.</p>'),
-                   {"Location": loc})
+                   headers)
 
     def _parse_submission(self):
         """Return (content, mode), or None after sending an error response."""
@@ -502,7 +613,16 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=None, help="port to listen on (default: 8080)")
     parser.add_argument("--debug", action="store_true",
                         help="load templates, static assets and docs from the working directory")
+    parser.add_argument("--ops_secret", "--ops-secret", dest="ops_secret", default=None,
+                        help="bearer token for /_ops/drain (env: TEXTDROP_OPS_SECRET)")
+    parser.add_argument("--id_seed", "--id-seed", dest="id_seed", default=None,
+                        help="seed for user identity tokens (env: TEXTDROP_ID_SEED)")
     args = parser.parse_args(argv)
+
+    OPS.ops_secret = (args.ops_secret if args.ops_secret is not None
+                      else os.environ.get("TEXTDROP_OPS_SECRET", ""))
+    OPS.id_seed = (args.id_seed if args.id_seed is not None
+                   else os.environ.get("TEXTDROP_ID_SEED", ""))
 
     global RESOURCES
     RESOURCES = Resources(debug=args.debug)
