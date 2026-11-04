@@ -225,8 +225,10 @@ def _load_record(did):
 
 
 def _register_record(did, rec):
+    enr = rec.get("enrichment")
     DATASETS[did] = {"columns": rec["columns"], "rows": rec["rows"],
-                     "raw": rec.get("raw"), "source": rec.get("source")}
+                     "raw": rec.get("raw"), "source": rec.get("source"),
+                     "enrichment": enr if isinstance(enr, dict) else None}
     src = rec.get("source")
     if isinstance(src, str) and not src.startswith("upload:") and "enc" in rec:
         CACHE[src] = (did, rec.get("enc"))
@@ -665,12 +667,63 @@ def parse_source(data, enc=None, charset=None, filename=None, ctype=None):
     return parse_csv(text)
 
 
-def store_dataset(did, columns, rows, raw, source, enc=None, cacheable=False):
+def _classify_column(values):
+    kinds = set()
+    distinct = set()
+    missing = 0
+    for v in values:
+        s = "" if v is None else str(v).strip()
+        if s == "":
+            missing += 1
+            continue
+        distinct.add(s)
+        cv = convert_value(s)
+        if isinstance(cv, bool) or not isinstance(cv, (int, float)):
+            kinds.add("text")
+        elif isinstance(cv, int):
+            kinds.add("integer")
+        else:
+            kinds.add("float")
+    if not kinds or "text" in kinds:
+        t = "text"
+    elif kinds == {"integer"}:
+        t = "integer"
+    elif kinds == {"float"}:
+        t = "float"
+    else:
+        t = "number"
+    return {"type": t, "distinct_count": len(distinct), "missing_count": missing}
+
+
+def compute_enrichment(fmt, columns, rows, raw):
+    """Compute enrichment metadata; raises ApiError on failure."""
+    try:
+        if fmt in ("xls", "xlsx"):
+            return {"dataset_summary": {"filetype": "excel", "row_count": len(rows),
+                                        "column_count": len(columns)}}
+        n = len(columns)
+        details = {}
+        for i, c in enumerate(columns):
+            col = [(r[i] if i < len(r) else "") for r in raw]
+            details[c] = _classify_column(col)
+        return {"dataset_summary": {"filetype": "csv", "row_count": len(rows),
+                                    "column_count": n},
+                "column_details": details}
+    except ApiError:
+        raise
+    except Exception as e:
+        raise ApiError(500, "Enrichment failed: %s" % e)
+
+
+def store_dataset(did, columns, rows, raw, source, enc=None, cacheable=False, enrichment=None):
     rec = {"columns": columns, "rows": rows, "raw": raw, "source": source}
     if cacheable:
         rec["enc"] = enc
+    if enrichment is not None:
+        rec["enrichment"] = enrichment
     with LOCK:
-        DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw, "source": source}
+        DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw, "source": source,
+                         "enrichment": enrichment}
     persist_dataset(did, rec)
     return 200, {"ok": True, "endpoint": endpoint_for(did)}
 
@@ -681,6 +734,7 @@ def handle_convert(params, multi=None):
     if len(force_vals) > 1:
         raise ApiError(400, "Parameter force may only be specified once")
     force = len(force_vals) == 1
+    enrich = multi.get("enrich", []) == ["yes"]
     source = params.get("source")
     if source is None or source == "":
         raise ApiError(400, "Missing required parameter: source")
@@ -695,7 +749,8 @@ def handle_convert(params, multi=None):
         with LOCK:
             entry = CACHE.get(source)
             hit = (entry is not None and entry == (did, enc)
-                   and did in DATASETS and DATASETS[did].get("source") == source)
+                   and did in DATASETS and DATASETS[did].get("source") == source
+                   and (not enrich or DATASETS[did].get("enrichment") is not None))
         if hit:
             return 200, {"ok": True, "endpoint": endpoint_for(did)}
     data, ctype = fetch(source)
@@ -703,7 +758,11 @@ def handle_convert(params, multi=None):
     if len(data) > MAX_BYTES:
         raise ApiError(400, "Source too large")
     columns, rows, raw = parse_source(data, enc, charset, ctype=ctype)
-    res = store_dataset(did, columns, rows, raw, source, enc=enc, cacheable=True)
+    enrichment = None
+    if enrich:
+        enrichment = compute_enrichment(detect_format(data, None, ctype), columns, rows, raw)
+    res = store_dataset(did, columns, rows, raw, source, enc=enc, cacheable=True,
+                        enrichment=enrichment)
     with LOCK:
         CACHE[source] = (did, enc)
     return res
@@ -1041,6 +1100,11 @@ def handle_dataset(did, multi=None):
     if ctl.get("_total") != "hide":
         out["total"] = total
     out["query_ms"] = round(elapsed, 3)
+    enr = ds.get("enrichment")
+    if isinstance(enr, dict):
+        for k in ("dataset_summary", "column_details"):
+            if isinstance(enr.get(k), dict):
+                out[k] = enr[k]
     return 200, out
 
 
