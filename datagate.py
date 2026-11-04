@@ -6,6 +6,8 @@ import csv
 import hashlib
 import io
 import json
+import os
+import sys
 import re
 import threading
 import datetime
@@ -36,6 +38,20 @@ MAX_BYTES = 200 * 1024 * 1024
 
 DATASETS = {}
 LOCK = threading.Lock()
+
+CACHE_ENABLED = True
+CACHE = {}  # source URL -> (dataset id, effective encoding)
+_TRUE_VALUES = ("1", "true", "yes", "on")
+_FALSE_VALUES = ("0", "false", "no", "off")
+
+
+def parse_bool_env(value):
+    v = value.lower()
+    if v in _TRUE_VALUES:
+        return True
+    if v in _FALSE_VALUES:
+        return False
+    raise ValueError("invalid boolean value: %r" % value)
 
 INT_RE = re.compile(r"^[+-]?(0|[1-9]\d*)$")
 DEC_RE = re.compile(r"^[+-]?((0|[1-9]\d*)\.\d+|\.\d+|(0|[1-9]\d*)\.)([eE][+-]?\d+)?$|^[+-]?(0|[1-9]\d*)[eE][+-]?\d+$")
@@ -400,7 +416,12 @@ def store_dataset(did, columns, rows, raw, source):
     return 200, {"ok": True, "endpoint": "/datasets/%s" % did}
 
 
-def handle_convert(params):
+def handle_convert(params, multi=None):
+    multi = multi or {}
+    force_vals = multi.get("force", [])
+    if len(force_vals) > 1:
+        raise ApiError(400, "Parameter force may only be specified once")
+    force = len(force_vals) == 1
     source = params.get("source")
     if source is None or source == "":
         raise ApiError(400, "Missing required parameter: source")
@@ -409,11 +430,22 @@ def handle_convert(params):
     enc = None
     if charset is not None:
         enc = validate_charset(charset.strip())
+    did = dataset_id(source)
+    if CACHE_ENABLED and not force:
+        with LOCK:
+            entry = CACHE.get(source)
+            hit = (entry is not None and entry == (did, enc)
+                   and did in DATASETS and DATASETS[did].get("source") == source)
+        if hit:
+            return 200, {"ok": True, "endpoint": "/datasets/%s" % did}
     data, ctype = fetch(source)
     if len(data) > MAX_BYTES:
         raise ApiError(400, "Source too large")
     columns, rows, raw = parse_source(data, enc, charset, ctype=ctype)
-    return store_dataset(dataset_id(source), columns, rows, raw, source)
+    res = store_dataset(did, columns, rows, raw, source)
+    with LOCK:
+        CACHE[source] = (did, enc)
+    return res
 
 
 def _parse_header_params(value):
@@ -785,7 +817,7 @@ class Handler(BaseHTTPRequestHandler):
             params.setdefault(k, v)
             multi.setdefault(k, []).append(v)
         if path == "/convert":
-            return handle_convert(params)
+            return handle_convert(params, multi)
         if path == "/upload":
             raise ApiError(405, "Method not allowed")
         m = re.match(r"^/datasets/([^/]+)/export$", path)
@@ -915,6 +947,15 @@ def main():
     st.add_argument("--port", type=int, default=8001)
     st.add_argument("--address", default="127.0.0.1")
     args = ap.parse_args()
+    global CACHE_ENABLED
+    raw_cache = os.environ.get("CACHE_ENABLED")
+    if raw_cache is not None:
+        try:
+            CACHE_ENABLED = parse_bool_env(raw_cache)
+        except ValueError:
+            sys.stderr.write("datagate: invalid CACHE_ENABLED value %r "
+                             "(expected 1/true/yes/on or 0/false/no/off)\n" % raw_cache)
+            sys.exit(2)
     if args.cmd == "start":
         ThreadingHTTPServer.daemon_threads = True
         ThreadingHTTPServer.allow_reuse_address = True
