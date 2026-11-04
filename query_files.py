@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Run read-only SQL queries over a directory of CSV files.
+"""Run read-only SQL queries over a directory of data files
+(CSV, TSV, Parquet, JSON, JSONL; optionally .gz/.bz2 compressed).
 
 Usage:
     python query_files.py --data <dir> --sql <query or path> [--out <file.csv>]
 """
 import argparse
+import bz2
 import csv
+import gzip
+import io
+import json
 import functools
 import os
 import re
@@ -489,11 +494,50 @@ class Parser:
 # Data loading
 # --------------------------------------------------------------------------
 
+def _native(v):
+    """Normalise a natively-typed value (from JSON/Parquet) for the engine."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        if v != v or v in (float('inf'), float('-inf')):
+            return None if v != v else str(v)
+        return Decimal(repr(v))
+    if isinstance(v, Decimal):
+        if not v.is_finite():
+            return None if v.is_nan() else str(v)
+        return v
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bytes):
+        try:
+            return v.decode('utf-8')
+        except UnicodeDecodeError:
+            return v.hex()
+    if isinstance(v, (list, tuple, dict)):
+        return json.dumps(v, default=str, ensure_ascii=False)
+    if hasattr(v, 'isoformat'):
+        return v.isoformat(sep=' ') if hasattr(v, 'hour') and hasattr(v, 'day') else v.isoformat()
+    return str(v)
+
+
 def infer_column(values):
-    """Convert a list of raw strings (None for empty) to typed values."""
+    """Convert a list of raw values (None = null) to typed values.
+
+    Strings are parsed as numbers when the whole column is numeric; already
+    typed numbers (int/Decimal) participate in the inference."""
     kind = 'int'
     for v in values:
         if v is None:
+            continue
+        if isinstance(v, int):
+            continue
+        if isinstance(v, Decimal):
+            if kind == 'int':
+                kind = 'dec'
             continue
         if kind == 'int' and not INT_RE.match(v):
             kind = 'dec'
@@ -503,8 +547,214 @@ def infer_column(values):
     if kind == 'int':
         return [None if v is None else int(v) for v in values]
     if kind == 'dec':
-        return [None if v is None else Decimal(v) for v in values]
-    return values
+        return [None if v is None else (v if isinstance(v, Decimal) else Decimal(v))
+                for v in values]
+    return [v if v is None or isinstance(v, str) else fmt_value(v) for v in values]
+
+
+FORMATS = ('.csv', '.tsv', '.parquet', '.jsonl', '.ndjson', '.json')
+COMPRESSIONS = ('.gz', '.bz2')
+
+
+def split_data_name(fn):
+    """Return (stem, format, compression) or None if not a data file."""
+    low = fn.lower()
+    comp = None
+    for c in COMPRESSIONS:
+        if low.endswith(c):
+            comp = c
+            low = low[:-len(c)]
+            fn = fn[:-len(c)]
+            break
+    for f in FORMATS:
+        if low.endswith(f) and len(low) > len(f):
+            return fn[:-len(f)], f, comp
+    return None
+
+
+def open_binary(path, comp):
+    if comp == '.gz':
+        return gzip.open(path, 'rb')
+    if comp == '.bz2':
+        return bz2.open(path, 'rb')
+    return open(path, 'rb')
+
+
+def read_text(path, comp):
+    with open_binary(path, comp) as f:
+        data = f.read()
+    return data.decode('utf-8-sig')
+
+
+def load_delimited(path, comp, delim):
+    text = read_text(path, comp)
+    reader = csv.reader(io.StringIO(text, newline=''), delimiter=delim)
+    header = None
+    for row in reader:
+        if row and any(c.strip() for c in row):
+            header = row
+            break
+    if header is None:
+        raise QueryError('Invalid file (no header): %s' % path)
+    header = [h.strip() for h in header]
+    if any(h == '' for h in header):
+        raise QueryError('Invalid header in %s' % path)
+    width = len(header)
+    raw = []
+    for row in reader:
+        if not row:
+            continue
+        if len(row) < width:
+            row = row + [''] * (width - len(row))
+        elif len(row) > width:
+            row = row[:width]
+        raw.append([None if c == '' else c for c in row])
+    return header, raw
+
+
+def records_to_table(records, path):
+    header = []
+    seen = set()
+    for r in records:
+        if not isinstance(r, dict):
+            raise QueryError('Unsupported JSON structure in %s' % path)
+        for k in r:
+            if k not in seen:
+                seen.add(k)
+                header.append(k)
+    raw = [[_native(r.get(k)) for k in header] for r in records]
+    return header, raw
+
+
+def json_to_table(obj, path):
+    if isinstance(obj, list):
+        if obj and all(isinstance(r, list) for r in obj):
+            # list of rows: first row is the header
+            header = [str(h) for h in obj[0]]
+            raw = []
+            for r in obj[1:]:
+                r = list(r[:len(header)]) + [None] * (len(header) - len(r))
+                raw.append([_native(v) for v in r])
+            return header, raw
+        return records_to_table(obj, path)
+    if isinstance(obj, dict):
+        keys = set(obj)
+        if 'columns' in keys and 'data' in keys and isinstance(obj['data'], list) \
+                and isinstance(obj['columns'], list):
+            header = [str(c) for c in obj['columns']]
+            raw = []
+            for r in obj['data']:
+                if isinstance(r, dict):
+                    raw.append([_native(r.get(k)) for k in header])
+                else:
+                    r = list(r[:len(header)]) + [None] * (len(header) - len(r))
+                    raw.append([_native(v) for v in r])
+            return header, raw
+        if 'schema' in keys and 'data' in keys and isinstance(obj['data'], list):
+            header, raw = records_to_table(obj['data'], path)
+            fields = obj['schema'].get('fields') if isinstance(obj['schema'], dict) else None
+            if fields:
+                names = [f.get('name') for f in fields if isinstance(f, dict)]
+                idx_names = obj['schema'].get('primaryKey') or []
+                order = [n for n in names if n in header and n not in idx_names
+                         and n != 'index'] or [n for n in names if n in header]
+                pos = [header.index(n) for n in order]
+                return order, [[r[i] for i in pos] for r in raw]
+            return header, raw
+        vals = list(obj.values())
+        if vals and all(isinstance(v, list) for v in vals):
+            n = max(len(v) for v in vals)
+            header = [str(k) for k in obj]
+            cols = [list(v) + [None] * (n - len(v)) for v in vals]
+            raw = [[_native(c[i]) for c in cols] for i in range(n)]
+            return header, raw
+        if vals and all(isinstance(v, dict) for v in vals):
+            # pandas "columns" orient: {col: {index: value}}
+            index = []
+            seen = set()
+            for v in vals:
+                for k in v:
+                    if k not in seen:
+                        seen.add(k)
+                        index.append(k)
+            header = [str(k) for k in obj]
+            raw = [[_native(v.get(i)) for v in vals] for i in index]
+            return header, raw
+        if not vals:
+            return [], []
+        return records_to_table([obj], path)
+    raise QueryError('Unsupported JSON structure in %s' % path)
+
+
+def load_jsonl(path, comp, text=None):
+    if text is None:
+        text = read_text(path, comp)
+    records = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line, parse_float=Decimal)
+        except ValueError as e:
+            raise QueryError('Invalid JSON in %s (line %d): %s' % (path, i, e))
+        if isinstance(obj, list) and all(isinstance(r, dict) for r in obj):
+            records.extend(obj)
+        else:
+            records.append(obj)
+    return records_to_table(records, path)
+
+
+def load_json(path, comp):
+    text = read_text(path, comp)
+    try:
+        obj = json.loads(text, parse_float=Decimal)
+    except ValueError:
+        return load_jsonl(path, comp, text)
+    return json_to_table(obj, path)
+
+
+def load_parquet(path, comp):
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        raise QueryError('pyarrow is required to read Parquet files')
+    try:
+        if comp:
+            with open_binary(path, comp) as f:
+                buf = io.BytesIO(f.read())
+            table = pq.read_table(buf)
+        else:
+            table = pq.read_table(path)
+    except QueryError:
+        raise
+    except Exception as e:
+        raise QueryError('Invalid Parquet file %s: %s' % (path, e))
+    header = [str(n) for n in table.column_names]
+    # drop pandas index columns that were stored as data
+    meta = table.schema.pandas_metadata or {}
+    idx = [c for c in meta.get('index_columns', []) if isinstance(c, str)]
+    cols = []
+    keep = []
+    for i, name in enumerate(header):
+        if name in idx and name.startswith('__index_level_'):
+            continue
+        keep.append(name)
+        cols.append([_native(v) for v in table.column(i).to_pylist()])
+    n = table.num_rows
+    raw = [[c[j] for c in cols] for j in range(n)]
+    return keep, raw
+
+
+def load_file(path, fmt, comp):
+    if fmt == '.csv':
+        return load_delimited(path, comp, ',')
+    if fmt == '.tsv':
+        return load_delimited(path, comp, '\t')
+    if fmt == '.parquet':
+        return load_parquet(path, comp)
+    if fmt in ('.jsonl', '.ndjson'):
+        return load_jsonl(path, comp)
+    return load_json(path, comp)
 
 
 class Catalog:
@@ -512,19 +762,20 @@ class Catalog:
         if not os.path.isdir(root):
             raise QueryError('Data directory not found: %s' % root)
         self.root = root
-        self.files = {}   # table name -> path
+        self.files = {}   # table name -> list of (path, fmt, comp)
         self.cache = {}
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames.sort()
             for fn in sorted(filenames):
-                if not fn.lower().endswith('.csv'):
+                info = split_data_name(fn)
+                if info is None:
                     continue
+                stem, fmt, comp = info
                 full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, root)
+                rel = os.path.relpath(os.path.join(dirpath, stem), root)
                 parts = rel.split(os.sep)
-                parts[-1] = parts[-1][:-4]
                 name = '.'.join(p.replace('.', '_') for p in parts)
-                self.files[name] = full
+                self.files.setdefault(name, []).append((full, fmt, comp))
 
     def resolve_name(self, name):
         if name in self.files:
@@ -546,29 +797,29 @@ class Catalog:
         name = self.resolve_name(name)
         if name in self.cache:
             return name, self.cache[name]
-        path = self.files[name]
-        with open(path, newline='', encoding='utf-8-sig') as f:
-            reader = csv.reader(f)
-            header = None
-            for row in reader:
-                if row and any(c.strip() for c in row):
-                    header = row
-                    break
+        header = None
+        first_path = None
+        raw = []
+        for path, fmt, comp in self.files[name]:
+            h, r = load_file(path, fmt, comp)
+            if len(set(h)) != len(h):
+                raise QueryError('Duplicate column names in %s' % path)
             if header is None:
-                raise QueryError('Invalid CSV file (no header): %s' % path)
-            header = [h.strip() for h in header]
-            if any(h == '' for h in header):
-                raise QueryError('Invalid CSV header in %s' % path)
-            width = len(header)
-            raw = []
-            for row in reader:
-                if not row:
-                    continue
-                if len(row) < width:
-                    row = row + [''] * (width - len(row))
-                elif len(row) > width:
-                    row = row[:width]
-                raw.append([None if c == '' else c for c in row])
+                header, first_path = h, path
+                raw.extend(r)
+                continue
+            if h != header:
+                if sorted(h) != sorted(header):
+                    raise QueryError(
+                        'Column mismatch for table %s: %s has columns [%s] but %s has '
+                        'columns [%s]' % (name, first_path, ', '.join(header),
+                                          path, ', '.join(h)))
+                pos = [h.index(c) for c in header]
+                r = [[row[i] for i in pos] for row in r]
+            raw.extend(r)
+        width = len(header)
+        if width == 0:
+            raise QueryError('No columns found for table %s' % name)
         cols = [infer_column([r[i] for r in raw]) for i in range(width)]
         rows = [tuple(cols[i][j] for i in range(width)) for j in range(len(raw))]
         self.cache[name] = (header, rows)
@@ -1157,8 +1408,8 @@ def run(data, sql_arg, out=None):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description='Run read-only SQL over CSV files.')
-    ap.add_argument('--data', required=True, help='Directory containing CSV files')
+    ap = argparse.ArgumentParser(description='Run read-only SQL over data files (CSV, TSV, Parquet, JSON, JSONL).')
+    ap.add_argument('--data', required=True, help='Directory containing data files')
     ap.add_argument('--sql', required=True, help='SQL query string or path to .sql file')
     ap.add_argument('--out', help='Optional output CSV path')
     args = ap.parse_args(argv)
@@ -1169,7 +1420,7 @@ def main(argv=None):
     except QueryError as e:
         print('Error: %s' % e, file=sys.stderr)
         return 1
-    except (OSError, UnicodeDecodeError, csv.Error) as e:
+    except (OSError, EOFError, UnicodeDecodeError, csv.Error) as e:
         print('Error: %s' % e, file=sys.stderr)
         return 1
     print(to_markdown(names, rows))
