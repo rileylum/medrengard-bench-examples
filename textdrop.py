@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ALPHABET = string.ascii_letters + string.digits
 ID_LEN = 8
@@ -66,31 +66,113 @@ class Store:
 STORE = None
 
 
+# ---------------------------------------------------------------------------
+# Resources (bundled or, in debug mode, read from the working directory)
+# ---------------------------------------------------------------------------
+
+DEBUG = False
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DEFAULT_TEMPLATE = (
+    "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "<title>{{ title }}</title>\n{{ head }}"
+    "<link rel=\"stylesheet\" href=\"/static/style.css\">\n"
+    "</head>\n<body>\n{{ body }}\n</body>\n</html>\n"
+)
+
+
+def _load_tree(sub):
+    base = os.path.join(APP_DIR, sub)
+    out = {}
+    for dirpath, _, files in os.walk(base):
+        for f in files:
+            full = os.path.join(dirpath, f)
+            rel = os.path.relpath(full, base).replace(os.sep, "/")
+            try:
+                with open(full, "rb") as fh:
+                    out[rel] = fh.read()
+            except OSError:
+                pass
+    return out
+
+
+try:
+    import textdrop_bundle as _bundle
+    BUNDLED_STATIC = dict(_bundle.STATIC)
+    BUNDLED_DOCS = dict(_bundle.DOCS)
+    BUNDLED_TEMPLATES = dict(_bundle.TEMPLATES)
+except ImportError:  # pragma: no cover - fall back to files shipped beside the script
+    BUNDLED_STATIC = _load_tree("static")
+    BUNDLED_DOCS = _load_tree("docs")
+    BUNDLED_TEMPLATES = _load_tree("templates")
+
+
+def _safe_rel(rel):
+    """Validate a relative resource path; return normalized form or None."""
+    if not rel or "\x00" in rel or "\\" in rel or rel.startswith("/"):
+        return None
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    return "/".join(parts)
+
+
+def read_debug_file(sub, rel):
+    """Read ./<sub>/<rel> from the working directory; None if missing or not a regular file."""
+    rel = _safe_rel(rel)
+    if rel is None:
+        return None
+    base = os.path.realpath(os.path.join(os.getcwd(), sub))
+    full = os.path.realpath(os.path.join(base, *rel.split("/")))
+    if not full.startswith(base + os.sep) or not os.path.isfile(full):
+        return None
+    try:
+        with open(full, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def get_template(name="page.html"):
+    data = None
+    if DEBUG:
+        data = read_debug_file("templates", name)
+    if data is None:
+        data = BUNDLED_TEMPLATES.get(name)
+    if data is None:
+        return DEFAULT_TEMPLATE
+    return data.decode("utf-8", errors="replace")
+
+
+_TPL_VAR_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+
+def render_template(tpl, values):
+    return _TPL_VAR_RE.sub(lambda m: values.get(m.group(1), ""), tpl)
+
+
 def page(title, body, raw_title=False, head=""):
     full_title = title if raw_title else f"{title} - TextDrop"
-    return (
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-        f"<title>{html.escape(full_title)}</title>\n"
-        f"{head}"
-        "<style>body{font-family:sans-serif;max-width:900px;margin:2em auto;padding:0 1em}"
-        "textarea{width:100%;min-height:20em;font-family:monospace}"
-        "pre{background:#f4f4f4;padding:1em;overflow:auto;white-space:pre-wrap}</style>\n"
-        "</head>\n<body>\n"
-        f"{body}\n</body>\n</html>\n"
+    return render_template(get_template(), {
+        "title": html.escape(full_title),
+        "head": head,
+        "body": body,
+    })
+
+
+def editor_page():
+    return page(
+        "New note",
+        "<h1>TextDrop</h1>\n"
+        "<form method=\"post\" action=\"/submit\" enctype=\"application/x-www-form-urlencoded\">\n"
+        "<p><textarea name=\"content\" placeholder=\"Paste or type your text here\" required></textarea></p>\n"
+        "<p><label>Format: <select name=\"mode\"><option value=\"\">Plain text</option>"
+        "<option value=\"markdown\">Markdown</option></select></label></p>\n"
+        "<p><button type=\"submit\">Save</button></p>\n"
+        "</form>\n"
+        "<p><a href=\"/about\">About</a> | <a href=\"/help/formatting\">Formatting help</a></p>",
     )
-
-
-EDITOR = page(
-    "New note",
-    "<h1>TextDrop</h1>\n"
-    "<form method=\"post\" action=\"/submit\" enctype=\"application/x-www-form-urlencoded\">\n"
-    "<p><textarea name=\"content\" placeholder=\"Paste or type your text here\" required></textarea></p>\n"
-    "<p><label>Format: <select name=\"mode\"><option value=\"\">Plain text</option>"
-    "<option value=\"markdown\">Markdown</option></select></label></p>\n"
-    "<p><button type=\"submit\">Save</button></p>\n"
-    "</form>",
-)
 
 
 def status_page(code, title, message):
@@ -99,6 +181,106 @@ def status_page(code, title, message):
         f"<h1>{code} {html.escape(title)}</h1>\n<p>{html.escape(message)}</p>\n"
         "<p><a href=\"/\">Back to editor</a></p>",
     )
+
+
+MIME_OVERRIDES = {
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".mjs": "application/javascript",
+    ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp",
+    ".json": "application/json",
+    ".txt": "text/plain",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".map": "application/json",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".xml": "application/xml",
+    ".pdf": "application/pdf",
+    ".wasm": "application/wasm",
+}
+
+
+def mime_for(name):
+    ext = os.path.splitext(name)[1].lower()
+    if ext in MIME_OVERRIDES:
+        return MIME_OVERRIDES[ext]
+    import mimetypes
+    guess, _ = mimetypes.guess_type("x" + ext)
+    return guess or "application/octet-stream"
+
+
+def get_static(rel):
+    rel = _safe_rel(rel)
+    if rel is None:
+        return None
+    if DEBUG:
+        return read_debug_file("static", rel)
+    return BUNDLED_STATIC.get(rel)
+
+
+ROBOTS_TXT = (
+    "User-agent: *\n"
+    "Disallow: /n/\n"
+    "Disallow: /submit\n"
+    "Disallow: /render\n"
+    "Disallow: /_health\n"
+    "Disallow: /_ops/\n"
+    "Allow: /\n"
+)
+
+DOC_ROUTES = {}      # route -> relative path under docs root
+BUNDLED_DOC_PAGES = {}  # route -> (body html, title, preview)
+
+
+def _doc_route(rel):
+    return "/" + rel[:-3]
+
+
+def render_doc(text):
+    rendered, title, preview = render_content(text, "markdown")
+    body = "<p><a href=\"/\">New note</a></p>\n" + rendered
+    return body, title, preview
+
+
+def init_docs():
+    DOC_ROUTES.clear()
+    BUNDLED_DOC_PAGES.clear()
+    for rel, data in BUNDLED_DOCS.items():
+        if rel.endswith(".md") and _safe_rel(rel):
+            route = _doc_route(rel)
+            DOC_ROUTES[route] = rel
+            if not DEBUG:
+                BUNDLED_DOC_PAGES[route] = render_doc(data.decode("utf-8", errors="replace"))
+    if DEBUG:
+        base = os.path.join(os.getcwd(), "docs")
+        for dirpath, _, files in os.walk(base):
+            for f in files:
+                if not f.endswith(".md"):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, f), base).replace(os.sep, "/")
+                if _safe_rel(rel):
+                    DOC_ROUTES[_doc_route(rel)] = rel
+
+
+def get_doc_page(route):
+    rel = DOC_ROUTES.get(route)
+    if rel is None:
+        return None
+    if not DEBUG:
+        return BUNDLED_DOC_PAGES.get(route)
+    data = read_debug_file("docs", rel)
+    if data is None:
+        return None
+    return render_doc(data.decode("utf-8", errors="replace"))
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +780,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path_only()
         if path in ("/", "/submit"):
-            return self.send_html(200, EDITOR)
+            return self.send_html(200, editor_page())
         if path == "/health":
             body = json.dumps({"status": "active", "notes": STORE.count(),
                                "uptime": round(time.time() - START_TIME, 3)})
@@ -626,6 +808,26 @@ class Handler(BaseHTTPRequestHandler):
                 f"<a href=\"/n/{nid}/text\">Raw text</a> | <a href=\"/\">New note</a></p>\n"
                 f"{rendered}"
             )
+            return self.send_html(200, page(title or "TextDrop", body, raw_title=True,
+                                            head=og_head(title, preview)))
+        if path == "/robots.txt":
+            return self.send(200, ROBOTS_TXT, "text/plain")
+        if path == "/favicon.ico":
+            data = get_static("favicon.ico")
+            if data is None:
+                return self.not_found()
+            return self.send(200, data, "image/x-icon")
+        if path == "/static" or path.startswith("/static/"):
+            rel = unquote(path[len("/static/"):]) if path.startswith("/static/") else ""
+            data = get_static(rel)
+            if data is None:
+                return self.not_found()
+            return self.send(200, data, mime_for(rel))
+        if path in DOC_ROUTES:
+            doc = get_doc_page(path)
+            if doc is None:
+                return self.not_found()
+            body, title, preview = doc
             return self.send_html(200, page(title or "TextDrop", body, raw_title=True,
                                             head=og_head(title, preview)))
         return self.not_found()
@@ -713,7 +915,13 @@ class Handler(BaseHTTPRequestHandler):
                        {"Location": loc})
 
     def _known(self, path):
-        return path in ("/", "/submit", "/health") or bool(NOTE_RE.match(path) or NOTE_TEXT_RE.match(path))
+        if path in ("/", "/submit", "/health", "/robots.txt") or path in DOC_ROUTES:
+            return True
+        if path == "/favicon.ico":
+            return get_static("favicon.ico") is not None
+        if path.startswith("/static/"):
+            return get_static(unquote(path[len("/static/"):])) is not None
+        return bool(NOTE_RE.match(path) or NOTE_TEXT_RE.match(path))
 
     def _other(self):
         path = self.path_only()
@@ -727,12 +935,20 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _other
 
 
+init_docs()
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="TextDrop text sharing service")
     p.add_argument("--host", default=None)
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--db", default=None, help="SQLite database path")
+    p.add_argument("--debug", action="store_true",
+                   help="load templates, static assets and docs from ./templates, ./static and ./docs")
     a = p.parse_args(argv)
+    global DEBUG
+    DEBUG = bool(a.debug)
+    init_docs()
     host = a.host if a.host is not None else os.environ.get("TEXTDROP_HOST", "")
     port = a.port
     if port is None:
