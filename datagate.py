@@ -3,6 +3,11 @@
 import argparse
 import codecs
 import csv
+import datetime
+import email.errors
+import email.parser
+import email.policy
+import email.utils
 import hashlib
 import io
 import json
@@ -13,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_LIMIT = 100
@@ -203,6 +209,190 @@ def parse_csv(text):
     return header, data, raw
 
 
+XLS_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+ZIP_MAGIC = b"PK\x03\x04"
+
+
+def detect_format(data):
+    if data.startswith(XLS_MAGIC):
+        return "xls"
+    if data.startswith(ZIP_MAGIC) or data.startswith(b"PK\x05\x06"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = set(zf.namelist())
+        except Exception:
+            raise ApiError(400, "Unrecognized or corrupt file format")
+        if any(n.startswith("xl/") for n in names) and "[Content_Types].xml" in names:
+            return "xlsx"
+        raise ApiError(400, "Unrecognized file format")
+    return "csv"
+
+
+def cell_value(v):
+    """Normalise a spreadsheet cell to (typed value, raw text)."""
+    if v is None:
+        return "", ""
+    if isinstance(v, bool):
+        return v, "TRUE" if v else "FALSE"
+    if isinstance(v, int):
+        return v, str(v)
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return "", ""
+        if v.is_integer() and abs(v) < 2**53:
+            return int(v), str(int(v))
+        return v, repr(v)
+    if isinstance(v, datetime.datetime):
+        if v.time() == datetime.time(0):
+            t = v.date().isoformat()
+        else:
+            t = v.isoformat()
+        return t, t
+    if isinstance(v, (datetime.date, datetime.time)):
+        t = v.isoformat()
+        return t, t
+    if isinstance(v, datetime.timedelta):
+        t = str(v)
+        return t, t
+    t = str(v)
+    return convert_value(t), t
+
+
+def table_from_cells(cells):
+    """cells: iterable of row sequences of python values (first sheet)."""
+    rows = []
+    for r in cells:
+        conv = [cell_value(v) for v in r]
+        if not conv or all(raw.strip() == "" for _, raw in conv):
+            continue
+        rows.append(conv)
+    if len(rows) < 2:
+        raise ApiError(400, "First worksheet must contain a header row and at least one data row")
+    width = 0
+    for r in rows:
+        for i in range(len(r) - 1, -1, -1):
+            if r[i][1].strip() != "":
+                width = max(width, i + 1)
+                break
+    if width == 0:
+        raise ApiError(400, "First worksheet is not tabular")
+    rows = [(r + [("", "")] * width)[:width] for r in rows]
+    header = [raw.strip() for _, raw in rows[0]]
+    if all(h == "" for h in header):
+        raise ApiError(400, "First worksheet has no header row")
+    data = [[v for v, _ in r] for r in rows[1:]]
+    raw = [[t for _, t in r] for r in rows[1:]]
+    return header, data, raw
+
+
+def parse_xlsx(data):
+    try:
+        import openpyxl
+    except ImportError:  # pragma: no cover
+        raise ApiError(400, "XLSX support unavailable")
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception:
+        raise ApiError(400, "Could not read XLSX workbook")
+    try:
+        if not wb.worksheets:
+            raise ApiError(400, "Workbook has no worksheets")
+        ws = wb.worksheets[0]
+        try:
+            ws.reset_dimensions()
+        except Exception:
+            pass
+        try:
+            cells = [list(r) for r in ws.iter_rows(values_only=True)]
+        except ApiError:
+            raise
+        except Exception:
+            raise ApiError(400, "Could not read XLSX worksheet")
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return table_from_cells(cells)
+
+
+def parse_xls(data):
+    try:
+        import xlrd
+    except ImportError:  # pragma: no cover
+        raise ApiError(400, "XLS support unavailable")
+    try:
+        book = xlrd.open_workbook(file_contents=data, on_demand=True)
+        if book.nsheets < 1:
+            raise ApiError(400, "Workbook has no worksheets")
+        sheet = book.sheet_by_index(0)
+        cells = []
+        for ri in range(sheet.nrows):
+            row = []
+            for c in sheet.row(ri):
+                t = c.ctype
+                if t == xlrd.XL_CELL_NUMBER:
+                    row.append(float(c.value))
+                elif t == xlrd.XL_CELL_DATE:
+                    try:
+                        row.append(xlrd.xldate.xldate_as_datetime(c.value, book.datemode))
+                    except Exception:
+                        row.append(float(c.value))
+                elif t == xlrd.XL_CELL_BOOLEAN:
+                    row.append(bool(c.value))
+                elif t == xlrd.XL_CELL_TEXT:
+                    row.append(c.value)
+                else:  # empty, blank, error
+                    row.append(None)
+            cells.append(row)
+    except ApiError:
+        raise
+    except Exception:
+        raise ApiError(400, "Could not read XLS workbook")
+    return table_from_cells(cells)
+
+
+def ingest(data, charset):
+    fmt = detect_format(data)
+    if fmt == "xlsx":
+        return parse_xlsx(data)
+    if fmt == "xls":
+        return parse_xls(data)
+    return parse_csv(decode(data, charset))
+
+
+def parse_multipart(content_type, body):
+    """Return dict name -> list of bytes values for a multipart body."""
+    msg_bytes = b"Content-Type: " + content_type.encode("latin-1") + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
+    try:
+        msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(msg_bytes)
+    except Exception:
+        raise ApiError(400, "Malformed multipart body")
+    if not msg.is_multipart() or msg.defects:
+        raise ApiError(400, "Malformed multipart body")
+    fields = {}
+    parts = msg.get_payload()
+    if not isinstance(parts, list) or not parts:
+        raise ApiError(400, "Malformed multipart body")
+    for part in parts:
+        if part.defects and any(not isinstance(d, email.errors.InvalidHeaderDefect) for d in part.defects):
+            raise ApiError(400, "Malformed multipart body")
+        disp = part.get("Content-Disposition")
+        if disp is None:
+            continue
+        name = part.get_param("name", header="content-disposition")
+        if name is None:
+            continue
+        if isinstance(name, tuple):
+            name = email.utils.collapse_rfc2231_value(name)
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            p = part.get_payload()
+            payload = p.encode("utf-8") if isinstance(p, str) else b""
+        fields.setdefault(name, []).append(payload)
+    return fields
+
+
 INT_RE = re.compile(r"[+-]?(0|[1-9][0-9]*)")
 DEC_RE = re.compile(r"[+-]?((0|[1-9][0-9]*)\.[0-9]+|\.[0-9]+|(0|[1-9][0-9]*)(\.[0-9]+)?[eE][+-]?[0-9]+)")
 
@@ -239,7 +429,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Access-Control-Max-Age", "86400")
 
@@ -260,6 +450,11 @@ class Handler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         if path == "/convert":
             return "convert", None, params
+        if path == "/upload":
+            return "upload", None, params
+        m = re.fullmatch(r"/datasets/([^/]+)/export", path)
+        if m:
+            return "export", urllib.parse.unquote(m.group(1)), params
         m = re.fullmatch(r"/datasets/([^/]+)", path)
         if m:
             return "dataset", urllib.parse.unquote(m.group(1)), params
@@ -272,6 +467,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_convert(params)
             elif kind == "dataset":
                 self.handle_dataset(arg, params)
+            elif kind == "export":
+                self.handle_export(arg, params)
+            elif kind == "upload":
+                self.error(405, "Method not allowed")
             else:
                 self.error(404, "Not found")
         except ApiError as e:
@@ -282,13 +481,101 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def _other(self):
+        self.discard_body()
         kind, _, _ = self.route()
         if kind is None:
             self.error(404, "Not found")
         else:
             self.error(405, "Method not allowed")
 
-    do_POST = do_PUT = do_DELETE = do_PATCH = _other
+    do_PUT = do_DELETE = do_PATCH = _other
+
+    def do_POST(self):
+        try:
+            kind, _, params = self.route()
+            if kind == "upload":
+                self.handle_upload(params)
+            else:
+                self._other()
+        except ApiError as e:
+            self.error(e.status, e.message)
+        except Exception as e:  # pragma: no cover
+            self.error(500, "Internal error: %s" % e)
+
+    def read_body(self):
+        if getattr(self, "_body_read", False):
+            return b""
+        self._body_read = True
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            chunks, total = [], 0
+            while True:
+                line = self.rfile.readline(65537)
+                if not line:
+                    raise ApiError(400, "Malformed chunked body")
+                try:
+                    n = int(line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    self.close_connection = True
+                    raise ApiError(400, "Malformed chunked body")
+                if n == 0:
+                    while True:
+                        t = self.rfile.readline(65537)
+                        if not t or t in (b"\r\n", b"\n"):
+                            break
+                    break
+                total += n
+                if total > MAX_BYTES:
+                    self.close_connection = True
+                    raise ApiError(400, "Upload too large")
+                chunks.append(self.rfile.read(n))
+                self.rfile.readline(3)
+            return b"".join(chunks)
+        cl = self.headers.get("Content-Length")
+        if not cl:
+            return b""
+        try:
+            n = int(cl)
+        except ValueError:
+            self.close_connection = True
+            raise ApiError(400, "Invalid Content-Length")
+        if n < 0:
+            self.close_connection = True
+            raise ApiError(400, "Invalid Content-Length")
+        if n > MAX_BYTES:
+            self.close_connection = True
+            raise ApiError(400, "Upload too large")
+        return self.rfile.read(n)
+
+    def discard_body(self):
+        try:
+            self.read_body()
+        except ApiError:
+            self.close_connection = True
+
+    def handle_upload(self, params):
+        ctype = self.headers.get("Content-Type") or ""
+        main = ctype.split(";", 1)[0].strip().lower()
+        if not main.startswith("multipart/"):
+            self.discard_body()
+            raise ApiError(415, "Upload must be multipart/form-data")
+        body = self.read_body()
+        if not re.search(r"(?i);\s*boundary\s*=", ctype):
+            raise ApiError(400, "Malformed multipart body: missing boundary")
+        fields = parse_multipart(ctype, body)
+        files = fields.get("file") or fields.get("attachment")
+        if not files:
+            raise ApiError(400, "Missing file field ('file' or 'attachment')")
+        data = files[0]
+        charset = params.get("charset", [None])[0]
+        if charset is None and fields.get("charset"):
+            charset = fields["charset"][0].decode("utf-8", "replace")
+        charset = validate_charset(charset) if charset is not None else None
+        columns, rows, raw = ingest(data, charset)
+        did = hashlib.sha256(data).hexdigest()[:16]
+        with LOCK:
+            DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw}
+        self.send_json(200, {"ok": True, "endpoint": "/datasets/%s" % did})
 
     def handle_convert(self, params):
         sources = params.get("source")
@@ -299,15 +586,13 @@ class Handler(BaseHTTPRequestHandler):
         charset = params.get("charset", [None])[0]
         charset = validate_charset(charset) if charset is not None else None
         data = fetch(source)
-        text = decode(data, charset)
-        columns, rows, raw = parse_csv(text)
+        columns, rows, raw = ingest(data, charset)
         did = dataset_id(source)
         with LOCK:
             DATASETS[did] = {"columns": columns, "rows": rows, "raw": raw}
         self.send_json(200, {"ok": True, "endpoint": "/datasets/%s" % did})
 
-    def handle_dataset(self, did, params):
-        start = time.perf_counter()
+    def query(self, did, params, start):
         with LOCK:
             ds = DATASETS.get(did)
         if ds is None:
@@ -330,6 +615,36 @@ class Handler(BaseHTTPRequestHandler):
         total = len(indexed)
         off, size = opts["offset"], opts["size"]
         page = indexed[off:off + size]
+        return ds, columns, opts, total, page
+
+    def handle_export(self, did, params):
+        start = time.perf_counter()
+        # presentation-only controls do not affect CSV output
+        params = {k: v for k, v in params.items() if k not in ("_shape", "_rowid", "_total")}
+        ds, columns, opts, total, page = self.query(did, params, start)
+        raws = ds.get("raw") or ds["rows"]
+        buf = io.StringIO(newline="")
+        w = csv.writer(buf, lineterminator="\r\n")
+        w.writerow(columns)
+        n = len(columns)
+        for rowid, _ in page:
+            r = raws[rowid - 1]
+            out = [(c if isinstance(c, str) else ("" if c is None else display(c))) for c in r[:n]]
+            out += [""] * (n - len(out))
+            w.writerow(out)
+        body = buf.getvalue().encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv")
+        self.send_header("Content-Disposition", 'attachment; filename="%s.csv"' % did)
+        self.send_header("Content-Length", str(len(body)))
+        self.cors()
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def handle_dataset(self, did, params):
+        start = time.perf_counter()
+        ds, columns, opts, total, page = self.query(did, params, start)
         if opts["shape"] == "objects":
             out_rows = []
             for rowid, row in page:
