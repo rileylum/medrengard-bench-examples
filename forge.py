@@ -1038,6 +1038,339 @@ def extract_revision(argv):
     return raw, rest
 
 
+class ConfigError(Exception):
+    def __init__(self, detail):
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _scalar(v):
+    v = v.strip()
+    if v == "" or v in ("~", "null", "Null", "NULL"):
+        return None
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        if v[0] == '"':
+            try:
+                return json.loads(v)
+            except ValueError:
+                return v[1:-1]
+        return v[1:-1].replace("''", "'")
+    if v in ("true", "True", "TRUE"):
+        return True
+    if v in ("false", "False", "FALSE"):
+        return False
+    if re.match(r"^[-+]?[0-9]+$", v):
+        return int(v)
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        return [_scalar(x) for x in inner.split(",")] if inner else []
+    if v.startswith("{") and v.endswith("}"):
+        inner = v[1:-1].strip()
+        out = {}
+        for part in inner.split(",") if inner else []:
+            if ":" not in part:
+                raise ValueError("invalid flow mapping")
+            k, val = part.split(":", 1)
+            out[str(_scalar(k))] = _scalar(val)
+        return out
+    return v
+
+
+def _strip_comment(line):
+    out = []
+    q = None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "'\"":
+            q = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            break
+        out.append(ch)
+    return "".join(out).rstrip()
+
+
+def _mini_yaml(text):
+    """Minimal YAML subset parser used when PyYAML is unavailable."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except ValueError:
+        pass
+    lines = [_strip_comment(l) for l in text.splitlines()]
+    lines = [l for l in lines if l.strip() and l.strip() not in ("---", "...")]
+    if not lines:
+        return None
+    result = {}
+    cur_key = None
+    for l in lines:
+        indent = len(l) - len(l.lstrip())
+        body = l.strip()
+        if body.startswith("- ") or body == "-":
+            if cur_key is None:
+                raise ValueError("unexpected list item")
+            if result[cur_key] is None:
+                result[cur_key] = []
+            if not isinstance(result[cur_key], list):
+                raise ValueError("mixed mapping and list")
+            result[cur_key].append(_scalar(body[1:]))
+            continue
+        if indent != 0:
+            raise ValueError("unsupported nesting")
+        m = re.match(r"^((?:\"[^\"]*\")|(?:'[^']*')|.+?)\s*:(?:\s+(.*)|)$", body)
+        if not m:
+            raise ValueError("invalid line: %s" % body)
+        key = _scalar(m.group(1))
+        key = str(key) if not isinstance(key, str) else key
+        result[key] = _scalar(m.group(2) or "")
+        cur_key = key
+    return result
+
+
+def parse_yaml(text):
+    try:
+        import yaml
+    except ImportError:
+        return _mini_yaml(text)
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ValueError(str(e))
+
+
+def extract_globals(argv, names):
+    """Remove the given global value flags from argv (first occurrence wins)."""
+    vals = {}
+    errors = []
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        hit = None
+        for n in names:
+            if a == n:
+                if i + 1 >= len(argv):
+                    errors.append("%s requires a value" % n)
+                    i += 1
+                else:
+                    if n not in vals:
+                        vals[n] = argv[i + 1]
+                    i += 2
+                hit = n
+                break
+            if a.startswith(n + "="):
+                if n not in vals:
+                    vals[n] = a[len(n) + 1:]
+                i += 1
+                hit = n
+                break
+        if hit is None:
+            rest.append(a)
+            i += 1
+    return vals, errors, rest
+
+
+def peek_data_dir(argv):
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--data-dir":
+            return argv[i + 1] if i + 1 < len(argv) else None
+        if a.startswith("--data-dir="):
+            return a[len("--data-dir="):]
+        i += 1
+    return None
+
+
+def load_config(path):
+    if path == "":
+        raise ConfigError("--config requires a non-empty path")
+    if not os.path.isfile(path):
+        raise ConfigError("configuration file '%s' not found" % path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError("cannot read configuration file '%s': %s" % (path, e))
+    try:
+        cfg = parse_yaml(text)
+    except (ValueError, RecursionError) as e:
+        raise ConfigError("invalid configuration file '%s': %s" % (path, e))
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise ConfigError("configuration file '%s' must contain a mapping" % path)
+    return cfg
+
+
+def validate_config(cfg, config_path, data_dir):
+    rules = None
+    if "rules_file" in cfg:
+        v = cfg["rules_file"]
+        if not isinstance(v, str) or v.strip() == "":
+            raise ConfigError("rules_file: must be a non-empty string path, got %s"
+                              % (json.dumps(v) if isinstance(v, str) else type_name(v)))
+        rules = v
+        if not os.path.isabs(v) and not os.path.exists(v) and config_path:
+            alt = os.path.join(os.path.dirname(os.path.abspath(config_path)), v)
+            if os.path.exists(alt):
+                rules = alt
+    if "enabled_plugins" in cfg:
+        plugins = cfg["enabled_plugins"]
+        if not isinstance(plugins, list) or not all(isinstance(p, str) for p in plugins):
+            raise ConfigError("enabled_plugins: must be a list of strings")
+        for name in plugins:
+            ok = (name not in ("", ".", "..") and "/" not in name and "\\" not in name
+                  and data_dir and os.path.isdir(os.path.join(data_dir, "plugins", name)))
+            if not ok:
+                raise ConfigError("enabled_plugins: plugin '%s' is not registered" % name)
+    return rules
+
+
+CTX = {"rules_file": None, "role": None, "scope": "project"}
+PROTECTED = {}
+
+
+def load_rules(path):
+    if not os.path.isfile(path):
+        raise ForgeError("configuration_error", "rules file '%s' not found" % path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rules = parse_yaml(f.read())
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as e:
+        raise ForgeError("configuration_error", "invalid rules file '%s': %s" % (path, e))
+    if rules is None:
+        return {}
+    if not isinstance(rules, dict):
+        raise ForgeError("configuration_error", "rules file '%s' must contain a mapping" % path)
+    return rules
+
+
+def check_access(op):
+    if CTX["scope"] == "system":
+        raise ForgeError("forbidden", "system scope is not supported for %s" % op)
+    path = CTX["rules_file"]
+    if path is None:
+        return
+    rules = load_rules(path)
+    if op not in rules:
+        return
+    required = rules[op]
+    if not isinstance(required, str):
+        raise ForgeError("configuration_error",
+                         "rules file entry for %s must be a role string" % op)
+    role = CTX["role"]
+    if role is None:
+        raise ForgeError("forbidden", "%s requires role '%s'; no role provided" % (op, required))
+    if role != required:
+        raise ForgeError("forbidden", "%s requires role '%s'; caller role '%s' is not permitted"
+                         % (op, required, role))
+
+
+def cmd_check_readiness(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "check readiness takes no arguments")
+    path = CTX["rules_file"]
+    if path is None:
+        res, detail = "pass", "no rules file configured"
+    elif not os.path.isfile(path):
+        res, detail = "fail", "rules file '%s' does not exist" % path
+    else:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".json":
+            res, detail = "fail", "rules file '%s' is JSON; YAML is required" % path
+        elif ext in (".yaml", ".yml"):
+            res, detail = "pass", "rules file '%s' is YAML" % path
+        else:
+            first = ""
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    first = f.read().lstrip()[:1]
+            except OSError:
+                pass
+            if first == "{":
+                res, detail = "fail", "rules file '%s' appears to be JSON; YAML is required" % path
+            else:
+                res, detail = "fail", ("rules file '%s' has an unrecognized format; "
+                                       "expected a .yaml or .yml file" % path)
+    checks = [{"detail": detail, "name": "rules_file_format", "result": res}]
+    status = "pass" if all(c["result"] == "pass" for c in checks) else "fail"
+    return {"status": status, "checks": checks}
+
+
+SCHEMA_FILE = "schema.json"
+SCHEMA_HEAD = 1
+
+
+def _read_schema(data_dir):
+    path = os.path.join(data_dir, SCHEMA_FILE)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.loads(f.read() or "null")
+        v = data.get("version") if isinstance(data, dict) else None
+        return int(str(v))
+    except (ValueError, TypeError, OSError):
+        return 0
+
+
+def _write_schema(data_dir, version):
+    os.makedirs(data_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=data_dir, prefix=".sc-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"version": str(version)}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(data_dir, SCHEMA_FILE))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def cmd_schema_init(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "schema init takes no arguments")
+    if _read_schema(data_dir) is not None:
+        raise ForgeError("conflict", "schema already exists")
+    _write_schema(data_dir, SCHEMA_HEAD)
+    return {"status": "created"}
+
+
+def cmd_schema_version(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "schema version takes no arguments")
+    v = _read_schema(data_dir)
+    if v is None:
+        raise ForgeError("not_found", "schema has not been initialized")
+    return {"version": str(max(v, 1))}
+
+
+def cmd_schema_upgrade(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "schema upgrade takes no arguments")
+    v = _read_schema(data_dir)
+    if v is None:
+        raise ForgeError("not_found", "schema has not been initialized")
+    if v >= SCHEMA_HEAD:
+        return {"status": "up_to_date", "version": str(SCHEMA_HEAD)}
+    _write_schema(data_dir, SCHEMA_HEAD)
+    return {"status": "upgraded", "version": str(SCHEMA_HEAD)}
+
+
+GROUPS["check"] = {"readiness": cmd_check_readiness}
+GROUPS["schema"] = {"init": cmd_schema_init, "version": cmd_schema_version,
+                    "upgrade": cmd_schema_upgrade}
+PROTECTED[cmd_create] = "blueprint:create"
+PROTECTED[cmd_delete] = "blueprint:delete"
+NO_DATA_DIR = (cmd_check_readiness,)
+
+
 def parse_argv(argv):
     data_dir = None
     rest = []
@@ -1060,11 +1393,12 @@ def parse_argv(argv):
         if len(rest) > 1:
             raise ForgeError("validation_error", "version takes no arguments")
         return data_dir, None, []
-    if not data_dir:
+    if not data_dir and not (len(rest) >= 2 and rest[0] in GROUPS
+                             and GROUPS[rest[0]].get(rest[1]) in NO_DATA_DIR):
         raise ForgeError("validation_error", "--data-dir is required")
     if not rest or rest[0] not in GROUPS:
         raise ForgeError("validation_error",
-                         "usage: forge.py --data-dir <path> {version|blueprint|allocation|unit|ledger|module|tag} <command> [args]")
+                         "usage: forge.py --data-dir <path> {version|blueprint|allocation|unit|ledger|module|tag|check|schema} <command> [args]")
     group = rest[0]
     if len(rest) < 2:
         raise ForgeError("unknown_command" if group in UNKNOWN_COMMAND_GROUPS
@@ -1079,6 +1413,18 @@ def parse_argv(argv):
 def main(argv):
     global REVISION
     REVISION = MIN_REVISION
+    gvals, gerrors, argv = extract_globals(
+        argv, ("--config", "--rules-file", "--role", "--scope"))
+    try:
+        cfg_rules = None
+        if "--config" in gvals:
+            cfg = load_config(gvals["--config"])
+            cfg_rules = validate_config(cfg, gvals["--config"], peek_data_dir(argv))
+    except ConfigError as e:
+        emit({"error": "configuration_error", "detail": e.detail}, 1)
+    CTX["rules_file"] = gvals.get("--rules-file", cfg_rules)
+    CTX["role"] = gvals.get("--role")
+    CTX["scope"] = gvals.get("--scope", "project")
     try:
         raw, argv = extract_revision(argv)
         if raw is not None:
@@ -1090,7 +1436,16 @@ def main(argv):
         out["revision"] = fmt_rev(MIN_REVISION)
         emit(out, 1)
     try:
+        if gerrors:
+            raise ForgeError("validation_error", gerrors[0])
+        if CTX["scope"] not in ("project", "system"):
+            raise ForgeError("validation_error",
+                             "invalid scope '%s': expected 'project' or 'system'" % CTX["scope"])
+        if CTX["rules_file"] == "":
+            raise ForgeError("validation_error", "--rules-file requires a non-empty path")
         data_dir, func, args = parse_argv(argv)
+        if func in PROTECTED:
+            check_access(PROTECTED[func])
         if func is None:
             emit({"max_revision": fmt_rev(MAX_REVISION),
                   "min_revision": fmt_rev(MIN_REVISION)}, 0)
@@ -1101,6 +1456,10 @@ def main(argv):
         out["revision"] = fmt_rev(REVISION)
         emit(out, 1)
     rev = fmt_rev(REVISION)
+    if func is cmd_check_readiness:
+        result = dict(result)
+        result["revision"] = rev
+        emit(result, 0 if result["status"] == "pass" else 1)
     if func in COLLECTION_KEYS:
         result = {"revision": rev, COLLECTION_KEYS[func]: result}
     elif isinstance(result, dict):
