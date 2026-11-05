@@ -1,1 +1,3 @@
 # No third-party dependencies; standard library only.
+# Clipboard support uses a system tool if present: wl-clipboard (wl-copy/wl-paste),
+# xclip, xsel, pbcopy/pbpaste (macOS) or clip.exe (Windows).

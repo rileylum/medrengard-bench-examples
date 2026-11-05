@@ -13,7 +13,11 @@ import hmac
 import json
 import os
 import secrets
+import shutil
+import string
+import subprocess
 import sys
+import time
 
 VAULT_DIR = os.path.join(os.path.expanduser("~"), ".vault")
 CONFIG_PATH = os.path.join(VAULT_DIR, "config.json")
@@ -25,6 +29,9 @@ MIN_KEY_LEN = 8
 MAX_NOTE_LINES = 15
 MAX_ATTEMPTS = 3
 PAYLOAD_MAGIC = b"PWDV1"
+DEFAULT_CLIPBOARD_TTL = 15
+DEFAULT_HIDE_DELAY = 5
+SUGGESTION_LENGTH = 20
 
 BANNER = r"""
 ==============================================
@@ -228,6 +235,357 @@ def read_secret(prompt):
     return read_line(prompt)
 
 
+# -------------------------------------------------------------- settings ---
+
+def _env_seconds(names, default):
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if value >= 0:
+            return value
+    return default
+
+
+def clipboard_ttl():
+    return _env_seconds(("PWD_MANAGER_CLIPBOARD_TTL", "VAULT_CLIPBOARD_TTL",
+                         "CLIPBOARD_TTL"), DEFAULT_CLIPBOARD_TTL)
+
+
+def hide_delay():
+    return _env_seconds(("PWD_MANAGER_HIDE_DELAY", "VAULT_HIDE_DELAY",
+                         "HIDE_DELAY"), DEFAULT_HIDE_DELAY)
+
+
+def _fmt_seconds(value):
+    if float(value).is_integer():
+        return str(int(value))
+    return ("%.2f" % value).rstrip("0").rstrip(".")
+
+
+# ------------------------------------------------------------- clipboard ---
+
+class ClipboardUnavailable(Exception):
+    pass
+
+
+def _clipboard_backends():
+    """Return a list of (copy_cmd, paste_cmd, clear_cmd) tuples, best first."""
+    candidates = []
+    wayland = [("wl-copy",), ("wl-paste", "--no-newline"), ("wl-copy", "--clear")]
+    xclip = [("xclip", "-selection", "clipboard", "-in"),
+             ("xclip", "-selection", "clipboard", "-out"), None]
+    xsel = [("xsel", "--clipboard", "--input"),
+            ("xsel", "--clipboard", "--output"),
+            ("xsel", "--clipboard", "--clear")]
+    mac = [("pbcopy",), ("pbpaste",), None]
+    win = [("clip.exe",),
+           ("powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"),
+           None]
+    termux = [("termux-clipboard-set",), ("termux-clipboard-get",), None]
+    if sys.platform == "darwin":
+        candidates.append(mac)
+    if os.environ.get("WAYLAND_DISPLAY"):
+        candidates.append(wayland)
+    if os.environ.get("DISPLAY"):
+        candidates.extend([xclip, xsel])
+    for c in (mac, wayland, xclip, xsel, win, termux):
+        if c not in candidates:
+            candidates.append(c)
+    return [c for c in candidates if shutil.which(c[0][0])]
+
+
+class Clipboard:
+    def __init__(self):
+        self.backends = _clipboard_backends()
+        self.active = None
+
+    def available(self):
+        return bool(self.backends)
+
+    def copy(self, text):
+        errors = []
+        for backend in self.backends:
+            try:
+                subprocess.run(list(backend[0]), input=text.encode("utf-8"),
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=True,
+                               timeout=5)
+                self.active = backend
+                return
+            except (OSError, subprocess.SubprocessError) as exc:
+                errors.append(str(exc))
+        raise ClipboardUnavailable(
+            "; ".join(errors) if errors else "no clipboard tool found "
+            "(install wl-clipboard, xclip or xsel)")
+
+    def paste(self):
+        backend = self.active
+        if backend is None or backend[1] is None:
+            return None
+        try:
+            res = subprocess.run(list(backend[1]), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if res.returncode != 0:
+            # e.g. wl-paste exits non-zero when the clipboard is empty
+            return ""
+        out = res.stdout.decode("utf-8", "replace")
+        if backend[0][0] == "powershell.exe":
+            out = out.rstrip("\r\n")
+        return out
+
+    def clear(self):
+        backend = self.active
+        if backend is None:
+            return False
+        try:
+            if backend[2] is not None:
+                subprocess.run(list(backend[2]), stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=True,
+                               timeout=5)
+            else:
+                subprocess.run(list(backend[0]), input=b"",
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=True,
+                               timeout=5)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def clear_if_unchanged(self, text):
+        """Clear the clipboard only if it still holds ``text``.
+
+        Returns "cleared", "changed" or "failed".
+        """
+        current = self.paste()
+        if current is not None and current != text:
+            return "changed"
+        return "cleared" if self.clear() else "failed"
+
+
+def _report_clear(result, label):
+    if result == "cleared":
+        print("Clipboard cleared.")
+    elif result == "changed":
+        print("Clipboard was changed by another application; left untouched.")
+    else:
+        print("Error: could not clear the clipboard.")
+
+
+def clipboard_countdown(clip, text, label, ttl=None):
+    ttl = clipboard_ttl() if ttl is None else ttl
+    tty = sys.stdout.isatty()
+    try:
+        remaining = ttl
+        while remaining > 0:
+            msg = ("Clearing clipboard in %s second(s)... "
+                   "(Ctrl-C to clear now)" % _fmt_seconds(remaining))
+            if tty:
+                sys.stdout.write("\r\033[K" + msg)
+            else:
+                sys.stdout.write(msg + "\n")
+            sys.stdout.flush()
+            step = min(1, remaining)
+            time.sleep(step)
+            remaining -= step
+        if tty:
+            sys.stdout.write("\r\033[K")
+        print("Clipboard time-to-live expired.")
+    except KeyboardInterrupt:
+        if tty:
+            sys.stdout.write("\r\033[K")
+        print("Interrupted; clearing clipboard now.")
+    _report_clear(clip.clear_if_unchanged(text), label)
+
+
+COPY_FIELDS = {"l": ("login", "Login"), "p": ("password", "Password"),
+               "u": ("url", "URL")}
+
+
+def copy_field(item, key):
+    field, label = COPY_FIELDS[key]
+    value = item.get(field) or ""
+    if value == "":
+        print("Nothing to copy: this secret has no %s." % (label if label == "URL" else label.lower()))
+        return
+    clip = Clipboard()
+    if not clip.available():
+        print("Error: no clipboard mechanism is available; "
+              "%s was not copied." % label.lower())
+        return
+    try:
+        clip.copy(value)
+    except ClipboardUnavailable as exc:
+        print("Error: no working clipboard mechanism is available; "
+              "%s was not copied (%s)." % (label.lower() if label != "URL"
+                                         else label, exc))
+        return
+    print("%s copied to clipboard." % label)
+    clipboard_countdown(clip, value, label)
+
+
+# ------------------------------------------------------- password reveal ---
+
+def mask_for(password):
+    """Asterisk mask whose length is unrelated to the password's length."""
+    length = 8 + secrets.randbelow(13)
+    if length == len(password):
+        length += 1 + secrets.randbelow(4)
+    return "*" * length
+
+
+def reveal_password(password, delay=None):
+    delay = hide_delay() if delay is None else delay
+    label = "Password: "
+    sys.stdout.write(label + password)
+    sys.stdout.flush()
+    try:
+        time.sleep(delay)
+    except KeyboardInterrupt:
+        pass
+    # Overwrite the cleartext in place (clear the whole line, then mask).
+    sys.stdout.write("\r\033[K" + label + mask_for(password) + "\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------- password suggestion ---
+
+SUGGESTION_ALPHABET = string.ascii_letters + string.digits + "!#$%&*+-=?@^_"
+_last_suggestion = None
+
+
+def generate_password(length=SUGGESTION_LENGTH):
+    groups = (string.ascii_lowercase, string.ascii_uppercase, string.digits,
+              "!#$%&*+-=?@^_")
+    while True:
+        chars = [secrets.choice(g) for g in groups]
+        chars += [secrets.choice(SUGGESTION_ALPHABET)
+                  for _ in range(length - len(chars))]
+        secrets.SystemRandom().shuffle(chars)
+        return "".join(chars)
+
+
+def suggest_password():
+    global _last_suggestion
+    while True:
+        pw = generate_password()
+        if pw != _last_suggestion:
+            _last_suggestion = pw
+            return pw
+
+
+def read_new_password(prompt):
+    print("Suggested password (generated password): %s" % suggest_password())
+    return read_secret(prompt)
+
+
+# ------------------------------------------------------------ completion ---
+
+_readline = None
+_readline_checked = False
+
+
+def _get_readline():
+    global _readline, _readline_checked
+    if not _readline_checked:
+        _readline_checked = True
+        try:
+            import readline as rl
+        except ImportError:
+            rl = None
+        if rl is not None:
+            try:
+                rl.set_completer_delims("")
+                doc = rl.__doc__ or ""
+                if "libedit" in doc:
+                    rl.parse_and_bind("bind ^I rl_complete")
+                else:
+                    rl.parse_and_bind("tab: complete")
+            except Exception:
+                rl = None
+        _readline = rl
+    return _readline
+
+
+def completion_matches(text, candidates):
+    seen = set()
+    uniq = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    exact = [c for c in uniq if c.startswith(text)]
+    if exact:
+        return sorted(exact)
+    low = text.lower()
+    ci = [c for c in uniq if c.lower().startswith(low)]
+    if ci:
+        return sorted(ci)
+    return sorted(c for c in uniq if low and low in c.lower())
+
+
+def make_completer(candidates_fn):
+    cache = {}
+
+    def complete(text, state):
+        rl = _readline
+        line = text
+        if rl is not None:
+            try:
+                line = rl.get_line_buffer()[:rl.get_endidx()]
+            except Exception:
+                line = text
+        if state == 0 or cache.get("text") != line:
+            cache["text"] = line
+            cache["matches"] = completion_matches(line, candidates_fn())
+        matches = cache["matches"]
+        if state >= len(matches):
+            return None
+        match = matches[state]
+        # Return the completion relative to the word readline gave us.
+        prefix_len = len(line) - len(text)
+        if prefix_len > 0:
+            match = match[prefix_len:] if match.startswith(line[:prefix_len]) \
+                else match
+        return match
+
+    return complete
+
+
+def read_line_completing(prompt, candidates_fn):
+    """Read a line, offering tab-completion from ``candidates_fn()``."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return read_line(prompt)
+    rl = _get_readline()
+    if rl is None:
+        return read_line(prompt)
+    old = rl.get_completer()
+    rl.set_completer(make_completer(candidates_fn))
+    try:
+        try:
+            line = input(prompt)
+        except EOFError:
+            sys.stdout.write("\n")
+            raise QuitProgram()
+    finally:
+        rl.set_completer(old)
+        try:
+            n = rl.get_current_history_length()
+            if n:
+                rl.remove_history_item(n - 1)
+        except Exception:
+            pass
+    return line.rstrip("\r\n")
+
+
 def clear_screen():
     if sys.stdout.isatty():
         sys.stdout.write("\033[2J\033[H")
@@ -363,8 +721,10 @@ def add_secret(vault):
             vault, "Category ID (leave empty for no category): ")
     name = read_line("Name: ")
     url = read_line("URL: ")
-    login = read_line("Login: ")
-    password = read_secret("Password: ")
+    login = read_line_completing(
+        "Login: ", lambda: sorted({it.get("login", "") for it in vault.items
+                                   if it.get("login")}))
+    password = read_new_password("Password: ")
     notes = read_notes()
     item_id = vault.add(name, url, login, password, notes, category_id)
     print("Secret saved with ID %d." % item_id)
@@ -397,7 +757,7 @@ def edit_category(vault, item):
 def edit_field(vault, item, field, label):
     print("Current %s: %s" % (label, item.get(field, "")))
     if field == "password":
-        value = read_secret("New password: ")
+        value = read_new_password("New password: ")
     elif field == "notes":
         value = read_notes()
     else:
@@ -434,12 +794,36 @@ def edit_menu(vault, item):
         print("Please choose one of c, n, u, l, p, o or b.")
 
 
+def item_actions(item):
+    copy = [label for key, label in (("login", "(l)ogin"),
+                                     ("password", "(p)assword"),
+                                     ("url", "(u)rl"))
+            if item.get(key)]
+    lines = []
+    if copy:
+        lines.append("Copy: " + "  ".join(copy))
+    if item.get("password"):
+        lines.append("(o) show password")
+    return lines
+
+
 def item_view(vault, item):
     clear_screen()
     show_item(vault, item)
     while True:
+        for line in item_actions(item):
+            print(line)
         choice = read_line("[s] new search  [b] back to menu  [e] edit  "
                            "[d] delete: ").strip().lower()
+        if choice in COPY_FIELDS:
+            copy_field(item, choice)
+            continue
+        if choice == "o":
+            if item.get("password"):
+                reveal_password(item["password"])
+            else:
+                print("Nothing to show: this secret has no password.")
+            continue
         if choice == "s":
             return "search"
         if choice == "b":
@@ -457,7 +841,7 @@ def item_view(vault, item):
                 return "menu"
             print("Secret kept.")
             continue
-        print("Please enter 's', 'b', 'e' or 'd'.")
+        print("Please enter 's', 'b', 'e', 'd', 'l', 'p', 'u' or 'o'.")
 
 
 def category_menu(vault):
@@ -511,7 +895,9 @@ def category_menu(vault):
 def search(vault):
     """Run the search prompt. Returns the next action."""
     while True:
-        query = read_line("Enter search query ([s]earch, [a]dd, [b]ack, [q]uit): ")
+        query = read_line_completing(
+            "Enter search query ([s]earch, [a]dd, [b]ack, [q]uit): ",
+            lambda: [it.get("name", "") for it in vault.sorted_items()])
         lowered = query.lower()
         if len(query) == 1 and lowered in ("s", "a", "q", "b"):
             if lowered == "s":
