@@ -520,13 +520,25 @@ def _parse_call(node: ast.AST, ctx):
     args = []
     for a in node.args:
         if isinstance(a, ast.Starred):
-            raise DiscoveryError(f"line {node.lineno}: unsupported argument")
+            v = _arg_value(a.value, ctx)
+            if isinstance(v, dict) or not isinstance(
+                    v, (list, tuple, str, set, frozenset, collections.deque)):
+                raise DiscoveryError(f"line {node.lineno}: unsupported argument")
+            args.extend(list(v))
+            continue
         args.append(_arg_value(a, ctx))
     kwargs = []
     for kw in node.keywords:
         if kw.arg is None:
-            raise DiscoveryError(f"line {node.lineno}: unsupported keyword argument")
+            v = _arg_value(kw.value, ctx)
+            if not isinstance(v, dict) or not all(isinstance(k, str) for k in v):
+                raise DiscoveryError(f"line {node.lineno}: unsupported keyword argument")
+            kwargs.extend([k, x] for k, x in v.items())
+            continue
         kwargs.append([kw.arg, _arg_value(kw.value, ctx)])
+    names = [k for k, _ in kwargs]
+    if len(set(names)) != len(names):
+        raise DiscoveryError(f"line {node.lineno}: duplicate keyword argument")
     return {"args": args, "kwargs": kwargs}
 
 
@@ -939,6 +951,12 @@ def discover(tests_dir: str, ep_name=None):
     ctx = _Ctx(ep_name, _collect_aliases(tree))
 
     tests = []
+    iters = []  # iteration indices of the enclosing loops
+
+    def add(t, line):
+        t["line"] = line
+        t["iters"] = list(iters)
+        tests.append(t)
 
     def walk(body):
         for stmt in body:
@@ -953,14 +971,29 @@ def discover(tests_dir: str, ep_name=None):
                     ctx.env = saved
             elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
                 _parse_assign(stmt, ctx)
+            elif isinstance(stmt, ast.AugAssign):
+                _parse_augassign(stmt, ctx)
             elif isinstance(stmt, ast.Assert):
-                t = _parse_assert(stmt, ctx)
-                t["line"] = stmt.lineno
-                tests.append(t)
+                add(_parse_assert(stmt, ctx), stmt.lineno)
             elif isinstance(stmt, ast.Try):
-                t = _parse_try(stmt, ctx)
-                t["line"] = stmt.lineno
-                tests.append(t)
+                add(_parse_try(stmt, ctx), stmt.lineno)
+            elif isinstance(stmt, ast.For):
+                walk_for(stmt)
+            elif isinstance(stmt, ast.While):
+                walk_while(stmt)
+            elif isinstance(stmt, ast.If):
+                c = _const_cond(stmt.test, ctx)
+                if c is _NO_VALUE:
+                    raise DiscoveryError(f"line {stmt.lineno}: unsupported if condition")
+                walk(stmt.body if c else stmt.orelse)
+            elif isinstance(stmt, ast.Break):
+                if not iters:
+                    raise DiscoveryError(f"line {stmt.lineno}: break outside loop")
+                raise _LoopBreak()
+            elif isinstance(stmt, ast.Continue):
+                if not iters:
+                    raise DiscoveryError(f"line {stmt.lineno}: continue outside loop")
+                raise _LoopContinue()
             elif isinstance(stmt, (ast.Pass, ast.Import, ast.ImportFrom)):
                 pass
             elif (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
@@ -970,24 +1003,170 @@ def discover(tests_dir: str, ep_name=None):
                 raise DiscoveryError(
                     f"line {stmt.lineno}: unsupported statement {type(stmt).__name__}")
 
+    def loop_test(stmt):
+        t = {"kind": "loop", "ok": False, "args": [], "kwargs": []}
+        add(t, stmt.lineno)
+        return t
+
+    def run_body(stmt, n):
+        """Run one iteration; returns False if the loop was broken out of."""
+        iters.append(n)
+        try:
+            walk(stmt.body)
+        except _LoopContinue:
+            pass
+        except _LoopBreak:
+            return False
+        finally:
+            iters.pop()
+        return True
+
+    def walk_for(stmt):
+        t = loop_test(stmt)
+        items = _const_iter(stmt.iter, ctx)
+        if items is _NO_VALUE:
+            return  # cannot be evaluated: loop test fails, body skipped
+        broke = False
+        for n, item in enumerate(items):
+            t["ok"] = True
+            _bind_const(stmt.target, item, ctx)
+            if not run_body(stmt, n):
+                broke = True
+                break
+        if not broke and stmt.orelse:
+            walk(stmt.orelse)
+
+    def walk_while(stmt):
+        t = loop_test(stmt)
+        n = 0
+        broke = False
+        while True:
+            c = _const_cond(stmt.test, ctx)
+            if c is _NO_VALUE:
+                if n == 0:
+                    return
+                raise DiscoveryError(f"line {stmt.lineno}: unsupported while condition")
+            if not c:
+                break
+            if n >= _MAX_ITERATIONS:
+                raise DiscoveryError(f"line {stmt.lineno}: too many loop iterations")
+            t["ok"] = True
+            if not run_body(stmt, n):
+                broke = True
+                break
+            n += 1
+        if not broke and stmt.orelse:
+            walk(stmt.orelse)
+
     walk(tree.body)
 
+    for t in tests:
+        t["id"] = f"tests.py:{t['line']}" + "".join(f":{i}" for i in t.pop("iters"))
     counts = {}
     for t in tests:
-        counts[t["line"]] = counts.get(t["line"], 0) + 1
+        counts[t["id"]] = counts.get(t["id"], 0) + 1
     seen = {}
     for t in tests:
-        ln = t["line"]
-        if counts[ln] > 1:
-            idx = seen.get(ln, 0)
-            seen[ln] = idx + 1
-            t["id"] = f"tests.py:{ln}#{idx}"
-        else:
-            t["id"] = f"tests.py:{ln}"
-        exp = _expectations(ln, comments, lines)
+        base = t["id"]
+        if counts[base] > 1:
+            idx = seen.get(base, 0)
+            seen[base] = idx + 1
+            t["id"] = f"{base}#{idx}"
+        if t["kind"] == "loop":
+            t["stdout"] = t["stderr"] = None
+            continue
+        exp = _expectations(t["line"], comments, lines)
         t["stdout"] = exp.get("stdout")
         t["stderr"] = exp.get("stderr")
     return tests
+
+
+# ---- loops ---------------------------------------------------------------
+
+_MAX_ITERATIONS = 100000
+_NO_VALUE = object()
+
+
+class _LoopBreak(Exception):
+    pass
+
+
+class _LoopContinue(Exception):
+    pass
+
+
+def _const_eval(node, ctx):
+    """Evaluate ``node`` to a constant value at generation time, or _NO_VALUE."""
+    try:
+        return _value(node, ctx)
+    except DiscoveryError:
+        pass
+    st = _ExprState()
+    try:
+        ir, dyn = _expr(node, ctx, st)
+    except DiscoveryError:
+        return _NO_VALUE
+    if dyn or st.call is not None:
+        return _NO_VALUE
+    if ir["t"] == "v":
+        return ir["v"]
+    try:
+        v = _EXPR_NS["_ex_ev"](ir, None)
+    except Exception:
+        return _NO_VALUE
+    if isinstance(v, (range, type({}.keys()), type({}.values()), type({}.items()))):
+        v = list(v)
+    return v
+
+
+def _const_iter(node, ctx):
+    v = _const_eval(node, ctx)
+    if v is _NO_VALUE:
+        return _NO_VALUE
+    if isinstance(v, (list, tuple, str, set, frozenset, collections.deque, dict, range)):
+        items = list(v)
+    else:
+        return _NO_VALUE
+    return items
+
+
+def _const_cond(node, ctx):
+    v = _const_eval(node, ctx)
+    if v is _NO_VALUE:
+        return _NO_VALUE
+    try:
+        return bool(v)
+    except Exception:
+        return _NO_VALUE
+
+
+def _bind_const(target, value, ctx):
+    if isinstance(target, ast.Name):
+        ctx.env[target.id] = {"ir": {"t": "v", "v": copy.deepcopy(value)}, "call": None, "origin": None}
+        return
+    if isinstance(target, (ast.Tuple, ast.List)):
+        if any(isinstance(e, ast.Starred) for e in target.elts):
+            raise _err(target, "unsupported loop target")
+        if isinstance(value, dict) or not isinstance(
+                value, (list, tuple, str, set, frozenset, collections.deque)):
+            raise _err(target, "cannot unpack loop value")
+        vals = list(value)
+        if len(vals) != len(target.elts):
+            raise _err(target, "cannot unpack loop value")
+        for e, v in zip(target.elts, vals):
+            _bind_const(e, v, ctx)
+        return
+    raise _err(target, "unsupported loop target")
+
+
+def _parse_augassign(stmt, ctx):
+    if not isinstance(stmt.target, ast.Name) or type(stmt.op) not in _BINOPS:
+        raise DiscoveryError(f"line {stmt.lineno}: unsupported assignment")
+    load = ast.copy_location(ast.Name(id=stmt.target.id, ctx=ast.Load()), stmt.target)
+    value = ast.copy_location(ast.BinOp(left=load, op=stmt.op, right=stmt.value), stmt)
+    store = ast.copy_location(ast.Name(id=stmt.target.id, ctx=ast.Store()), stmt.target)
+    assign = ast.copy_location(ast.Assign(targets=[store], value=value), stmt)
+    _parse_assign(assign, ctx)
 
 
 # ---- general expressions (one entrypoint call + primitive operations) ----
@@ -1618,6 +1797,8 @@ def _check_msg(e, chk):
 
 def run_test(factory, t):
     kind = t["kind"]
+    if kind == "loop":
+        return bool(t.get("ok"))
     args = copy.deepcopy(t["args"])
     kwargs = {k: copy.deepcopy(v) for k, v in t["kwargs"]}
     cmp = t.get("cmp")
@@ -3023,6 +3204,7 @@ function resolve(loaded, name) {
 
 // ---------- running ----------
 async function runTest(factory, t) {
+  if (t.kind === "loop") return !!t.ok;
   const args = toJS(t.args).concat(t.kwargs.map(function (kv) { return toJS(kv[1]); }));
   const cmp = t.cmp || null;
   let ok = false;
@@ -3119,7 +3301,7 @@ def render_tester(lang: str, tests, entrypoint: str) -> str:
             "kwargs": t["kwargs"], "expected": t.get("expected"),
             "cmp": t.get("cmp"), "exc": t.get("exc"), "checks": t.get("checks"),
             "stdout": t.get("stdout"), "stderr": t.get("stderr"),
-            "expr": t.get("expr"),
+            "expr": t.get("expr"), "ok": t.get("ok"),
         })
     if lang == "python":
         body = "[\n" + "".join("    " + py_literal(r) + ",\n" for r in records) + "]"

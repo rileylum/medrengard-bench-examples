@@ -21,3 +21,10 @@ Assertions may wrap the single entrypoint call in primitive operations, e.g.
 at generation time (also usable as call arguments, e.g. `f(list(range(5)))`).
 Names may be bound (`r = f(x)` / `a, b = f(x)` / `xs = [1, 2]`) and used by later asserts in the same scope.
 Each test must trace to exactly one entrypoint invocation; multiple calls in one test are rejected.
+
+Loops (`for`, incl. `enumerate`/`range(len(...))`/`zip`/`.items()`, and `while` with `i += 1`) are unrolled at
+generation time. Each loop statement is a test (`tests.py:<line>`, plus enclosing iteration indices when nested)
+that passes iff it iterates at least once (zero iterations or an unevaluable iterable fail, body skipped).
+Assertions in the body get IDs `tests.py:<line>:<i>` (nested: `tests.py:<line>:<outer>:<inner>`) and must each
+trace to exactly one entrypoint call. `*args`/`**kwargs` unpacking of constants, constant `if`, `break`/`continue`
+are supported.
