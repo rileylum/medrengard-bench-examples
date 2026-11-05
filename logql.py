@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""LogQL Parts 1-3: query NDJSON logs with a tiny SQL-like language (GROUP BY, aggregates, CONFLATE joins)."""
+"""LogQL Parts 1-4: query NDJSON logs with a tiny SQL-like language
+(GROUP BY, aggregates, CONFLATE joins, GLOSS canonical labels)."""
 import json
 import math
 import re
@@ -65,8 +66,6 @@ def tokenize(src):
             i = m.end()
             if word.upper() in KEYWORDS:
                 toks.append(Tok("KW", word.upper(), start))
-
-
             else:
                 toks.append(Tok("IDENT", word, start))
             continue
@@ -120,7 +119,14 @@ def tokenize(src):
             toks.append(Tok("OP", c, start))
             i += 1
             continue
-        single = {",": "COMMA", ".": "DOT", "(": "LPAREN", ")": "RPAREN", "*": "STAR"}
+        if c == ":":
+            if src[i:i + 2] == ":=":
+                toks.append(Tok("ASSIGN", ":=", start))
+                i += 2
+                continue
+            fail("E_PARSE", "unexpected character ':'", start)
+        single = {",": "COMMA", ".": "DOT", "(": "LPAREN", ")": "RPAREN", "*": "STAR",
+                  "|": "PIPE", "{": "LBRACE", "}": "RBRACE"}
         if c in single:
             toks.append(Tok(single[c], c, start))
             i += 1
@@ -169,16 +175,25 @@ class Parser:
         else:
             fail("E_PARSE", "expected table name but found %s" % describe(t), t.pos)
         where = None
-        if self.is_kw("WHERE"):
-            self.advance()
-            where = self.parse_or()
+        gloss = None
         conflates = []
-        while self.is_word("CONFLATE"):
-            conflates.append(self.parse_conflate())
-        if where is None and conflates and self.is_kw("WHERE"):
-            # lenient: also accept WHERE after the CONFLATE clauses
-            self.advance()
-            where = self.parse_or()
+        # Clause order per the grammar is WHERE, GLOSS, CONFLATE*; WHERE and GLOSS are
+        # also accepted (once each) after CONFLATE clauses.
+        while True:
+            t = self.peek()
+            if self.is_kw("WHERE"):
+                if where is not None:
+                    fail("E_PARSE", "duplicate WHERE clause", t.pos)
+                self.advance()
+                where = self.parse_or()
+            elif self.is_word("GLOSS"):
+                if gloss is not None:
+                    fail("E_PARSE", "duplicate GLOSS clause", t.pos)
+                gloss = self.parse_gloss()
+            elif self.is_word("CONFLATE"):
+                conflates.append(self.parse_conflate())
+            else:
+                break
         group = None
         if self.is_word("GROUP"):
             self.advance()
@@ -197,8 +212,51 @@ class Parser:
         t = self.peek()
         if t.kind != "EOF":
             fail("E_PARSE", "unexpected %s" % describe(t), t.pos)
-        return {"select": select, "source": source, "where": where,
+        return {"select": select, "source": source, "where": where, "gloss": gloss,
                 "conflates": conflates, "group": group}
+
+    def parse_gloss(self):
+        start = self.advance().pos  # GLOSS
+        strict = False
+        if self.is_word("STRICT"):
+            self.advance()
+            strict = True
+        t = self.peek()
+        if t.kind != "LBRACE":
+            fail("E_PARSE", "expected '{' after GLOSS but found %s" % describe(t), t.pos)
+        self.advance()
+        decls = []
+        while True:
+            t = self.peek()
+            if t.kind != "IDENT":
+                fail("E_PARSE", "expected canonical label name but found %s" % describe(t), t.pos)
+            self.advance()
+            a = self.peek()
+            if a.kind != "ASSIGN":
+                fail("E_PARSE", "expected ':=' but found %s" % describe(a), a.pos)
+            self.advance()
+            cands = []
+            while True:
+                cpos = self.peek().pos
+                cands.append((self.parse_field_ref(), cpos))
+                if self.peek().kind == "PIPE":
+                    self.advance()
+                    continue
+                break
+            default = ("null", None)
+            if self.is_word("DEFAULT"):
+                self.advance()
+                default = self.parse_literal()
+            decls.append({"name": t.value, "pos": t.pos, "cands": cands, "default": default[1]})
+            if self.peek().kind == "COMMA":
+                self.advance()
+                continue
+            break
+        t = self.peek()
+        if t.kind != "RBRACE":
+            fail("E_PARSE", "expected ',' or '}' in GLOSS but found %s" % describe(t), t.pos)
+        self.advance()
+        return {"strict": strict, "decls": decls, "pos": start}
 
     def parse_conflate(self):
         start = self.advance().pos  # CONFLATE
@@ -265,6 +323,8 @@ class Parser:
         nxt = self.toks[self.i + 1] if t.kind == "IDENT" else None
         if (nxt is not None and nxt.kind == "DOT"
                 and self.toks[self.i + 2].kind == "STAR"):
+            if t.value.upper() == "CANON":
+                fail("E_PARSE", "wildcard is not allowed on CANON", self.toks[self.i + 2].pos)
             self.i += 3
             return {"kind": "astar", "source": t.value, "pos": t.pos,
                     "key": t.value + ".*", "alias": None}
@@ -361,6 +421,10 @@ class Parser:
             fail("E_PARSE", "expected comparison operator but found %s" % describe(t), t.pos)
         self.advance()
         op = t.value
+        lit = self.parse_literal()
+        return ("CMP", path, op, lit, ppos)
+
+    def parse_literal(self):
         lt = self.peek()
         if lt.kind == "NUMBER":
             lit = ("number", lt.value)
@@ -375,7 +439,7 @@ class Parser:
         else:
             fail("E_PARSE", "expected literal but found %s" % describe(lt), lt.pos)
         self.advance()
-        return ("CMP", path, op, lit, ppos)
+        return lit
 
 
 # ---------------------------------------------------------------- evaluation
@@ -444,8 +508,49 @@ def evaluate(expr, record):
     return compare(resolve_ref(record, ref), op, lit)
 
 
+CANON_TAG = object()
+
+
+class Canon:
+    """A GLOSS declaration: CANON.<name> := cand1 | cand2 ... [DEFAULT lit].
+
+    Hashed by identity so (CANON_TAG, canon) refs can be used like ordinary field refs."""
+
+    def __init__(self, name, cands, default, strict):
+        self.name = name
+        self.cands = cands  # list of bound (alias, path) refs
+        self.default = default
+        self.strict = strict
+        self.aliases = {c[0] for c in cands}
+
+    def value(self, row):
+        """First non-null candidate (left to right); candidates whose alias is absent
+        from `row` (not joined / not visible) count as null."""
+        found = None
+        found_key = None
+        for ref in self.cands:
+            v = resolve_ref(row, ref)
+            if v is None:
+                continue
+            if not self.strict:
+                return v
+            if found_key is None:
+                found, found_key = v, deep_key(v)
+            elif deep_key(v) != found_key:
+                fail("E_RUNTIME", "LOGQL_ERROR: conflict in CANON.%s" % self.name)
+        if found_key is not None:
+            return found
+        return self.default
+
+
+def is_canon(ref):
+    return ref is not None and ref[0] is CANON_TAG
+
+
 def resolve_ref(row, ref):
     """row maps alias -> record (or None when null-padded by an outer conflation)."""
+    if ref[0] is CANON_TAG:
+        return ref[1].value(row)
     rec = row.get(ref[0])
     if rec is None:
         return None
@@ -453,6 +558,8 @@ def resolve_ref(row, ref):
 
 
 def resolve_ref_present(row, ref):
+    if ref[0] is CANON_TAG:
+        return ref[1].value(row)
     rec = row.get(ref[0])
     if rec is None:
         return MISSING
@@ -511,7 +618,18 @@ def bind_query(q):
             fail("E_SEMANTIC", "source alias %r used more than once" % name, pos)
         aliases.append(name)
 
-    def bind(path, pos, scope=None):
+    canons = {}
+
+    def bind(path, pos, scope=None, canon_ok=True):
+        if len(path) >= 2 and path[0].upper() == "CANON" and path[0] not in aliases:
+            if len(path) != 2:
+                fail("E_PARSE", "CANON reference must be CANON.<name>", pos)
+            if not canon_ok:
+                fail("E_SEMANTIC", "CANON.%s cannot be used here" % path[1], pos)
+            c = canons.get(path[1])
+            if c is None:
+                fail("E_SEMANTIC", "undeclared canonical label CANON.%s" % path[1], pos)
+            return (CANON_TAG, c)
         scope = aliases if scope is None else scope
         if not multi:
             if len(path) >= 2 and path[0] == from_alias:
@@ -527,11 +645,34 @@ def bind_query(q):
             fail("E_SEMANTIC", "source alias %r is not in scope here" % path[0], pos)
         return (path[0], tuple(path[1:]))
 
+    gloss = q.get("gloss")
+    if gloss is not None:
+        for d in gloss["decls"]:
+            if d["name"] in canons:
+                fail("E_SEMANTIC", "canonical label CANON.%s declared more than once"
+                     % d["name"], d["pos"])
+            cands = []
+            for path, pos in d["cands"]:
+                if len(path) < 2:
+                    fail("E_SEMANTIC", "GLOSS candidate %r must be qualified with a source alias"
+                         % ".".join(path), pos)
+                if path[0].upper() == "CANON" and path[0] not in aliases:
+                    fail("E_SEMANTIC", "GLOSS candidate cannot reference CANON", pos)
+                if path[0] not in aliases:
+                    fail("E_SEMANTIC", "unknown source alias %r in GLOSS candidate %r"
+                         % (path[0], ".".join(path)), pos)
+                cands.append((path[0], tuple(path[1:])))
+            canons[d["name"]] = Canon(d["name"], cands, d["default"], gloss["strict"])
+
     def bind_expr(e):
         if e[0] in ("AND", "OR"):
             return (e[0], bind_expr(e[1]), bind_expr(e[2]))
         _, path, op, lit, pos = e
-        return ("CMP", bind(path, pos), op, lit)
+        ref = bind(path, pos)
+        if is_canon(ref) and any(a != from_alias for a in ref[1].aliases):
+            fail("E_SEMANTIC", "CANON.%s cannot be used in WHERE: not all candidates reference %r"
+                 % (ref[1].name, from_alias), pos)
+        return ("CMP", ref, op, lit)
 
     select = q["select"]
     for it in select:
@@ -558,7 +699,7 @@ def bind_query(q):
         for (lp, lpos), (rp, rpos) in c["on"]:
             l = bind(lp, lpos, scope)
             r = bind(rp, rpos, scope)
-            if l[0] == r[0]:
+            if not is_canon(l) and not is_canon(r) and l[0] == r[0]:
                 fail("E_SEMANTIC", "UPON predicate must compare two different aliases", lpos)
             on.append((l, r))
         c["on_b"] = on
@@ -789,14 +930,35 @@ def aggregate(rows, select, group):
 # ---------------------------------------------------------------- conflation
 
 def conflate(left_rows, left_aliases, right_alias, right_records, on, flavor):
-    # Conjuncts with exactly one side on the new alias are hash-joinable;
-    # anything else is checked per candidate pair.
+    # Each operand is assigned a side: L (already-bound aliases) or R (the new alias).
+    # Conjuncts with one operand on each side are hash-joinable, each operand being
+    # evaluated against its own side only; anything else is checked per candidate pair.
+    # A CANON operand whose candidates all live on one side takes that side; a mixed
+    # one takes the side opposite its partner (positional when both are mixed), and is
+    # then resolved using only the candidates visible on that side.
+    def side_of(ref):
+        if is_canon(ref):
+            al = ref[1].aliases
+            if al and al <= set(left_aliases):
+                return "L"
+            if al == {right_alias}:
+                return "R"
+            return None
+        return "R" if ref[0] == right_alias else "L"
+
     hash_l, hash_r, extra = [], [], []
     for l, r in on:
-        if r[0] == right_alias and l[0] != right_alias:
+        sl, sr = side_of(l), side_of(r)
+        if sl is None and sr is None:
+            sl, sr = "L", "R"
+        elif sl is None:
+            sl = "L" if sr == "R" else "R"
+        elif sr is None:
+            sr = "L" if sl == "R" else "R"
+        if sl == "L" and sr == "R":
             hash_l.append(l)
             hash_r.append(r)
-        elif l[0] == right_alias and r[0] != right_alias:
+        elif sl == "R" and sr == "L":
             hash_l.append(r)
             hash_r.append(l)
         else:
@@ -804,7 +966,8 @@ def conflate(left_rows, left_aliases, right_alias, right_records, on, flavor):
 
     index = {}
     for j, rec in enumerate(right_records):
-        k = tuple(deep_key(resolve(rec, ref[1])) for ref in hash_r)
+        view = {right_alias: rec}
+        k = tuple(deep_key(resolve_ref(view, ref)) for ref in hash_r)
         index.setdefault(k, []).append(j)
 
     all_right = list(range(len(right_records)))
@@ -934,6 +1097,11 @@ def run(sources, query):
 
 
 def emit_error(code, message, position=None):
+    if code == "E_RUNTIME":
+        # runtime errors use the flat shape shown in the Part 4 spec
+        sys.stderr.write(json.dumps({"error": message, "code": code}, ensure_ascii=False) + "\n")
+        sys.stderr.flush()
+        return
     err = {"code": code, "message": message}
     if position is not None:
         err["position"] = position
