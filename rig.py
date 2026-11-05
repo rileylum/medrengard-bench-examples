@@ -12,7 +12,7 @@ CONFIG_EXTS = (".yaml", ".yml", ".json")
 OS_NAMES = ("macos", "linux")
 PACKAGE_MANAGERS = ("brew", "apt", "yum")
 ACTION_TYPES = ("link", "copy", "run")
-SCHEMAS = ("module", "preferences", "dock")
+SCHEMAS = ("module", "preferences", "dock", "environments")
 VALUE_TYPES = ("bool", "int", "string", "float")
 OS_VERSIONS = ("yosemite", "el_capitan", "sierra", "high_sierra", "mojave",
                "catalina", "big_sur", "monterey", "ventura", "sonoma")
@@ -91,11 +91,16 @@ def validate_config(data):
     elif schema not in SCHEMAS:
         errors.append("schema: unrecognized schema '%s'" % schema)
 
+    errors.extend(validate_depends_on(data))
+
     if schema == "preferences":
         errors.extend(validate_preferences(data))
         return errors
     if schema == "dock":
         errors.extend(validate_dock(data))
+        return errors
+    if schema == "environments":
+        errors.extend(validate_environments(data))
         return errors
 
     # 4-8. os
@@ -203,6 +208,105 @@ def validate_config(data):
                     if v is not _MISSING and not isinstance(v, bool):
                         errors.append(
                             "actions[%d].%s: must be a boolean" % (i, key))
+    return errors
+
+
+def validate_depends_on(data):
+    errors = []
+    deps = data.get("depends_on", _MISSING)
+    if deps is _MISSING:
+        return errors
+    if not isinstance(deps, list):
+        return ["depends_on: must be a list"]
+    for i, d in enumerate(deps):
+        if not _is_str(d):
+            errors.append("depends_on[%d]: must be a string" % i)
+        elif d == "":
+            errors.append("depends_on[%d]: must not be empty" % i)
+    return errors
+
+
+def _check_str(obj, key, pre, errors):
+    v = obj.get(key, _MISSING)
+    if v is _MISSING:
+        errors.append("%s.%s: required" % (pre, key))
+    elif not _is_str(v):
+        errors.append("%s.%s: must be a string" % (pre, key))
+    elif v == "":
+        errors.append("%s.%s: must not be empty" % (pre, key))
+    else:
+        return True
+    return False
+
+
+def validate_environments(data):
+    errors = []
+    envs = data.get("environments", _MISSING)
+    if envs is _MISSING:
+        return ["environments: required"]
+    if not isinstance(envs, list) or not envs:
+        return ["environments: must be a non-empty list"]
+    for n, env in enumerate(envs):
+        pre = "environments[%d]" % n
+        if not isinstance(env, dict):
+            errors.append("%s: must be an object" % pre)
+            continue
+        _check_str(env, "language", pre, errors)
+        versions = env.get("versions", _MISSING)
+        valid_versions = None
+        if versions is _MISSING:
+            errors.append("%s.versions: required" % pre)
+        elif not isinstance(versions, list) or not versions:
+            errors.append("%s.versions: must be a non-empty list" % pre)
+        else:
+            for i, v in enumerate(versions):
+                if not _is_str(v):
+                    errors.append("%s.versions[%d]: must be a string"
+                                  % (pre, i))
+                elif v == "":
+                    errors.append("%s.versions[%d]: must not be empty"
+                                  % (pre, i))
+            valid_versions = versions
+        mgr = env.get("manager", _MISSING)
+        if mgr is _MISSING:
+            errors.append("%s.manager: required" % pre)
+            continue
+        if not isinstance(mgr, dict):
+            errors.append("%s.manager: must be an object" % pre)
+            continue
+        mpre = pre + ".manager"
+        _check_str(mgr, "name", mpre, errors)
+        plugins = mgr.get("plugins", _MISSING)
+        if plugins is _MISSING or plugins is None:
+            continue
+        if not isinstance(plugins, list):
+            errors.append("%s.plugins: must be a list" % mpre)
+            continue
+        for m, plug in enumerate(plugins):
+            ppre = "%s.plugins[%d]" % (mpre, m)
+            if not isinstance(plug, dict):
+                errors.append("%s: must be an object" % ppre)
+                continue
+            _check_str(plug, "name", ppre, errors)
+            venvs = plug.get("virtual_environments", _MISSING)
+            if venvs is _MISSING or venvs is None:
+                continue
+            if not isinstance(venvs, list):
+                errors.append("%s.virtual_environments: must be a list"
+                              % ppre)
+                continue
+            for k, ve in enumerate(venvs):
+                vpre = "%s.virtual_environments[%d]" % (ppre, k)
+                if not isinstance(ve, dict):
+                    errors.append("%s: must be an object" % vpre)
+                    continue
+                if _check_str(ve, "version", vpre, errors):
+                    if (valid_versions is not None
+                            and ve["version"] not in valid_versions):
+                        errors.append(
+                            "%s.version: '%s' is not in the environment's "
+                            "versions list" % (vpre, ve["version"]))
+                _check_str(ve, "name", vpre, errors)
     return errors
 
 
@@ -443,6 +547,78 @@ def plan_preferences(pref_entries, os_version):
     return out
 
 
+def plan_environments(env_entries):
+    out = []
+    for e in env_entries:
+        for env in e["data"].get("environments") or []:
+            lang = env["language"]
+            mgr = env["manager"]
+            mname = mgr["name"]
+            plugins = mgr.get("plugins") or []
+            for v in env["versions"]:
+                out.append({"type": "install_runtime", "language": lang,
+                            "version": v, "manager": mname})
+            for p in plugins:
+                out.append({"type": "install_plugin", "manager": mname,
+                            "plugin": p["name"]})
+            for p in plugins:
+                for ve in p.get("virtual_environments") or []:
+                    out.append({"type": "create_virtual_env",
+                                "language": lang, "manager": mname,
+                                "plugin": p["name"],
+                                "version": ve["version"],
+                                "name": ve["name"]})
+    return out
+
+
+class DependencyError(PlanError):
+    def __init__(self, payload):
+        super().__init__(payload["error"], payload)
+        self.payload = payload
+
+
+def order_modules(modules, deps):
+    """Topologically order modules (dicts with 'name'); ties alphabetical."""
+    import heapq
+    names = {m["name"] for m in modules}
+    for name in sorted(names):
+        for d in sorted(deps.get(name, ())):
+            if d not in names:
+                raise DependencyError({"error": "missing_dependency",
+                                       "module": name, "missing": d})
+    remaining = {n: set(deps.get(n, ())) for n in names}
+    dependents = {n: set() for n in names}
+    for n, ds in remaining.items():
+        for d in ds:
+            dependents[d].add(n)
+    heap = [n for n, ds in remaining.items() if not ds]
+    heapq.heapify(heap)
+    order = []
+    done = set()
+    while heap:
+        n = heapq.heappop(heap)
+        order.append(n)
+        done.add(n)
+        for x in dependents[n]:
+            remaining[x].discard(n)
+            if not remaining[x]:
+                heapq.heappush(heap, x)
+    if len(order) != len(names):
+        left = sorted(n for n in names if n not in done)
+        path = []
+        seen = {}
+        cur = left[0]
+        while cur not in seen:
+            seen[cur] = len(path)
+            path.append(cur)
+            cur = min(remaining[cur])
+        cycle = path[seen[cur]:] + [cur]
+        raise DependencyError({"error": "circular_dependency",
+                               "cycle": cycle})
+    by_name = {m["name"]: m for m in modules}
+    return [by_name[n] for n in order]
+
+
 def find_conflicts(modules):
     by_dest = {}
     for m in modules:
@@ -472,6 +648,8 @@ def build_plan(root, os_filter, module_filter, os_version=None):
 
     prefs_by_dir = {}
     dock_by_dir = {}
+    env_by_dir = {}
+    deps = {}
     for e in entries:
         schema = e["data"].get("schema")
         name = module_name_of(e["rel"])
@@ -479,10 +657,15 @@ def build_plan(root, os_filter, module_filter, os_version=None):
             prefs_by_dir.setdefault(name, []).append(e)
         elif schema == "dock":
             dock_by_dir.setdefault(name, []).append(e)
+        elif schema == "environments":
+            env_by_dir.setdefault(name, []).append(e)
+        for d in e["data"].get("depends_on") or []:
+            deps.setdefault(name, set()).add(d)
 
     root_abs = os.path.abspath(root)
     modules = []
-    names = set(by_dir) | set(prefs_by_dir) | set(dock_by_dir)
+    names = (set(by_dir) | set(prefs_by_dir) | set(dock_by_dir)
+             | set(env_by_dir))
     for name in sorted(names):
         if not name:
             continue  # root-level configs are not modules
@@ -495,7 +678,8 @@ def build_plan(root, os_filter, module_filter, os_version=None):
                 continue
         dock_ok = name in dock_by_dir and (os_filter is None
                                            or os_filter == "macos")
-        if data is None and name not in prefs_by_dir and not dock_ok:
+        if (data is None and name not in prefs_by_dir
+                and name not in env_by_dir and not dock_ok):
             continue  # dock-only module excluded by --os
         mod_dir = os.path.join(root_abs, *name.split("/"))
         actions = []
@@ -507,7 +691,10 @@ def build_plan(root, os_filter, module_filter, os_version=None):
             actions.append({"type": "configure_dock",
                             "items": list(dock_by_dir[name][0]["data"]
                                           ["items"])})
+        actions.extend(plan_environments(env_by_dir.get(name, [])))
         modules.append({"name": name, "actions": actions})
+
+    modules = order_modules(modules, deps)
 
     conflicts = find_conflicts(modules)
     if conflicts:
@@ -541,7 +728,9 @@ def main(argv=None):
                           set(args.modules) if args.modules is not None
                           else None, args.os_version)
     except PlanError as exc:
-        if exc.kind == "conflict":
+        if isinstance(exc, DependencyError):
+            err = exc.payload
+        elif exc.kind == "conflict":
             err = {"error": "conflict", "conflicts": exc.details}
         else:
             err = {"error": exc.kind, "details": exc.details}
