@@ -178,6 +178,18 @@ class SDE:
                         self.reprocess_skill[int(parts[0])] = int(float(val))
                     except ValueError:
                         continue
+        self.jumps = {}  # system_id -> set(system_id)
+        f = _open_sde(sde_dir, "mapSolarSystemJumps")
+        if f:
+            with f:
+                for row in csv.DictReader(f):
+                    try:
+                        a = int(row["fromSolarSystemID"])
+                        b = int(row["toSolarSystemID"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    self.jumps.setdefault(a, set()).add(b)
+                    self.jumps.setdefault(b, set()).add(a)
         yp = os.path.join(sde_dir, "ship_volumes.yaml")
         if os.path.exists(yp):
             with open(yp, encoding="utf-8") as fh:
@@ -410,6 +422,9 @@ class State:
         self.books = {}  # market -> {order_id: order}
         self.stations = {}  # location_id -> {"name", "type", "system_id", "region_id"}
         self.configs = {}  # api key -> config
+        self.effective_ts = None  # max issued timestamp of latest price upload
+        self.history = {}  # (region_id, type_id) -> {date: (average, volume)}
+        self.history_max_date = None
 
     def all_orders(self):
         merged = {}
@@ -470,6 +485,10 @@ def handle_prices(state, query, headers, body):
         except ValueError:
             raise ApiError(400, "INVALID_FORMAT", "location_id must be an integer, got %r" % loc)
     rows = read_gzip_csv(body, PRICE_SCHEMA)
+    eff_ts = max((r["issued"] for r in rows), default=None)
+    if eff_ts is not None:
+        with state.lock:
+            state.effective_ts = eff_ts
     if loc_id is not None:
         rows = [r for r in rows if r["location_id"] == loc_id]
     with state.lock:
@@ -772,10 +791,17 @@ def parse_config(body):
     implant = body.get("implant")
     if implant is not None and (not isinstance(implant, str) or implant not in IMPLANT_IM):
         raise _enum_error("implant", implant, list(IMPLANT_IM))
+    tax = body.get("sales_tax")
+    if tax is not None:
+        if isinstance(tax, bool) or not isinstance(tax, (int, float)) or tax < 0 or tax > 100:
+            raise ValueApiError(404, "INVALID_VALUE", "sales_tax",
+                                "sales_tax must be a number between 0 and 1, got %s" % json.dumps(tax))
+        tax = float(tax) / 100.0 if tax > 1 else float(tax)
     return {
         "structure": {"type": stype, "rig": rig, "security": sec},
         "skills": clean_skills,
         "implant": implant,
+        "sales_tax": tax,
     }
 
 
@@ -1460,6 +1486,637 @@ def handle_compress(state, body):
 
 
 # --------------------------------------------------------------------------
+# Profit finding
+# --------------------------------------------------------------------------
+
+from bisect import bisect_left, bisect_right
+from datetime import date as _date, timedelta
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+
+
+def parse_date(v):
+    s = v.strip()
+    if not s:
+        raise ValueError("empty date")
+    try:
+        return _date.fromisoformat(s[:10])
+    except ValueError:
+        return parse_datetime(s).date()
+
+
+CONVERTERS["date"] = parse_date
+
+VOLUME_SCHEMA = {
+    "date": "date",
+    "region_id": "int",
+    "type_id": "int",
+    "average": "float",
+    "highest": "float",
+    "lowest": "float",
+    "count": "int",
+    "volume": "int",
+}
+HISTORY_DAYS = 30
+DEFAULT_TAX = 0.04
+_CENT = Decimal("0.01")
+
+
+def _price_step(d):
+    m = d.adjusted()
+    return max(_CENT, Decimal(10) ** (m - 3)), m
+
+
+def undercut_price(p):
+    """Largest valid price (4 significant digits, 0.01 resolution) below p."""
+    d = Decimal(repr(float(p)))
+    if d <= _CENT:
+        return float(d)
+    step, m = _price_step(d)
+    k = (d / step).to_integral_value(rounding=ROUND_CEILING) - 1
+    x = k * step
+    if x < Decimal(10) ** m:
+        step2 = max(_CENT, Decimal(10) ** (m - 4))
+        x = Decimal(10) ** m - step2
+    return float(x)
+
+
+def overbid_price(p):
+    """Smallest valid price (4 significant digits, 0.01 resolution) above p."""
+    d = Decimal(repr(float(p)))
+    if d <= 0:
+        return 0.01
+    step, _m = _price_step(d)
+    k = (d / step).to_integral_value(rounding=ROUND_FLOOR) + 1
+    return float(k * step)
+
+
+def handle_volumes(state, query, headers, body):
+    rows = read_gzip_csv(body, VOLUME_SCHEMA)
+    with state.lock:
+        for r in rows:
+            key = (r["region_id"], r["type_id"])
+            state.history.setdefault(key, {})[r["date"]] = (r["average"], r["volume"])
+            if state.history_max_date is None or r["date"] > state.history_max_date:
+                state.history_max_date = r["date"]
+    return 200, {"status": "VOLUME_UPDATED", "count": len(rows)}
+
+
+def daily_stats(state, region_id, tid):
+    """(avg daily volume, avg daily value) over the 30 day window, 0-filled."""
+    hist = state.history.get((region_id, tid))
+    if not hist or state.history_max_date is None:
+        return 0.0, 0.0
+    start = state.history_max_date - timedelta(days=HISTORY_DAYS - 1)
+    vol = 0.0
+    val = 0.0
+    for d, (avg, v) in hist.items():
+        if start <= d <= state.history_max_date:
+            vol += v
+            val += avg * v
+    return vol / HISTORY_DAYS, val / HISTORY_DAYS
+
+
+def _bad(msg):
+    return ApiError(400, "INVALID_VALUE", msg)
+
+
+def _parse_hub(v):
+    if v is None:
+        return "jita"
+    if not isinstance(v, str):
+        raise _bad("hub must be one of: %s" % ", ".join(MARKET_KEYS))
+    t = v.strip().lower()
+    if t in MARKET_KEYS:
+        return t
+    for k, name, loc in HUBS:
+        if t == name.lower() or t == str(loc):
+            return k
+    raise _bad("Unknown hub %s; expected one of: %s" % (json.dumps(v), ", ".join(MARKET_KEYS)))
+
+
+def _parse_tax(v, path="sales_tax"):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        try:
+            v = float(v.strip().rstrip("%"))
+        except ValueError:
+            raise _bad("%s must be a number" % path)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0 or v > 100:
+        raise _bad("%s must be a number between 0 and 1" % path)
+    v = float(v)
+    return v / 100.0 if v > 1 else v
+
+
+def _get_num(v, path, default, lo=None, integer=False):
+    if v is None:
+        return default
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return default
+        try:
+            v = float(s)
+        except ValueError:
+            raise _bad("%s must be a number, got %s" % (path, json.dumps(v)))
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+        raise _bad("%s must be a number, got %s" % (path, json.dumps(v)))
+    if integer:
+        if v != int(v):
+            raise _bad("%s must be an integer, got %s" % (path, json.dumps(v)))
+        v = int(v)
+    if lo is not None and v < lo:
+        raise _bad("%s must be >= %s, got %s" % (path, lo, json.dumps(v)))
+    return v
+
+
+def _api_config(state, headers):
+    """Returns (config or None, error response or None)."""
+    api_key = headers.get("x-api-key")
+    if api_key is None or api_key.strip() == "":
+        return None, None
+    with state.lock:
+        cfg = state.configs.get(api_key.strip())
+    if cfg is None:
+        return None, (401, {"code": "BAD_API_KEY"})
+    return cfg, None
+
+
+def _config_tax(cfg):
+    if cfg is None:
+        return None
+    if cfg.get("sales_tax") is not None:
+        return cfg["sales_tax"]
+    skills = cfg.get("skills") or {}
+    if any(k.lower() == "accounting" for k in skills):
+        lvl = _skill_level(skills, "Accounting")
+        return 0.075 * (1.0 - 0.11 * lvl)
+    return None
+
+
+def _station_orders(state, market_key):
+    with state.lock:
+        lst = hub_orders(state, market_key) or []
+    return lst
+
+
+def _competition(orders, eff_ts, minutes):
+    if eff_ts is None:
+        return len(orders)
+    cnt = 0
+    limit = minutes * 60.0
+    for o in orders:
+        age = (eff_ts - o["issued"]).total_seconds()
+        if age <= limit:
+            cnt += 1
+    return cnt
+
+
+class _Book:
+    """Cumulative view of an order list sorted by fill priority."""
+
+    def __init__(self, orders):
+        self.orders = orders
+        self.cumvol = []
+        self.cumval = []
+        v = 0
+        t = 0.0
+        for o in orders:
+            v += o["volume_remain"]
+            t += o["volume_remain"] * o["price"]
+            self.cumvol.append(v)
+            self.cumval.append(t)
+        self.total = v
+
+    def value(self, qty):
+        """Value of filling qty units (capped at total)."""
+        if qty <= 0 or not self.orders:
+            return 0.0
+        if qty >= self.total:
+            return self.cumval[-1]
+        i = bisect_left(self.cumvol, qty)
+        prev_v = self.cumvol[i - 1] if i else 0
+        prev_t = self.cumval[i - 1] if i else 0.0
+        return prev_t + (qty - prev_v) * self.orders[i]["price"]
+
+    def marginal_price(self, qty):
+        """Price of the qty-th unit."""
+        i = bisect_left(self.cumvol, qty)
+        return self.orders[min(i, len(self.orders) - 1)]["price"]
+
+
+# ---------------------------- reprocess profit ----------------------------
+
+def handle_profit_reprocess(state, headers, body):
+    cfg, err = _api_config(state, headers)
+    if err:
+        return err
+    data = _json_body(body)
+    if not isinstance(data, dict):
+        raise _bad("Request body must be a JSON object")
+    k = _get_num(data.get("k"), "k", 5, lo=0, integer=True)
+    hub = _parse_hub(data.get("hub"))
+    sort_by = data.get("sort_by")
+    if sort_by is None:
+        sort_by = "profit"
+    if not isinstance(sort_by, str) or sort_by.strip().lower() not in ("roi", "profit"):
+        raise _bad("sort_by must be 'roi' or 'profit'")
+    sort_by = sort_by.strip().lower()
+    tax = _parse_tax(data.get("sales_tax"))
+    eff = data.get("scrap_efficiency")
+    if eff is not None:
+        eff = _get_num(eff, "scrap_efficiency", None, lo=0)
+        if eff > 1:
+            eff = eff / 100.0
+    if cfg is not None:
+        model = YieldModel(state.sde, config=cfg)
+        eff = model._scrap
+        ctax = _config_tax(cfg)
+        if ctax is not None:
+            tax = ctax
+    if eff is None:
+        eff = DEFAULT_EFF["scrap"]
+    if tax is None:
+        tax = DEFAULT_TAX
+
+    sde = state.sde
+    orders = _station_orders(state, hub)
+    sells_by, buys_by = {}, {}
+    for o in orders:
+        if o["volume_remain"] <= 0:
+            continue
+        (buys_by if o["is_buy_order"] else sells_by).setdefault(o["type_id"], []).append(o)
+    buy_books = {}
+
+    def buy_book(mid):
+        if mid not in buy_books:
+            lst = sorted(buys_by.get(mid, []), key=lambda o: (-o["price"], o["order_id"]))
+            buy_books[mid] = _Book(lst)
+        return buy_books[mid]
+
+    kind_model = YieldModel(sde)
+    results = []
+    for tid, sells in sells_by.items():
+        name = sde.types.get(tid)
+        if not name:
+            continue
+        mats = sde.materials.get(tid)
+        if not mats or kind_model.kind(tid) != "scrap":
+            continue
+        portion = sde.type_portion.get(tid, 1)
+        sbook = _Book(sorted(sells, key=lambda o: (o["price"], o["order_id"])))
+        nmax = sbook.total // portion
+        if nmax <= 0:
+            continue
+        base = {}
+        for mid, q in mats:
+            base[mid] = base.get(mid, 0) + q
+        mat_books = {mid: buy_book(mid) for mid in base}
+        if not any(b.total > 0 for b in mat_books.values()):
+            continue
+
+        def revenue(n):
+            tot = 0.0
+            for mid, q in base.items():
+                b = mat_books[mid]
+                if b.total <= 0:
+                    continue
+                qty = int(math.floor(n * q * eff + EPS))
+                tot += b.value(qty)
+            return tot
+
+        def profit(n):
+            return revenue(n) * (1.0 - tax) - sbook.value(n * portion) * (1.0 + tax)
+
+        cands = {1, nmax}
+        for cv in sbook.cumvol:
+            c = cv // portion
+            for x in (c, c + 1):
+                if 1 <= x <= nmax:
+                    cands.add(x)
+        for mid, q in base.items():
+            y = q * eff
+            if y <= 0:
+                continue
+            for cv in mat_books[mid].cumvol:
+                c = int(cv / y)
+                for x in (c - 1, c, c + 1, c + 2):
+                    if 1 <= x <= nmax:
+                        cands.add(x)
+        best_n, best_p = 0, 0.0
+        for n in sorted(cands):
+            p = profit(n)
+            if p > best_p + 1e-9:
+                best_n, best_p = n, p
+        if best_n <= 0:
+            continue
+        qty = best_n * portion
+        cost = sbook.value(qty)
+        value = revenue(best_n)
+        results.append({
+            "item": name,
+            "quantity": qty,
+            "cost": cost,
+            "value": value,
+            "profit": best_p,
+            "roi": best_p / cost if cost > 0 else 0.0,
+            "max_price": sbook.marginal_price(qty),
+        })
+    results.sort(key=lambda r: (-r[sort_by], r["item"]))
+    results = results[:k]
+    items = [{
+        "item": r["item"],
+        "quantity": r["quantity"],
+        "cost": round(r["cost"], 2),
+        "value": round(r["value"], 2),
+        "profit": round(r["profit"], 2),
+        "roi": round(r["roi"], 4),
+        "max_price": r["max_price"],
+    } for r in results]
+    return 200, {
+        "cost": round(sum(r["cost"] for r in results), 2),
+        "revenue": round(sum(r["value"] for r in results), 2),
+        "profit": round(sum(r["profit"] for r in results), 2),
+        "items": items,
+    }
+
+
+# ------------------------------- hauling ---------------------------------
+
+def _systems_within(sde, start, max_jumps):
+    seen = {start: 0}
+    frontier = [start]
+    for d in range(1, max_jumps + 1):
+        nxt = []
+        for s in frontier:
+            for t in sde.jumps.get(s, ()):
+                if t not in seen:
+                    seen[t] = d
+                    nxt.append(t)
+        frontier = nxt
+        if not frontier:
+            break
+    return seen
+
+
+def _order_system(state, o):
+    sid = o.get("system_id")
+    if sid:
+        return sid
+    st = state.sde.stations.get(o["location_id"])
+    if st:
+        return st[1]
+    st = state.stations.get(o["location_id"])
+    return st.get("system_id") if st else None
+
+
+def _qbool(v, path, default):
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return default
+    if isinstance(v, bool):
+        return v
+    try:
+        return parse_bool(str(v))
+    except ValueError:
+        raise _bad("%s must be true or false" % path)
+
+
+def handle_profit_haul(state, query, headers):
+    cfg, err = _api_config(state, headers)
+    if err:
+        return err
+
+    def q(name):
+        v = query.get(name)
+        return v[0] if v else None
+
+    hub = _parse_hub(q("hub"))
+    capacity = _get_num(q("capacity"), "capacity", float("inf"), lo=0)
+    shipping = _get_num(q("shipping"), "shipping", 350.0, lo=0)
+    max_jumps = _get_num(q("max_jumps"), "max_jumps", 5, lo=0, integer=True)
+    margin = _get_num(q("margin"), "margin", 20.0)
+    include_hubs = _qbool(q("include_hubs"), "include_hubs", False)
+    daily_value = _get_num(q("daily_value"), "daily_value", 1e9, lo=0)
+    optimize = (q("optimize") or "profit").strip().lower()
+    if optimize not in ("m3", "roi", "profit"):
+        raise _bad("optimize must be one of: m3, roi, profit")
+    tax = _parse_tax(q("sales_tax"))
+    ctax = _config_tax(cfg)
+    if ctax is not None:
+        tax = ctax
+    if tax is None:
+        tax = DEFAULT_TAX
+
+    sde = state.sde
+    _k, hub_loc = MARKET_KEYS[hub]
+    hub_st = sde.stations.get(hub_loc)
+    hub_sys = hub_st[1] if hub_st else None
+    hub_region = hub_st[2] if hub_st else None
+    other_hubs = {loc for kk, _n, loc in HUBS if kk != hub}
+    with state.lock:
+        all_orders = state.all_orders()
+        eff_ts = state.effective_ts
+    reach = _systems_within(sde, hub_sys, max_jumps) if hub_sys is not None else {}
+
+    dest_sells, dest_buys, src = {}, {}, {}
+    for o in all_orders:
+        if o["volume_remain"] <= 0:
+            continue
+        loc = o["location_id"]
+        if loc == hub_loc:
+            (dest_buys if o["is_buy_order"] else dest_sells).setdefault(o["type_id"], []).append(o)
+            continue
+        if o["is_buy_order"]:
+            continue
+        if loc in other_hubs and not include_hubs:
+            continue
+        if _order_system(state, o) not in reach:
+            continue
+        src.setdefault(o["type_id"], []).append(o)
+
+    lots = []
+    sell_prices = {}
+    for tid, lst in src.items():
+        name = sde.types.get(tid)
+        if not name:
+            continue
+        ds = dest_sells.get(tid)
+        db = dest_buys.get(tid)
+        cand = []
+        if ds:
+            cand.append(undercut_price(min(o["price"] for o in ds)))
+        if db:
+            cand.append(max(o["price"] for o in db))
+        if not cand:
+            continue
+        sp = max(cand)
+        if hub_region is not None and daily_stats(state, hub_region, tid)[1] < daily_value:
+            continue
+        vol = item_volume(sde, tid)
+        ship_unit = vol * shipping
+        net_sell = sp * (1.0 - tax)
+        for o in lst:
+            c = o["price"]
+            if c <= 0:
+                continue
+            pu = net_sell - c * (1.0 + tax) - ship_unit
+            if pu <= 0 or pu / c * 100.0 < margin:
+                continue
+            lots.append({"tid": tid, "name": name, "order": o, "pu": pu, "vol": vol,
+                         "roi": pu / c, "density": pu / vol if vol > 0 else float("inf"),
+                         "total": pu * o["volume_remain"]})
+            sell_prices[tid] = sp
+
+    key = {"m3": "density", "roi": "roi", "profit": "pu"}[optimize]
+    lots.sort(key=lambda l: (-l[key], -l["pu"], l["name"], l["order"]["price"], l["order"]["order_id"]))
+    remaining = capacity
+    bought = {}  # tid -> {loc: [qty, total]}
+    for lot in lots:
+        o = lot["order"]
+        qty = o["volume_remain"]
+        if lot["vol"] > 0:
+            if remaining != float("inf"):
+                qty = min(qty, int(math.floor(remaining / lot["vol"] + EPS)))
+        if qty <= 0:
+            continue
+        if lot["vol"] > 0 and remaining != float("inf"):
+            remaining -= qty * lot["vol"]
+        ent = bought.setdefault(lot["tid"], {}).setdefault(o["location_id"], [0, 0.0])
+        ent[0] += qty
+        ent[1] += qty * o["price"]
+
+    purchases = {}
+    sales = {}
+    cost = revenue = ship_total = 0.0
+    for tid in sorted(bought, key=lambda t: sde.types[t]):
+        name = sde.types[tid]
+        total_qty = 0
+        for loc, (qq, tt) in bought[tid].items():
+            purchases.setdefault(state.station_name(loc), []).append(
+                {"item": name, "quantity": qq, "total": round(tt, 2)})
+            total_qty += qq
+            cost += tt
+        vol = item_volume(sde, tid) * total_qty
+        ship_total += vol * shipping
+        sp = sell_prices[tid]
+        rev = sp * total_qty
+        revenue += rev
+        comp_orders = dest_sells.get(tid, [])
+        sales[name] = {
+            "sell_price": sp,
+            "total": total_qty,
+            "volume": round(vol, 2),
+            "revenue": round(rev, 2),
+            "competition": {
+                "5_minutes": _competition(comp_orders, eff_ts, 5),
+                "1_hour": _competition(comp_orders, eff_ts, 60),
+                "1_day": _competition(comp_orders, eff_ts, 1440),
+            },
+        }
+    for st in purchases:
+        purchases[st].sort(key=lambda e: (e["item"]))
+    purchases = dict(sorted(purchases.items()))
+    profit = revenue * (1.0 - tax) - cost * (1.0 + tax) - ship_total
+    return 200, {
+        "cost": round(cost, 2),
+        "revenue": round(revenue, 2),
+        "profit": round(profit, 2),
+        "purchases": purchases,
+        "sales": sales,
+    }
+
+
+# ----------------------------- station trading ---------------------------
+
+def handle_profit_trade(state, headers, body):
+    cfg, err = _api_config(state, headers)
+    if err:
+        return err
+    data = _json_body(body, allow_empty=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise _bad("Request body must be a JSON object")
+    hub = _parse_hub(data.get("hub"))
+    margin = _get_num(data.get("margin"), "margin", 20.0)
+    sort_by = data.get("sorting_by", data.get("sort_by"))
+    if sort_by is None:
+        sort_by = "ppu"
+    if not isinstance(sort_by, str) or sort_by.strip().lower() not in ("ppu", "margin", "daily"):
+        raise _bad("sorting_by must be one of: ppu, margin, daily")
+    sort_by = sort_by.strip().lower()
+    k = _get_num(data.get("k"), "k", 5, lo=0, integer=True)
+    daily_traded = _get_num(data.get("daily_traded"), "daily_traded", 1e8, lo=0)
+    daily_volume = _get_num(data.get("daily_volume"), "daily_volume", 5.0, lo=0)
+    window = _get_num(data.get("competition_window"), "competition_window", 1440, lo=0)
+    max_buy = _get_num(data.get("buy_competition"), "buy_competition", 3, lo=0)
+    max_sell = _get_num(data.get("sell_competition"), "sell_competition", 3, lo=0)
+    tax = _parse_tax(data.get("sales_tax"))
+    ctax = _config_tax(cfg)
+    if ctax is not None:
+        tax = ctax
+    if tax is None:
+        tax = DEFAULT_TAX
+
+    sde = state.sde
+    _k, hub_loc = MARKET_KEYS[hub]
+    hub_st = sde.stations.get(hub_loc)
+    orders = _station_orders(state, hub)
+    with state.lock:
+        eff_ts = state.effective_ts
+    region = hub_st[2] if hub_st else None
+    if region is None and orders:
+        region = state.region_of_order(orders[0])
+    by_type = {}
+    for o in orders:
+        if o["volume_remain"] <= 0:
+            continue
+        ent = by_type.setdefault(o["type_id"], ([], []))
+        ent[0 if o["is_buy_order"] else 1].append(o)
+
+    res = []
+    for tid, (buys, sells) in by_type.items():
+        name = sde.types.get(tid)
+        if not name or not buys or not sells:
+            continue
+        bp = overbid_price(max(o["price"] for o in buys))
+        sp = undercut_price(min(o["price"] for o in sells))
+        if bp <= 0:
+            continue
+        ppu = sp - bp
+        m = ppu / bp * 100.0
+        if m < margin or ppu <= 0:
+            continue
+        avg_vol, avg_val = daily_stats(state, region, tid)
+        if avg_val < daily_traded or avg_vol < daily_volume:
+            continue
+        bc = _competition(buys, eff_ts, window)
+        sc = _competition(sells, eff_ts, window)
+        if bc > max_buy or sc > max_sell:
+            continue
+        dp = avg_vol * 0.10 * ppu * (1.0 - tax)
+        res.append({"name": name, "margin": m, "value": avg_val, "volume": avg_vol,
+                    "ppu": ppu, "buy_competition": bc, "sell_competition": sc,
+                    "buy_price": bp, "sell_price": sp, "daily_profit": dp})
+    key = {"ppu": "ppu", "margin": "margin", "daily": "daily_profit"}[sort_by]
+    res.sort(key=lambda r: (-r[key], r["name"]))
+    out = {}
+    for r in res[:k]:
+        out[r["name"]] = {
+            "margin": round(r["margin"], 2),
+            "value": round(r["value"], 2),
+            "volume": round(r["volume"], 2),
+            "ppu": round(r["ppu"], 2),
+            "buy_competition": r["buy_competition"],
+            "sell_competition": r["sell_competition"],
+            "buy_price": r["buy_price"],
+            "sell_price": r["sell_price"],
+            "daily_profit": round(r["daily_profit"], 2),
+        }
+    return 200, out
+
+
+# --------------------------------------------------------------------------
 # HTTP plumbing
 # --------------------------------------------------------------------------
 
@@ -1524,6 +2181,16 @@ def make_handler(state):
                         return self._send(*handle_reprocess(state, headers, body))
                     if method == "POST" and route == "compress" and len(parts) == 2:
                         return self._send(*handle_compress(state, body))
+                    if method == "POST" and route == "volumes" and len(parts) == 2:
+                        return self._send(*handle_volumes(state, query, headers, body))
+                    if route == "profit" and len(parts) == 3:
+                        sub = parts[2]
+                        if method == "POST" and sub == "reprocess":
+                            return self._send(*handle_profit_reprocess(state, headers, body))
+                        if method == "GET" and sub == "haul":
+                            return self._send(*handle_profit_haul(state, query, headers))
+                        if method == "POST" and sub == "trade":
+                            return self._send(*handle_profit_trade(state, headers, body))
                     if method == "GET" and route == "hub-compare" and len(parts) == 3:
                         return self._send(*handle_hub_compare(state, parts[2]))
                 self._send(404, {"error": "NOT_FOUND", "details": "No route for %s %s" % (method, parsed.path)})
