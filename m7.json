@@ -1,0 +1,1 @@
+{"version":7,"description":"idx","operations":[{"type":"create_index","name":"idx_posts_user_created","table":"posts","columns":["user_id","created_at"],"unique":false}]}

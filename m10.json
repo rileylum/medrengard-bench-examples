@@ -1,0 +1,1 @@
+{"version":10,"description":"drop","operations":[{"type":"drop_foreign_key","table":"posts","name":"fk_posts_user_id"},{"type":"drop_check_constraint","table":"users","name":"chk_users_age"},{"type":"drop_index","name":"idx_posts_user_created"}]}

@@ -1,0 +1,1 @@
+{"version":8,"description":"chk","operations":[{"type":"add_check_constraint","table":"users","name":"chk_users_age","expression":"age >= 0 AND age <= 150"}]}

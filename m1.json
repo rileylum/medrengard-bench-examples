@@ -1,0 +1,1 @@
+{"version":1,"description":"users","operations":[{"type":"create_table","table":"users","columns":[{"name":"id","type":"INTEGER","primary_key":true,"auto_increment":true},{"name":"email","type":"TEXT","not_null":true},{"name":"age","type":"INTEGER"}]}]}
