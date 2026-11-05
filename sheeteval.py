@@ -543,6 +543,17 @@ class Evaluator(object):
             self.parsed[formula] = ast
         return self.scalar(self.ev(ast, sheet))
 
+    def evaluate_with_overrides(self, sheet, row, col, overrides):
+        """Evaluate a cell with temporary cell-value overrides; nothing carries over."""
+        saved_cache, saved_stack = self.cache, self.stack
+        self.cache = dict(overrides)
+        self.cache.pop((sheet, row, col), None)
+        self.stack = []
+        try:
+            return self.cell_value(sheet, row, col)
+        finally:
+            self.cache, self.stack = saved_cache, saved_stack
+
     def evaluate_cell(self, sheet, row, col):
         """Evaluate the formula at the given cell (top-level); returns its value."""
         key = (sheet, row, col)
@@ -945,7 +956,7 @@ def get_cell(ws, row, col):
 
 
 RULE_KINDS = ("literal", "expression", "computed", "reference", "reference_expr",
-              "result", "boolean")
+              "result", "boolean", "scenario")
 
 
 class RuleContext(object):
@@ -956,6 +967,8 @@ class RuleContext(object):
         self.key_ws, self.sub_ws = key_ws, sub_ws
         self.key_wbf, self.sub_wbf = key_wbf, sub_wbf
         self.key_eval, self.sub_eval = key_eval, sub_eval
+        self.expected = None
+        self.actual = None
 
     def alt_cells(self):
         for alt in self.alts:
@@ -982,6 +995,7 @@ def grade_literal(ctx):
     key_val = ctx.key_ws.cell(row=ctx.row, column=ctx.col).value
     sub_val = (ctx.sub_ws.cell(row=ctx.row, column=ctx.col).value
                if ctx.sub_ws is not None else None)
+    ctx.expected, ctx.actual = key_val, sub_val
     if compare(key_val, sub_val, ctx.tol):
         return True
     for _, ar, ac in ctx.alt_cells():
@@ -997,6 +1011,7 @@ def grade_expression(ctx):
                      % ctx.where)
         return None
     actual = ctx.sub_formula()
+    ctx.expected, ctx.actual = expected, actual
     if actual is None:
         return False
     norm = normalize_formula(actual)
@@ -1080,6 +1095,7 @@ def grade_computed(ctx):
     except (FormulaError, RecursionError) as e:
         _formula_failure(ctx, e, "answer key")
         return None
+    ctx.expected, ctx.actual = expected, actual
     if _compare_computed(expected, actual, ctx.tol):
         return True
     for alt, ar, ac in ctx.alt_cells():
@@ -1148,6 +1164,7 @@ def _grade_reference(ctx, kind, require_sub_formula):
     except FormulaError as e:
         _formula_failure(ctx, e, "answer key")
         return None
+    ctx.expected, ctx.actual = expected, actual
     if _compare_computed(expected, actual, ctx.tol):
         return True
     for alt, ar, ac in ctx.alt_cells():
@@ -1191,6 +1208,7 @@ def grade_boolean(ctx):
     except FormulaError as e:
         _formula_failure(ctx, e, "submission")
         return None
+    ctx.expected, ctx.actual = True, v
     return is_truthy(v)
 
 
@@ -1227,6 +1245,7 @@ def grade_result(ctx, target):
     except (FormulaError, RecursionError) as e:
         _formula_failure(ctx, e, "answer key")
         return None
+    ctx.expected, ctx.actual = expected, actual
     if _result_compare(expected, actual, ctx.tol):
         return True
     for alt, ar, ac in ctx.alt_cells():
@@ -1243,6 +1262,239 @@ def grade_result(ctx, target):
         if _result_compare(alt_val, actual, ctx.tol):
             return True
     return False
+
+
+def _parse_sheet_ref(text, default_sheet):
+    """Parse 'A1', 'Sheet!A1' or "'My Sheet'!A1" into (sheet, coord, row, col)."""
+    text = str(text).strip()
+    sheet = default_sheet
+    ref = text
+    if "!" in text:
+        sh, _, ref = text.rpartition("!")
+        sh = sh.strip()
+        if len(sh) >= 2 and sh[0] == "'" and sh[-1] == "'":
+            sh = sh[1:-1].replace("''", "'")
+        sheet = sh
+    coord, row, col = parse_coord(ref)
+    return sheet, coord, row, col
+
+
+def parse_scenarios(data, rule, where, rep):
+    """Return the list of valid scenario cases: (name, input, output, tol, fail_template)."""
+    raw = data.get("scenarios") if isinstance(data, dict) else None
+    if raw is None and isinstance(rule, dict):
+        raw = rule.get("scenarios")
+    if raw is None:
+        rep.warn("%s: 'scenario' rule has no scenarios; rule scored 0" % where)
+        return []
+    if isinstance(raw, (list, tuple)):
+        items = []
+        for i, case in enumerate(raw):
+            if isinstance(case, dict) and "name" in case:
+                items.append((str(case["name"]), case))
+            else:
+                items.append(("case%d" % (i + 1), case))
+    elif isinstance(raw, dict):
+        items = [(str(k), v) for k, v in raw.items()]
+    else:
+        rep.warn("%s: 'scenarios' is not a mapping of cases; rule scored 0" % where)
+        return []
+    cases = []
+    for name, case in items:
+        if not isinstance(case, dict):
+            rep.warn("%s: scenario case '%s' is not a mapping; case skipped" % (where, name))
+            continue
+        missing = [k for k in ("input", "output") if k not in case]
+        if missing:
+            rep.warn("%s: scenario case '%s' is missing %s; case skipped"
+                     % (where, name, " and ".join("'%s'" % m for m in missing)))
+            continue
+        inp = case["input"]
+        if inp is None:
+            inp = {}
+        if not isinstance(inp, dict):
+            rep.warn("%s: scenario case '%s' input is not a mapping; case skipped"
+                     % (where, name))
+            continue
+        tol = None
+        if case.get("tolerance") is not None:
+            t = case["tolerance"]
+            if not is_number(t) or t != t or t < 0:
+                rep.warn("%s: scenario case '%s' has invalid tolerance %r; using rule tolerance"
+                         % (where, name, t))
+                tol = "rule"
+            else:
+                tol = t
+        else:
+            tol = "rule"
+        ft = case.get("fail-template")
+        if ft is not None and not isinstance(ft, str):
+            ft = str(ft)
+        cases.append((name, inp, case["output"], tol, ft))
+    return cases
+
+
+def _override_value(v):
+    if isinstance(v, bool):
+        return v
+    if is_number(v):
+        return float(v)
+    return v
+
+
+def grade_scenario(ctx, cases):
+    """Return (rule_ok, case_results) where case_results is a list of
+    (name, ok, expected, actual, fail_template). rule_ok is None on scoring failure."""
+    results = []
+    if ctx.key_formula(ctx.row, ctx.col) is None:
+        ctx.rep.warn("%s: answer key cell has no formula for 'scenario' rule; rule scored 0"
+                     % ctx.where)
+        for name, _, output, _, ft in cases:
+            results.append((name, False, output, None, ft))
+        return None, results
+    formula = ctx.sub_formula()
+    unsupported = _scan_unsupported(formula[1:]) if formula is not None else None
+    if unsupported is not None:
+        _formula_failure(ctx, UnsupportedFunction(unsupported), "submission")
+    for name, inp, output, tol, ft in cases:
+        if tol == "rule":
+            tol = ctx.tol
+        if formula is None:
+            actual = (ctx.sub_ws.cell(row=ctx.row, column=ctx.col).value
+                      if ctx.sub_ws is not None else None)
+            results.append((name, False, output, actual, ft))
+            continue
+        if unsupported is not None:
+            results.append((name, False, output, None, ft))
+            continue
+        overrides = {}
+        for ref, val in inp.items():
+            try:
+                sh, _, r, c = _parse_sheet_ref(ref, ctx.sheet)
+            except ValueError:
+                ctx.rep.warn("%s: scenario case '%s' input %r is not a valid cell reference; "
+                             "input ignored" % (ctx.where, name, ref))
+                continue
+            overrides[(sh, r, c)] = _override_value(val)
+        try:
+            actual = ctx.sub_eval.evaluate_with_overrides(ctx.sheet, ctx.row, ctx.col,
+                                                          overrides)
+        except RecursionError:
+            ctx.rep.warn("%s: scenario case '%s': formula nesting too deep; case failed"
+                         % (ctx.where, name))
+            results.append((name, False, output, None, ft))
+            continue
+        except FormulaError as e:
+            _formula_failure(ctx, e, "submission")
+            results.append((name, False, output, None, ft))
+            continue
+        ok = _compare_computed(_override_value(output), actual, tol)
+        results.append((name, ok, output, actual, ft))
+    if not results:
+        return None, results
+    return all(r[1] for r in results), results
+
+
+def render_value(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if is_number(v):
+        try:
+            return fmt_num(v)
+        except (OverflowError, ValueError):
+            return str(v)
+    if isinstance(v, XLError):
+        return v.code
+    return str(v)
+
+
+_PLACEHOLDER_RE = re.compile(
+    r"\$(?:(?P<kw>expected|actual)(?![A-Za-z0-9_])"
+    r"|(?P<ref>(?:(?:'(?:[^']|'')+'|[A-Za-z0-9_.]+)!)?\$?[A-Za-z]{1,3}\$?[0-9]+)"
+    r"(?![A-Za-z0-9_]))")
+
+
+def render_template(template, expected, actual, ctx, rep):
+    """Single-pass placeholder substitution for fail templates."""
+    def sub(m):
+        kw = m.group("kw")
+        if kw == "expected":
+            return render_value(expected)
+        if kw == "actual":
+            return render_value(actual)
+        ref = m.group("ref")
+        try:
+            sh, coord, r, c = _parse_sheet_ref(ref, ctx.sheet)
+        except ValueError:
+            rep.warn("%s: fail-template placeholder $%s does not reference a cell in the "
+                     "submission; substituted with empty string" % (ctx.where, ref))
+            return ""
+        sub_wb = ctx.sub_wbf
+        if sub_wb is None or sh not in sub_wb.sheetnames:
+            rep.warn("%s: fail-template placeholder $%s references missing submission sheet "
+                     "'%s'; substituted with empty string" % (ctx.where, ref, sh))
+            return ""
+        ws = sub_wb[sh]
+        if (r, c) not in getattr(ws, "_cells", {}):
+            rep.warn("%s: fail-template placeholder $%s references a cell that does not exist "
+                     "in the submission; substituted with empty string" % (ctx.where, ref))
+            return ""
+        val = None
+        vwb = ctx.sub_eval.wbv
+        if vwb is not None and sh in vwb.sheetnames:
+            val = vwb[sh].cell(row=r, column=c).value
+        if val is None and formula_text(ws.cell(row=r, column=c).value) is not None:
+            try:
+                val = ctx.sub_eval.cell_value(sh, r, c)
+            except (FormulaError, RecursionError):
+                val = None
+        elif val is None:
+            val = ws.cell(row=r, column=c).value
+        return render_value(val)
+    return _PLACEHOLDER_RE.sub(sub, template)
+
+
+def parse_expected_outcome(raw, where, rep):
+    if raw is None:
+        return "pass"
+    text = str(raw).strip().lower()
+    if not text:
+        return "pass"
+    if text in ("pass", "fail"):
+        return text
+    rep.warn("%s: unrecognized expected-outcome %r; defaulting to 'pass'" % (where, raw))
+    return "pass"
+
+
+def parse_expected_points(raw, where, rep):
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        rep.warn("%s: non-numeric expected-points %r; ignored" % (where, raw))
+        return None
+    if is_number(raw):
+        if raw != raw:
+            rep.warn("%s: non-numeric expected-points %r; ignored" % (where, raw))
+            return None
+        return float(raw)
+    text = str(raw).strip()
+    if not text:
+        return None
+    if NUMERIC_TEXT_RE.match(text):
+        return float(text)
+    rep.warn("%s: non-numeric expected-points %r; ignored" % (where, text))
+    return None
+
+
+def cell_text(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, float) and raw == int(raw):
+        raw = int(raw)
+    text = str(raw).strip()
+    return text or None
 
 
 DEFAULT_THRESHOLD_MESSAGE = "Minimum score not met."
@@ -1362,7 +1614,7 @@ class SheetBuffer(object):
         self.pending = []
 
 
-def grade(key_path, sub_path, rep, out):
+def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
     import openpyxl
 
     for p in (key_path, sub_path):
@@ -1413,6 +1665,8 @@ def grade(key_path, sub_path, rep, out):
 
     total_earned = 0
     total_max = 0
+    total_passed = 0
+    total_checks = 0
     for sheet, min_score, threshold_message in sheets:
         cl_name = "%s_Checklist" % sheet
         if cl_name not in key_wb.sheetnames:
@@ -1425,6 +1679,10 @@ def grade(key_path, sub_path, rep, out):
                      % (cl_name, sheet))
             continue
         flags_col = find_exact_col(cl, "flags")
+        name_col_cl = find_exact_col(cl, "check-name")
+        eo_col = find_exact_col(cl, "expected-outcome")
+        fm_col = find_exact_col(cl, "fail-message")
+        ep_col = find_exact_col(cl, "expected-points")
         key_ws = key_wb[sheet] if sheet in key_wb.sheetnames else None
         sub_ws = sub_wb[sheet] if sub_wb is not None and sheet in sub_wb.sheetnames else None
 
@@ -1433,6 +1691,12 @@ def grade(key_path, sub_path, rep, out):
         sheet_out.header("Sheet '%s':" % sheet)
         sheet_earned = 0
         sheet_max = 0
+        check_lines = []
+        sheet_passed = 0
+        sheet_checks = 0
+
+        def cval(row, col):
+            return cl.cell(row=row, column=col).value if col else None
 
         # Collect checklist rows first (needed to validate dependencies).
         rows = []
@@ -1441,15 +1705,21 @@ def grade(key_path, sub_path, rep, out):
             if raw is None or (isinstance(raw, str) and not raw.strip()):
                 continue
             coord, r, c = parse_coord(raw)
-            flags_raw = cl.cell(row=row, column=flags_col).value if flags_col else None
-            rows.append((coord, r, c, flags_raw))
+            meta = {
+                "flags": cval(row, flags_col),
+                "check-name": cell_text(cval(row, name_col_cl)),
+                "expected-outcome": cval(row, eo_col),
+                "fail-message": cell_text(cval(row, fm_col)),
+                "expected-points": cval(row, ep_col),
+            }
+            rows.append((coord, r, c, meta))
         checklist_cells = set(coord_key(coord) for coord, _, _, _ in rows)
 
         outcomes = {}  # normalized coord -> outcome of an earlier rule
         halted = False
-        for coord, r, c, flags_raw in rows:
+        for coord, r, c, meta in rows:
             where = "%s.%s" % (sheet, coord)
-            fatal, concealed, manual = parse_flags(flags_raw, where, rep)
+            fatal, concealed, manual = parse_flags(meta["flags"], where, rep)
             if manual:
                 continue
             parsed = parse_annotation(get_cell(key_ws, r, c))
@@ -1466,88 +1736,162 @@ def grade(key_path, sub_path, rep, out):
                 continue
             label = "[concealed]" if concealed else coord
             key = coord_key(coord)
+            fail_template = data.get("fail-template")
+            if fail_template is not None and not isinstance(fail_template, str):
+                fail_template = str(fail_template)
+            cases = parse_scenarios(data, rule, where, rep) if kind == "scenario" else None
+
+            if check_mode:
+                check_name = meta["check-name"] or "%s.%s" % (sheet, coord)
+                exp_outcome = parse_expected_outcome(meta["expected-outcome"], where, rep)
+                exp_points = parse_expected_points(meta["expected-points"], where, rep)
+            tol = None
+            mode = "award"
+            ok = None
+            ctx = None
+            case_results = None
 
             if halted:
                 possible = abs(points)
                 sheet_max += possible
-                outcomes[key] = "SKIPPED"
+                outcome = "SKIPPED"
+                earned = 0
+                outcomes[key] = outcome
                 sheet_out.line("  [SKIPPED] %s %s: 0 / %s" % (coord, label, fmt_num(possible)))
                 rep.log("%s.%s: %s SKIPPED" % (sheet, coord, kind))
-                continue
-
-            unmet = check_depends(rule, sheet, where, outcomes, checklist_cells, rep)
-            if unmet is not None:
-                possible = abs(points)
-                sheet_max += possible
-                outcomes[key] = "PREREQ"
-                sheet_out.line("  [PREREQ] %s %s: 0 / %s (requires %s)"
-                               % (coord, label, fmt_num(possible), unmet))
-                rep.log("%s.%s: %s PREREQ (requires %s)" % (sheet, coord, kind, unmet))
-                continue
-
-            tol = get_tolerance(rule, where, rep)
-            mode = get_mode(rule, where, rep)
-            alts = []
-            if "alternates" in data and data["alternates"] is not None:
-                alts = data["alternates"]
-                if not isinstance(alts, (list, tuple)):
-                    alts = [alts]
-            ctx = RuleContext(sheet, coord, r, c, where, tol, alts, rep,
-                              key_ws, sub_ws, key_wbf, sub_wbf, key_eval, sub_eval)
-            if kind == "literal":
-                ok = grade_literal(ctx)
-            elif kind == "expression":
-                ok = grade_expression(ctx)
-            elif kind == "computed":
-                ok = grade_computed(ctx)
-            elif kind == "reference":
-                ok = grade_reference(ctx)
-            elif kind == "reference_expr":
-                ok = grade_reference_expr(ctx)
-            elif kind == "result":
-                ok = grade_result(ctx, rule.get("target"))
             else:
-                ok = grade_boolean(ctx)
-            if ok is None:
-                # Formula-evaluation failure: scores 0 regardless of mode.
-                if mode == "penalty":
+                unmet = check_depends(rule, sheet, where, outcomes, checklist_cells, rep)
+                if unmet is not None:
                     possible = abs(points)
+                    sheet_max += possible
+                    outcome = "PREREQ"
+                    earned = 0
+                    outcomes[key] = outcome
+                    sheet_out.line("  [PREREQ] %s %s: 0 / %s (requires %s)"
+                                   % (coord, label, fmt_num(possible), unmet))
+                    rep.log("%s.%s: %s PREREQ (requires %s)" % (sheet, coord, kind, unmet))
                 else:
-                    possible = points
-                    sheet_max += points
-                earned = 0
-                outcomes[key] = "INCORRECT"
-                sheet_out.line("  [INCORRECT] %s %s: %s / %s" % (coord, label, fmt_num(earned),
-                                                                fmt_num(possible)))
-                rep.log("%s.%s: %s ERROR" % (sheet, coord, kind))
-                if fatal:
-                    halted = True
-                continue
-            if mode == "penalty":
-                possible = abs(points)
-                earned = 0 if ok else -abs(points)
-            else:
-                possible = points
-                earned = points if ok else 0
-                sheet_max += points
-            sheet_earned += earned
-            outcome = "CORRECT" if ok else "INCORRECT"
-            outcomes[key] = outcome
-            sheet_out.line("  [%s] %s %s: %s / %s" % (outcome, coord, label,
-                                                     fmt_num(earned), fmt_num(possible)))
-            rep.log("%s.%s: %s %s" % (sheet, coord, kind, outcome))
-            if fatal and not ok:
-                halted = True
+                    tol = get_tolerance(rule, where, rep)
+                    mode = get_mode(rule, where, rep)
+                    alts = []
+                    if "alternates" in data and data["alternates"] is not None:
+                        alts = data["alternates"]
+                        if not isinstance(alts, (list, tuple)):
+                            alts = [alts]
+                    ctx = RuleContext(sheet, coord, r, c, where, tol, alts, rep,
+                                      key_ws, sub_ws, key_wbf, sub_wbf, key_eval, sub_eval)
+                    if kind == "literal":
+                        ok = grade_literal(ctx)
+                    elif kind == "expression":
+                        ok = grade_expression(ctx)
+                    elif kind == "computed":
+                        ok = grade_computed(ctx)
+                    elif kind == "reference":
+                        ok = grade_reference(ctx)
+                    elif kind == "reference_expr":
+                        ok = grade_reference_expr(ctx)
+                    elif kind == "result":
+                        ok = grade_result(ctx, rule.get("target"))
+                    elif kind == "scenario":
+                        ok, case_results = grade_scenario(ctx, cases)
+                        for cr in case_results:
+                            if not cr[1]:
+                                ctx.expected, ctx.actual = cr[2], cr[3]
+                                break
+                    else:
+                        ok = grade_boolean(ctx)
+                    if ok is None:
+                        # Formula-evaluation failure: scores 0 regardless of mode.
+                        if mode == "penalty":
+                            possible = abs(points)
+                        else:
+                            possible = points
+                            sheet_max += points
+                        earned = 0
+                        outcome = "INCORRECT"
+                        rep.log("%s.%s: %s ERROR" % (sheet, coord, kind))
+                    else:
+                        if mode == "penalty":
+                            possible = abs(points)
+                            earned = 0 if ok else -abs(points)
+                        else:
+                            possible = points
+                            earned = points if ok else 0
+                            sheet_max += points
+                        outcome = "CORRECT" if ok else "INCORRECT"
+                        rep.log("%s.%s: %s %s" % (sheet, coord, kind, outcome))
+                    sheet_earned += earned
+                    outcomes[key] = outcome
+                    sheet_out.line("  [%s] %s %s: %s / %s" % (outcome, coord, label,
+                                                             fmt_num(earned), fmt_num(possible)))
+                    if outcome == "INCORRECT" and fail_template is not None:
+                        sheet_out.line("    Feedback: %s" % render_template(
+                            fail_template, ctx.expected, ctx.actual, ctx, rep))
+                    if fatal and outcome != "CORRECT":
+                        halted = True
 
-        if min_score is not None and sheet_earned < min_score:
+            if not check_mode:
+                continue
+
+            # Build this rule's checks.
+            if ctx is None:
+                ctx = RuleContext(sheet, coord, r, c, where, tol, [], rep,
+                                  key_ws, sub_ws, key_wbf, sub_wbf, key_eval, sub_eval)
+            checks = []  # (name, base_pass, earned, expected, actual, case_template)
+            if kind == "scenario":
+                if case_results is None:
+                    case_results = [(n, False, out_v, None, ft)
+                                    for n, _, out_v, _, ft in cases]
+                for name, cok, exp_v, act_v, ft in case_results:
+                    base = outcome != "SKIPPED" and outcome != "PREREQ" and cok
+                    if base:
+                        cearned = 0 if mode == "penalty" else points
+                    elif outcome in ("SKIPPED", "PREREQ") or ok is None:
+                        cearned = 0
+                    else:
+                        cearned = -abs(points) if mode == "penalty" else 0
+                    checks.append(("%s.%s" % (check_name, name), base, cearned,
+                                   exp_v, act_v, ft))
+            else:
+                checks.append((check_name, outcome == "CORRECT", earned,
+                               ctx.expected, ctx.actual, None))
+            for name, base, cearned, exp_v, act_v, ft in checks:
+                passed = base if exp_outcome == "pass" else not base
+                if exp_points is not None and float(cearned) != exp_points:
+                    passed = False
+                sheet_checks += 1
+                if passed:
+                    sheet_passed += 1
+                    check_lines.append("PASS: %s" % name)
+                else:
+                    check_lines.append("FAIL: %s" % name)
+                    tmpl = ft or meta["fail-message"] or fail_template
+                    if tmpl is not None:
+                        check_lines.append("    Feedback: %s" % render_template(
+                            tmpl, exp_v, act_v, ctx, rep))
+
+        threshold_hit = min_score is not None and sheet_earned < min_score
+        if threshold_hit:
             sheet_earned = 0
             sheet_out.replace_rules("  %s" % threshold_message)
+        if check_mode:
+            for ln in check_lines:
+                cout.line(ln)
+            if threshold_hit:
+                sheet_passed = 0
+                cout.line(threshold_message)
+            cout.line("%s: %d / %d passed" % (sheet, sheet_passed, sheet_checks))
+            total_passed += sheet_passed
+            total_checks += sheet_checks
         sheet_out.flush()
         out.line("Sheet '%s': %s / %s" % (sheet, fmt_num(sheet_earned), fmt_num(sheet_max)))
         out.line("")
         total_earned += sheet_earned
         total_max += sheet_max
     out.line("Total: %s / %s" % (fmt_num(total_earned), fmt_num(total_max)))
+    if check_mode:
+        cout.lines.append("Total: %d / %d passed" % (total_passed, total_checks))
+        return total_passed, total_checks
     return total_earned, total_max
 
 
@@ -1561,10 +1905,30 @@ def main(argv=None):
     parser.add_argument("--debug", "-d", action="store_true")
     parser.add_argument("--log", "-l", action="store_true")
     parser.add_argument("--quiet-warnings", action="store_true")
+    parser.add_argument("--check-mode", "-C", action="store_true")
     args = parser.parse_args(argv)
     rep = Reporter(args.quiet_warnings, args.log)
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
     try:
+        if args.check_mode:
+            out = Output(False)
+            cout = Output(args.detailed)
+            passed, total = grade(args.answer_key, args.submission, rep, out,
+                                  check_mode=True, cout=cout)
+            if args.report_file:
+                try:
+                    with open(args.report_file, "w", encoding="utf-8", newline="\n") as f:
+                        for ln in cout.lines:
+                            f.write(ln + "\n")
+                except OSError as e:
+                    raise FatalError("cannot write report file '%s': %s"
+                                     % (args.report_file, e.strerror or e))
+            if args.score_file:
+                with open(args.score_file, "w", encoding="utf-8") as f:
+                    f.write("%d\n" % passed)
+            sys.stdout.write("Total: %d / %d passed\n" % (passed, total))
+            sys.stdout.flush()
+            return 0
         out = Output(args.detailed)
         earned, maximum = grade(args.answer_key, args.submission, rep, out)
         if args.report_file:
