@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 MANUFACTURING = 1
 REACTIONS = 11
 ACTIVITY_NAMES = {MANUFACTURING: "Manufacturing", REACTIONS: "Reactions"}
+MAX_ME, MAX_TE = 10, 20
 TECH_BY_META = {1: "Tech I", 2: "Tech II", 14: "Tech III",
                 54: "Tech I", 53: "Tech II"}
 
@@ -179,14 +180,22 @@ class SDE:
         return fmt_volume(t.get("volume") or "0")
 
 
-def render_table(rows):
-    headers = ("Item", "Quantity", "Buildable")
-    widths = [max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(3)]
+def render_table(rows, headers=("Item", "Quantity", "Buildable")):
+    n = len(headers)
+    widths = [max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(n)]
     def line(cells):
         return "| " + " | ".join(c.ljust(w) for c, w in zip(cells, widths)) + " |"
-    sep = ("|:" + "-" * widths[0] + ":|:" + "-" * widths[1] + ":|"
-           + "-" * (widths[2] + 1) + ":|")
+    sep = "|" + "|".join(":" + "-" * w + ":" for w in widths[:-1]) + "|"
+    sep += "-" * (widths[-1] + 1) + ":|"
     return [line(headers), sep] + [line(r) for r in rows]
+
+
+def me_amount(quantity, me, runs=1):
+    return math.ceil(max(1, quantity * (1 - me / 100) * runs))
+
+
+def te_seconds(seconds, te):
+    return math.ceil(seconds * (1 - te / 100))
 
 
 def cmd_recipe(args):
@@ -206,12 +215,24 @@ def cmd_recipe(args):
     if prod not in sde.types:
         print(f"Error: product {prod} not found", file=sys.stderr)
         return 1
+    me = args.material_efficiency if act == MANUFACTURING else 0
     mats = []
     for mid, mq in sde.materials.get((bp, act), []):
         mname = sde.types[mid]["typeName"] if mid in sde.types else str(mid)
-        mats.append((mname, str(mq), "Yes" if sde.is_buildable(mid) else "No"))
+        if act == MANUFACTURING:
+            need = me_amount(mq, me)
+            waste = need - me_amount(mq, MAX_ME)
+        else:
+            need, waste = mq, 0
+        row = [mname, str(need)]
+        if args.display_waste:
+            row.append(str(waste))
+        row.append("Yes" if sde.is_buildable(mid) else "No")
+        mats.append(tuple(row))
     mats.sort(key=lambda r: (r[0].lower(), r[0]))
-    seconds = sde.times.get((bp, act), 0)
+    seconds = te_seconds(sde.times.get((bp, act), 0), args.time_efficiency)
+    headers = (("Item", "Quantity", "Waste", "Buildable") if args.display_waste
+               else ("Item", "Quantity", "Buildable"))
     out = [
         f"ITEM: {sde.types[prod]['typeName']} ({prod})",
         f"Group: {sde.group_line(prod)}",
@@ -223,7 +244,7 @@ def cmd_recipe(args):
         f"Activity: {ACTIVITY_NAMES[act]}",
         f"Output Quantity: {qty}",
         f"Run Time: {math.ceil(seconds / 60)}",
-    ] + render_table(mats)
+    ] + render_table(mats, headers)
     print("\n".join(out))
     return 0
 
@@ -418,12 +439,38 @@ def skill_level(v):
     return n
 
 
+def material_efficiency(v):
+    try:
+        n = int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError("material efficiency must be an integer 0-10")
+    if not 0 <= n <= MAX_ME:
+        raise argparse.ArgumentTypeError("material efficiency must be an integer 0-10")
+    return n
+
+
+def time_efficiency(v):
+    try:
+        n = int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError("time efficiency must be an even integer 0-20")
+    if not 0 <= n <= MAX_TE or n % 2:
+        raise argparse.ArgumentTypeError("time efficiency must be an even integer 0-20")
+    return n
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="EVE Online industry planner")
     sub = p.add_subparsers(dest="command", required=True)
     r = sub.add_parser("recipe", help="Show recipe for a product or blueprint")
     r.add_argument("name", nargs="+")
     r.add_argument("--sde", required=True)
+    r.add_argument("--material-efficiency", "-me", dest="material_efficiency",
+                   type=material_efficiency, default=0)
+    r.add_argument("--time-efficiency", "-te", dest="time_efficiency",
+                   type=time_efficiency, default=0)
+    r.add_argument("--display-waste", "-waste", dest="display_waste",
+                   action="store_true")
     i = sub.add_parser("invention", help="Plan invention / reverse engineering")
     i.add_argument("name", nargs="+")
     i.add_argument("--sde", required=True)
