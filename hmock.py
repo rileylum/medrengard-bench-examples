@@ -3104,6 +3104,24 @@ def _resolve_template_file(templates_dir, rel):
     return os.path.normpath(os.path.join(templates_dir or ".", rel))
 
 
+def _load_binary(spec, templates_dir, ctx):
+    """Load body_from_binary_file / binary_file_name; returns (path, name, bytes|None)."""
+    bbf = spec.get("body_from_binary_file")
+    rel = "" if bbf is None else _to_text(bbf)
+    bfn = spec.get("binary_file_name")
+    name = "" if bfn is None else _to_text(bfn)
+    data = None
+    if rel != "":
+        path = _resolve_template_file(templates_dir, rel)
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()  # stable snapshot for this loaded configuration
+        except OSError as e:
+            raise ValidationError("%s.body_from_binary_file: cannot read %s: %s"
+                                  % (ctx, rel, e.strerror or e))
+    return rel, name, data
+
+
 class ReplyHTTP:
     def __init__(self, spec, templates_dir=None):
         if not isinstance(spec, dict):
@@ -3137,6 +3155,8 @@ class ReplyHTTP:
                                       % (self.body_from_file, e.strerror or e))
             # snapshot of the file contents for this loaded configuration
             self.body = _dec(data)
+        self.body_from_binary_file, self.binary_file_name, self.binary = \
+            _load_binary(spec, templates_dir, "reply_http")
 
 
 class Sleep:
@@ -3194,9 +3214,26 @@ class SendHTTP:
                 raise ValidationError("send_http.body_from_file: cannot read %s: %s"
                                       % (self.body_from_file, e.strerror or e))
             self.body = _dec(data)
+        self.body_from_binary_file, self.binary_file_name, self.binary = \
+            _load_binary(spec, templates_dir, "send_http")
 
 
 SEND_HTTP_TIMEOUT = 5.0
+
+
+def _mp_escape(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "%0D").replace("\n", "%0A")
+
+
+def build_multipart_file(field, filename, content_type, data):
+    """Encode a single-file multipart/form-data body; returns (content_type, bytes)."""
+    boundary = uuid.uuid4().hex + uuid.uuid4().hex[:28]
+    head = ('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\n'
+            'Content-Type: %s\r\n\r\n') % (boundary, _mp_escape(field), _mp_escape(filename),
+                                            content_type.replace("\r", " ").replace("\n", " "))
+    tail = "\r\n--%s--\r\n" % boundary
+    return ("multipart/form-data; boundary=%s" % boundary,
+            _enc(head) + bytes(data) + _enc(tail))
 
 
 def do_send_http(method, url, headers, body):
@@ -3216,7 +3253,7 @@ def do_send_http(method, url, headers, body):
     if sp.query:
         target += "?" + sp.query
     target = target.replace(" ", "%20")
-    data = _enc(body)
+    data = body if isinstance(body, (bytes, bytearray)) else _enc(body)
     try:
         conn.putrequest(method, target, skip_accept_encoding=True)
         names = {k.lower() for k, _ in headers}
@@ -4328,6 +4365,45 @@ class MockRegistry:
         self.lock = threading.RLock()
         self.active = []
         self.fingerprint = None
+        self.fs_fingerprint = None
+        self.hot_reload = True
+
+    def _ignored_paths(self):
+        p = getattr(self.store, "path", None)
+        return os.path.abspath(p) if p else None
+
+    def fs_snapshot(self):
+        """Cheap fingerprint of every file under the templates directory."""
+        ignore = self._ignored_paths()
+        out = []
+        root = self.templates_dir
+
+        def walk(d):
+            try:
+                entries = sorted(os.scandir(d), key=lambda e: e.name)
+            except OSError as e:
+                out.append((d, "err", e.errno))
+                return
+            for ent in entries:
+                full = ent.path
+                try:
+                    if ent.is_dir():
+                        out.append((full, "dir"))
+                        walk(full)
+                        continue
+                    st = ent.stat()
+                except OSError:
+                    continue
+                if ignore:
+                    af = os.path.abspath(full)
+                    if af == ignore or af.startswith(ignore + ".tmp"):
+                        continue
+                out.append((full, st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns))
+        if os.path.isdir(root):
+            walk(root)
+        else:
+            out.append((root, "missing"))
+        return out
 
     def _gather(self, base=None, sets=None, extra=None):
         raw = list(read_fs_items(self.templates_dir))
@@ -4346,6 +4422,11 @@ class MockRegistry:
 
     def reload(self, base=None, sets=None):
         with self.lock:
+            try:
+                self.fs_fingerprint = self.fs_snapshot()
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("templates dir fingerprint failed", err=str(e))
+                self.fs_fingerprint = None
             try:
                 raw, base, sets = self._gather(base, sets)
             except Exception as e:  # noqa: BLE001
@@ -4389,6 +4470,16 @@ class MockRegistry:
         if fp != self.fingerprint:
             LOG.info("persisted mocks changed; reloading")
             self.reload()
+            return
+        if self.hot_reload:
+            try:
+                fs = self.fs_snapshot()
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("templates dir poll failed", err=str(e))
+                return
+            if fs != self.fs_fingerprint:
+                LOG.info("templates directory changed; reloading", dir=self.templates_dir)
+                self.reload()
 
 
 REGISTRY = None
@@ -4435,11 +4526,20 @@ def _log_str(s):
     return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
+CORS_HEADERS = [
+    ("Access-Control-Allow-Origin", "*"),
+    ("Access-Control-Allow-Methods", "*"),
+    ("Access-Control-Allow-Headers", "*"),
+    ("Access-Control-Allow-Credentials", "true"),
+]
+
+
 class MockHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "hmock"
     sys_version = ""
     behaviors = []
+    cors_enabled = False
 
     def version_string(self):
         return self.server_version
@@ -4536,7 +4636,19 @@ class MockHandler(BaseHTTPRequestHandler):
             status, resp_headers, resp_body = self._run_actions(b, ctx)
             break
 
-        out_body = _enc(resp_body)
+        if matched_key is None and method == "OPTIONS" and self.cors_enabled:
+            # CORS preflight for an OPTIONS request no mock handled
+            status, resp_headers, resp_body = 200, [], ""
+        if self.cors_enabled:
+            present = {k.lower() for k, _ in resp_headers}
+            resp_headers = list(resp_headers) + [
+                (k, v) for k, v in CORS_HEADERS if k.lower() not in present]
+
+        if isinstance(resp_body, (bytes, bytearray)):
+            out_body = bytes(resp_body)
+            resp_body = "<binary %d bytes>" % len(out_body)
+        else:
+            out_body = _enc(resp_body)
         try:
             self.send_response(status)
             has_ct = False
@@ -4600,6 +4712,15 @@ class MockHandler(BaseHTTPRequestHandler):
                         continue
                     headers.append((k, v))
                 status, body = act.status_code, rb
+                if act.body == "" and act.binary is not None:
+                    # binary payload: sent as-is, never template-rendered
+                    body = act.binary
+                    names = {k.lower() for k, _ in headers}
+                    if act.binary_file_name and "content-disposition" not in names:
+                        headers.append(("Content-Disposition", 'inline; filename="%s"'
+                                        % _mp_escape(act.binary_file_name)))
+                    if "content-type" not in names:
+                        headers.append(("Content-Type", "application/octet-stream"))
                 replied = True
         if not replied:
             headers = [("Content-Type", "text/plain; charset=utf-8")]
@@ -4619,8 +4740,26 @@ class MockHandler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             LOG.error("failed to render send_http", key=b.key, err=str(e))
             return
+        payload = body
+        if body == "" and act.binary is not None:
+            if act.method == "POST":
+                fname = act.binary_file_name or os.path.basename(
+                    act.body_from_binary_file.replace("\\", "/"))
+                part_ct = "application/octet-stream"
+                rest = []
+                for k, v in hs:
+                    if k.lower() == "content-type":
+                        part_ct = v
+                    else:
+                        rest.append((k, v))
+                ctype, payload = build_multipart_file("file", fname, part_ct, act.binary)
+                hs = rest + [("Content-Type", ctype)]
+                body = "<multipart file %s (%d bytes)>" % (fname, len(act.binary))
+            else:
+                payload = act.binary
+                body = "<binary file %s (%d bytes)>" % (act.body_from_binary_file, len(act.binary))
         try:
-            status, rbody = do_send_http(act.method, url, hs, body)
+            status, rbody = do_send_http(act.method, url, hs, payload)
         except Exception as e:  # noqa: BLE001
             LOG.error("send_http request failed", key=b.key, method=act.method,
                       url=_log_str(url), err=str(e))
@@ -4837,7 +4976,10 @@ def main():
         LOG.error("failed to configure persistent store", err=str(e))
         store = FileStore(_default_store_path(templates_dir))
     REGISTRY = MockRegistry(templates_dir, store)
+    REGISTRY.hot_reload = _env_bool("HM_TEMPLATES_DIR_HOT_RELOAD", True)
+    LOG.info("templates dir hot reload", enabled=REGISTRY.hot_reload)
     REGISTRY.reload()
+    MockHandler.cors_enabled = _env_bool("HM_CORS_ENABLED", False)
 
     try:
         httpd = Server((host, port), MockHandler)
@@ -4861,7 +5003,7 @@ def main():
         LOG.info("starting admin http server", host=ahost, port=aport)
         threading.Thread(target=admin.serve_forever, daemon=True).start()
 
-    threading.Thread(target=_reload_loop, args=(1.0,), daemon=True).start()
+    threading.Thread(target=_reload_loop, args=(0.5,), daemon=True).start()
     LOG.info("starting http server", host=host, port=port)
     try:
         httpd.serve_forever()
