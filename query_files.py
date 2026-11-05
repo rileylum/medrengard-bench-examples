@@ -5,6 +5,9 @@ Supported formats: CSV, TSV, JSON, JSONL and Parquet, each optionally
 compressed with gzip (.gz) or bzip2 (.bz2). Files sharing a table name
 (e.g. users.csv and users.parquet) are combined and must have identical columns.
 
+Window functions (COUNT/SUM/AVG/MIN/MAX/ROW_NUMBER/RANK/DENSE_RANK ... OVER (...))
+are supported; window errors exit with code 3.
+
 Usage:
     python query_files.py --data <dir> --sql <query or path to .sql file> [--out <file.csv>]
 """
@@ -17,7 +20,16 @@ from decimal import Decimal, InvalidOperation
 
 
 class QueryError(Exception):
-    pass
+    exit_code = 1
+
+
+class WindowError(QueryError):
+    """Errors in window function usage (exit code 3, group WINDOW_ERROR)."""
+    exit_code = 3
+
+    def __init__(self, kind, msg):
+        self.kind = kind  # INVALID_WINDOW_SPEC, FRAME_ERROR, NESTED_WINDOW_ERROR
+        super().__init__("WINDOW_ERROR (%s): %s" % (kind, msg))
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +266,18 @@ class Agg(Node):
         self.distinct = distinct
 
 
+class Window(Node):
+    """func(arg) OVER (PARTITION BY ... ORDER BY ... frame)."""
+
+    def __init__(self, func, arg, partition, order, frame):
+        self.func = func          # COUNT SUM AVG MIN MAX ROW_NUMBER RANK DENSE_RANK
+        self.arg = arg            # None for COUNT(*) and ranking functions
+        self.partition = partition  # list of exprs
+        self.order = order        # list of OrderItem
+        self.frame = frame        # None or (mode, start, end); bound = (kind, n)
+        self.values = None
+
+
 class Cmp(Node):
     def __init__(self, op, left, right):
         self.op, self.left, self.right = op, left, right
@@ -329,6 +353,9 @@ def children(node):
         return [node.expr] + list(node.items)
     if isinstance(node, Agg):
         return [node.arg] if node.arg is not None else []
+    if isinstance(node, Window):
+        out = [node.arg] if node.arg is not None else []
+        return out + list(node.partition) + [o.expr for o in node.order]
     return []
 
 
@@ -342,11 +369,21 @@ def contains_agg(node):
     return any(isinstance(n, Agg) for n in walk(node))
 
 
+def contains_window(node):
+    return any(isinstance(n, Window) for n in walk(node))
+
+
+def reject_window(node, where):
+    if node is not None and contains_window(node):
+        raise WindowError("INVALID_WINDOW_SPEC", "Window functions are not allowed in %s" % where)
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
 
-AGG_FUNCS = {"COUNT", "SUM", "MIN", "MAX"}
+AGG_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
+RANK_FUNCS = {"ROW_NUMBER", "RANK", "DENSE_RANK"}
 CLAUSE_END = {"FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET",
               "INNER", "LEFT", "RIGHT", "FULL", "JOIN", "ON", "CROSS"}
 
@@ -461,12 +498,14 @@ class Parser:
             if kind != "CROSS":
                 self.expect_kw("ON")
                 on = self.parse_expr()
+                reject_window(on, "JOIN conditions")
                 if contains_agg(on):
                     raise QueryError("Aggregate functions are not allowed in JOIN conditions")
             q.joins.append(Join(kind, tref, on))
         q.where = None
         if self.accept_kw("WHERE"):
             q.where = self.parse_expr()
+            reject_window(q.where, "WHERE")
             if contains_agg(q.where):
                 raise QueryError("Aggregate functions are not allowed in WHERE")
         q.group_by = []
@@ -476,11 +515,13 @@ class Parser:
             while self.accept_op(","):
                 q.group_by.append(self.parse_expr())
             for g in q.group_by:
+                reject_window(g, "GROUP BY")
                 if contains_agg(g):
                     raise QueryError("Aggregate functions are not allowed in GROUP BY")
         q.having = None
         if self.accept_kw("HAVING"):
             q.having = self.parse_expr()
+            reject_window(q.having, "HAVING")
         q.order_by = []
         if self.accept_kw("ORDER"):
             self.expect_kw("BY")
@@ -653,9 +694,27 @@ class Parser:
             return Decimal(s)
         return int(s)
 
+    def is_word(self, word, k=0):
+        t = self.peek(k)
+        return t.kind == "IDENT" and t.value.upper() == word
+
+    def accept_word(self, word):
+        if self.is_word(word):
+            return self.next()
+        return None
+
     def parse_func(self):
         name_tok = self.next()
         fname = name_tok.value.upper()
+        if fname in RANK_FUNCS:
+            self.expect_op("(")
+            if not self.is_op(")"):
+                raise WindowError("INVALID_WINDOW_SPEC", "%s() takes no arguments" % fname)
+            self.next()
+            if not self.is_word("OVER"):
+                raise WindowError("INVALID_WINDOW_SPEC", "%s() requires an OVER clause" % fname)
+            self.next()
+            return self.parse_window(fname, None)
         if fname not in AGG_FUNCS:
             raise QueryError("Unsupported function: %s" % name_tok.value)
         self.expect_op("(")
@@ -667,12 +726,121 @@ class Parser:
             arg = None
         else:
             arg = self.parse_expr()
+        self.expect_op(")")
+        if self.is_word("OVER"):
+            self.next()
+            if distinct:
+                raise WindowError("INVALID_WINDOW_SPEC", "DISTINCT is not supported in window functions")
+            if arg is not None and contains_window(arg):
+                raise WindowError("NESTED_WINDOW_ERROR", "Window functions cannot be nested")
+            return self.parse_window(fname, arg)
+        if arg is not None:
+            if contains_window(arg):
+                raise WindowError("NESTED_WINDOW_ERROR",
+                                  "Window functions are not allowed inside aggregate functions")
             if contains_agg(arg):
                 raise QueryError("Nested aggregate functions are not allowed")
             if not isinstance(arg, Col):
                 raise QueryError("%s() only accepts a column reference" % fname)
-        self.expect_op(")")
         return Agg(fname, arg, distinct)
+
+    def parse_window(self, fname, arg):
+        if not self.is_op("("):
+            raise WindowError("INVALID_WINDOW_SPEC",
+                              "Expected '(' after OVER but found %s" % self.describe(self.peek()))
+        self.next()
+        try:
+            partition = []
+            if self.accept_word("PARTITION"):
+                self.expect_kw("BY")
+                partition.append(self.parse_expr())
+                while self.accept_op(","):
+                    partition.append(self.parse_expr())
+            order = []
+            if self.accept_kw("ORDER"):
+                self.expect_kw("BY")
+                order.append(self.parse_order_item())
+                while self.accept_op(","):
+                    order.append(self.parse_order_item())
+            frame = None
+            if self.is_word("ROWS") or self.is_word("RANGE") or self.is_word("GROUPS"):
+                frame = self.parse_frame(order)
+            if not self.is_op(")"):
+                raise QueryError("Expected ')' to close window specification but found %s"
+                                 % self.describe(self.peek()))
+            self.next()
+        except WindowError:
+            raise
+        except QueryError as e:
+            raise WindowError("INVALID_WINDOW_SPEC", str(e))
+        for e in partition + [o.expr for o in order]:
+            if contains_window(e):
+                raise WindowError("NESTED_WINDOW_ERROR", "Window functions cannot be nested")
+        return Window(fname, arg, partition, order, frame)
+
+    def parse_frame(self, order):
+        mode = self.next().value.upper()
+        if mode == "GROUPS":
+            raise WindowError("FRAME_ERROR", "GROUPS frames are not supported")
+        if self.is_word("BETWEEN"):
+            self.next()
+            start = self.parse_bound(mode)
+            if not self.accept_kw("AND"):
+                raise WindowError("FRAME_ERROR", "Expected AND in frame clause but found %s"
+                                  % self.describe(self.peek()))
+            end = self.parse_bound(mode)
+        else:
+            start = self.parse_bound(mode)
+            end = ("C", None)
+        rank = {"UP": 0, "P": 1, "C": 2, "F": 3, "UF": 4}
+        if start[0] == "UF":
+            raise WindowError("FRAME_ERROR", "Frame start cannot be UNBOUNDED FOLLOWING")
+        if end[0] == "UP":
+            raise WindowError("FRAME_ERROR", "Frame end cannot be UNBOUNDED PRECEDING")
+        if rank[start[0]] > rank[end[0]]:
+            raise WindowError("FRAME_ERROR", "Frame starting from %s cannot end with %s"
+                              % (self.bound_text(start), self.bound_text(end)))
+        if mode == "RANGE" and (start[0] in ("P", "F") or end[0] in ("P", "F")):
+            if len(order) != 1:
+                raise WindowError("FRAME_ERROR", "RANGE with offset PRECEDING/FOLLOWING requires "
+                                  "exactly one ORDER BY column")
+        if self.is_word("EXCLUDE"):
+            raise WindowError("FRAME_ERROR", "EXCLUDE is not supported in frame clauses")
+        return (mode, start, end)
+
+    @staticmethod
+    def bound_text(b):
+        return {"UP": "UNBOUNDED PRECEDING", "UF": "UNBOUNDED FOLLOWING", "C": "CURRENT ROW",
+                "P": "%s PRECEDING" % b[1], "F": "%s FOLLOWING" % b[1]}[b[0]]
+
+    def parse_bound(self, mode):
+        t = self.peek()
+        if self.accept_word("UNBOUNDED"):
+            if self.accept_word("PRECEDING"):
+                return ("UP", None)
+            if self.accept_word("FOLLOWING"):
+                return ("UF", None)
+            raise WindowError("FRAME_ERROR", "Expected PRECEDING or FOLLOWING after UNBOUNDED")
+        if self.accept_word("CURRENT"):
+            if not self.accept_word("ROW"):
+                raise WindowError("FRAME_ERROR", "Expected ROW after CURRENT")
+            return ("C", None)
+        if t.kind == "NUM":
+            self.next()
+            if mode == "ROWS":
+                if not t.value.isdigit():
+                    raise WindowError("FRAME_ERROR", "ROWS frame offset must be a non-negative integer")
+                n = int(t.value)
+            else:
+                n = Decimal(t.value)
+            if self.accept_word("PRECEDING"):
+                return ("P", n)
+            if self.accept_word("FOLLOWING"):
+                return ("F", n)
+            raise WindowError("FRAME_ERROR", "Expected PRECEDING or FOLLOWING after frame offset")
+        if t.kind == "OP" and t.value == "-":
+            raise WindowError("FRAME_ERROR", "Frame offset must not be negative")
+        raise WindowError("FRAME_ERROR", "Invalid frame bound: %s" % self.describe(t))
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1270,12 @@ def resolve_expr(node, scope, aliases=None):
     elif isinstance(node, Agg):
         if node.arg is not None:
             node.arg = resolve_expr(node.arg, scope, None)
+    elif isinstance(node, Window):
+        if node.arg is not None:
+            node.arg = resolve_expr(node.arg, scope, None)
+        node.partition = [resolve_expr(p, scope, None) for p in node.partition]
+        for o in node.order:
+            o.expr = resolve_expr(o.expr, scope, None)
     return node
 
 
@@ -1142,6 +1316,10 @@ def evaluate(node, row, group=None):
         if group is None:
             raise QueryError("Aggregate functions are not allowed here")
         return eval_agg(node, group)
+    if isinstance(node, Window):
+        if node.values is None or _CUR_CTX[0] is None:
+            raise WindowError("INVALID_WINDOW_SPEC", "Window functions are not allowed here")
+        return node.values[_CUR_CTX[0]]
     if isinstance(node, Cmp):
         c = compare(evaluate(node.left, row, group), evaluate(node.right, row, group))
         if c is None:
@@ -1240,11 +1418,264 @@ def eval_agg(node, group):
                 raise QueryError("SUM() requires numeric values, found %r" % (v,))
             total += Decimal(n)
         return total
+    if node.func == "AVG":
+        return avg_of(vals)
     if node.func == "MIN":
         return min(vals, key=sort_key)
     if node.func == "MAX":
         return max(vals, key=sort_key)
     raise QueryError("Unsupported aggregate %s" % node.func)
+
+
+# ---------------------------------------------------------------------------
+# Window functions
+# ---------------------------------------------------------------------------
+
+_CUR_CTX = [None]  # index of the context (row / group) currently being evaluated
+
+
+def num_or_error(v, func):
+    n = to_num(v)
+    if n is None:
+        raise QueryError("%s() requires numeric values, found %r" % (func, v))
+    return Decimal(n)
+
+
+def avg_value(total, count):
+    from decimal import localcontext
+    with localcontext() as ctx:
+        ctx.prec = 15
+        q = Decimal(total) / Decimal(count)
+    q = q.normalize()
+    if q == 0:
+        return Decimal(0)
+    return q
+
+
+def avg_of(vals):
+    total = Decimal(0)
+    for v in vals:
+        total += num_or_error(v, "AVG")
+    return avg_value(total, len(vals))
+
+
+def window_sort(seq, keys, specs):
+    """Stable sort of seq (context indices) by keys[i][j] using specs[j]=(desc, nulls_first)."""
+    for j in range(len(specs) - 1, -1, -1):
+        desc, nulls_first = specs[j]
+        nonnull = [i for i in seq if keys[i][j] is not None]
+        nulls = [i for i in seq if keys[i][j] is None]
+        nonnull.sort(key=lambda i: sort_key(keys[i][j]), reverse=desc)
+        seq = nulls + nonnull if nulls_first else nonnull + nulls
+    return seq
+
+
+def compute_window(w, ctxs, seq):
+    """Compute w.values for all contexts; returns the new processing order."""
+    n = len(ctxs)
+    pvals = [[evaluate(p, r, g) for p in w.partition] for r, g in ctxs]
+    ovals = [[evaluate(o.expr, r, g) for o in w.order] for r, g in ctxs]
+    specs = [(False, True)] * len(w.partition)
+    ospecs = [(o.desc, o.nulls == "FIRST") for o in w.order]
+    keys = [pvals[i] + ovals[i] for i in range(n)]
+    if specs or ospecs:
+        seq = window_sort(list(seq), keys, specs + ospecs)
+    # split into partitions
+    parts = []
+    prev = object()
+    for i in seq:
+        k = tuple(group_key(v) for v in pvals[i])
+        if k != prev:
+            parts.append([])
+            prev = k
+        parts[-1].append(i)
+    values = [None] * n
+    for part in parts:
+        compute_partition(w, ctxs, part, ovals, values)
+    w.values = values
+    return seq
+
+
+def peer_groups(part, ovals):
+    """Return list peer_start, peer_end (inclusive) indexes within part for each position."""
+    m = len(part)
+    starts = [0] * m
+    ends = [0] * m
+    j = 0
+    while j < m:
+        k = tuple(group_key(v) for v in ovals[part[j]])
+        e = j
+        while e + 1 < m and tuple(group_key(v) for v in ovals[part[e + 1]]) == k:
+            e += 1
+        for x in range(j, e + 1):
+            starts[x] = j
+            ends[x] = e
+        j = e + 1
+    return starts, ends
+
+
+def frame_bounds(w, part, ovals, starts, ends):
+    """Return lists lo, hi (inclusive positions; hi < lo means empty frame)."""
+    m = len(part)
+    if w.frame is None:
+        if w.order:
+            return [0] * m, list(ends)
+        return [0] * m, [m - 1] * m
+    mode, start, end = w.frame
+    lo = [0] * m
+    hi = [0] * m
+    if mode == "ROWS":
+        for x in range(m):
+            lo[x] = bound_rows(start, x, m)
+            hi[x] = bound_rows(end, x, m)
+        return lo, hi
+    # RANGE
+    offset = start[0] in ("P", "F") or end[0] in ("P", "F")
+    if not offset:
+        for x in range(m):
+            lo[x] = 0 if start[0] == "UP" else starts[x]
+            hi[x] = m - 1 if end[0] == "UF" else ends[x]
+        return lo, hi
+    o = w.order[0]
+    vals = [ovals[i][0] for i in part]
+    nums = []
+    for v in vals:
+        if v is None:
+            nums.append(None)
+        else:
+            n = to_num(v)
+            if n is None:
+                raise WindowError("FRAME_ERROR", "RANGE offset frames require a numeric ORDER BY "
+                                  "column, found %r" % (v,))
+            nums.append(Decimal(n))
+    sign = -1 if o.desc else 1
+    for x in range(m):
+        if nums[x] is None:
+            lo[x] = 0 if start[0] == "UP" else starts[x]
+            hi[x] = m - 1 if end[0] == "UF" else ends[x]
+            continue
+        cur = nums[x] * sign
+
+        def pos(b, is_start):
+            kind, off = b
+            if kind == "UP":
+                return 0
+            if kind == "UF":
+                return m - 1
+            if kind == "C":
+                return starts[x] if is_start else ends[x]
+            target = cur - off if kind == "P" else cur + off
+            if is_start:
+                for y in range(m):
+                    if nums[y] is not None and nums[y] * sign >= target:
+                        return y
+                return m
+            r = -1
+            for y in range(m):
+                if nums[y] is not None and nums[y] * sign <= target:
+                    r = y
+            return r
+        lo[x] = pos(start, True)
+        hi[x] = pos(end, False)
+    return lo, hi
+
+
+def bound_rows(b, x, m):
+    kind, off = b
+    if kind == "UP":
+        return 0
+    if kind == "UF":
+        return m - 1
+    if kind == "C":
+        return x
+    if kind == "P":
+        return x - off
+    return x + off
+
+
+def compute_partition(w, ctxs, part, ovals, values):
+    m = len(part)
+    func = w.func
+    if func in RANK_FUNCS:
+        starts, ends = peer_groups(part, ovals)
+        dense = 0
+        for x in range(m):
+            if func == "ROW_NUMBER":
+                values[part[x]] = x + 1
+            elif func == "RANK":
+                values[part[x]] = starts[x] + 1
+            else:
+                if starts[x] == x:
+                    dense += 1
+                values[part[x]] = dense
+        return
+    starts, ends = peer_groups(part, ovals)
+    lo, hi = frame_bounds(w, part, ovals, starts, ends)
+    lo = [max(0, v) for v in lo]
+    hi = [min(m - 1, v) for v in hi]
+    if func == "COUNT" and w.arg is None:
+        for x in range(m):
+            values[part[x]] = max(0, hi[x] - lo[x] + 1)
+        return
+    args = [evaluate(w.arg, ctxs[i][0], ctxs[i][1]) for i in part]
+    if func in ("COUNT", "SUM", "AVG"):
+        cnt = [0] * (m + 1)
+        tot = [Decimal(0)] * (m + 1)
+        for x in range(m):
+            v = args[x]
+            cnt[x + 1] = cnt[x] + (v is not None)
+            if func != "COUNT" and v is not None:
+                tot[x + 1] = tot[x] + num_or_error(v, func)
+            else:
+                tot[x + 1] = tot[x]
+        for x in range(m):
+            if hi[x] < lo[x]:
+                c, t = 0, Decimal(0)
+            else:
+                c = cnt[hi[x] + 1] - cnt[lo[x]]
+                t = tot[hi[x] + 1] - tot[lo[x]]
+            if func == "COUNT":
+                values[part[x]] = c
+            elif c == 0:
+                values[part[x]] = None
+            elif func == "SUM":
+                values[part[x]] = t
+            else:
+                values[part[x]] = avg_value(t, c)
+        return
+    # MIN / MAX
+    better = (lambda a, b: sort_key(a) < sort_key(b)) if func == "MIN" else \
+        (lambda a, b: sort_key(a) > sort_key(b))
+
+    def combine(a, b):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return b if better(b, a) else a
+    if all(v == 0 for v in lo):
+        pre = [None] * m
+        acc = None
+        for x in range(m):
+            acc = combine(acc, args[x])
+            pre[x] = acc
+        for x in range(m):
+            values[part[x]] = pre[hi[x]] if hi[x] >= 0 else None
+        return
+    if all(v == m - 1 for v in hi):
+        suf = [None] * m
+        acc = None
+        for x in range(m - 1, -1, -1):
+            acc = combine(acc, args[x])
+            suf[x] = acc
+        for x in range(m):
+            values[part[x]] = suf[lo[x]] if lo[x] <= m - 1 else None
+        return
+    for x in range(m):
+        acc = None
+        for y in range(lo[x], hi[x] + 1):
+            acc = combine(acc, args[y])
+        values[part[x]] = acc
 
 
 # ---------------------------------------------------------------------------
@@ -1449,18 +1880,33 @@ def execute(q, data_dir, sharded=None):
             glist = [groups[k] for k in gorder]
         else:
             glist = [rows]
+        ctxs = []
         for grp in glist:
             rep = grp[0] if grp else None
             if having is not None and truth(evaluate(having, rep, grp)) is not True:
                 continue
-            outv = [evaluate(it.expr, rep, grp) for it in items]
-            ordv = [outv[t[1]] if t[0] == "out" else evaluate(t[1], rep, grp) for t, _, _ in order]
-            results.append((outv, ordv))
+            ctxs.append((rep, grp))
     else:
-        for r in rows:
-            outv = [evaluate(it.expr, r) for it in items]
-            ordv = [outv[t[1]] if t[0] == "out" else evaluate(t[1], r) for t, _, _ in order]
-            results.append((outv, ordv))
+        ctxs = [(r, None) for r in rows]
+
+    windows = []
+    seen_w = set()
+    exprs = [it.expr for it in items] + [t[1] for t, _, _ in order if t[0] == "expr"]
+    for e in exprs:
+        for nd in walk(e):
+            if isinstance(nd, Window) and id(nd) not in seen_w:
+                seen_w.add(id(nd))
+                windows.append(nd)
+    seq = list(range(len(ctxs)))
+    for w in windows:
+        seq = compute_window(w, ctxs, seq)
+    for ci in seq:
+        rep, grp = ctxs[ci]
+        _CUR_CTX[0] = ci
+        outv = [evaluate(it.expr, rep, grp) for it in items]
+        ordv = [outv[t[1]] if t[0] == "out" else evaluate(t[1], rep, grp) for t, _, _ in order]
+        results.append((outv, ordv))
+    _CUR_CTX[0] = None
 
     # sort (stable, last key first)
     for i in range(len(order) - 1, -1, -1):
@@ -1583,7 +2029,7 @@ def main(argv=None):
             write_csv(args.out, names, rows)
     except QueryError as e:
         print("Error: %s" % e, file=sys.stderr)
-        return 1
+        return e.exit_code
     except OSError as e:
         print("Error: %s" % e, file=sys.stderr)
         return 1
