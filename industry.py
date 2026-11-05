@@ -433,6 +433,30 @@ def cmd_invention(args):
 from fractions import Fraction
 
 
+def parse_simple_yaml(text):
+    """Minimal YAML subset: nested mappings of scalars via indentation."""
+    root = {}
+    stack = [(-1, root)]
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip() or ":" not in line:
+            continue
+        indent = len(line) - len(line.lstrip())
+        k, _, v = line.strip().partition(":")
+        k = k.strip().strip("'\"")
+        v = v.strip().strip("'\"")
+        while len(stack) > 1 and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1]
+        if v == "":
+            child = {}
+            parent[k] = child
+            stack.append((indent, child))
+        else:
+            parent[k] = v
+    return root
+
+
 def load_config(path):
     data = None
     try:
@@ -440,21 +464,33 @@ def load_config(path):
         with open(path, encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
     except ImportError:
-        data = {}
         with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.split("#", 1)[0].rstrip()
-                if not line.strip() or ":" not in line:
-                    continue
-                k, _, v = line.partition(":")
-                data[k.strip().strip("'\"")] = v.strip().strip("'\"")
+            data = parse_simple_yaml(fh.read())
+    if not isinstance(data, dict):
+        raise ValueError("config must be a mapping")
     te_bonus = to_int(data.get("te_bonus", 0), None)
     skill = to_int(data.get("invention_skill", 5), None)
     if te_bonus is None or not 0 <= te_bonus <= 30:
         raise ValueError("te_bonus must be an integer in [0, 30]")
     if skill is None or not 1 <= skill <= 5:
         raise ValueError("invention_skill must be an integer in [1, 5]")
-    return {"te_bonus": te_bonus, "invention_skill": skill}
+    try:
+        split = Fraction(str(data.get("split_days", 3)))
+    except (ValueError, ZeroDivisionError):
+        raise ValueError("split_days must be a number <= 30")
+    if not 0 < split <= 30:
+        raise ValueError("split_days must be a number in (0, 30]")
+    comp = data.get("component_bpo_defaults") or {}
+    if not isinstance(comp, dict):
+        raise ValueError("component_bpo_defaults must be a mapping")
+    cme = to_int(comp.get("me", 10), None)
+    cte = to_int(comp.get("te", 20), None)
+    if cme is None or not 0 <= cme <= MAX_ME:
+        raise ValueError("component_bpo_defaults.me must be an integer in [0, 10]")
+    if cte is None or not 0 <= cte <= MAX_TE:
+        raise ValueError("component_bpo_defaults.te must be an integer in [0, 20]")
+    return {"te_bonus": te_bonus, "invention_skill": skill, "split_days": split,
+            "component_me": cme, "component_te": cte}
 
 
 def is_int_token(t):
@@ -619,23 +655,136 @@ class Planner:
             me, te = spec["me"], spec["te"]
         if act != MANUFACTURING:
             me, te = 0, 0
-        for mid, mq in sde.materials.get((bp, act), []):
-            per_job = max(runs, ceil_div(mq * runs * (100 - me), 100))
-            add(mid, per_job * jobs)
-        seconds = Fraction(sde.times.get((bp, act), 0) * runs) \
-            * Fraction(100 - te, 100) * Fraction(100 - config["te_bonus"], 100)
-        days = round(float(seconds / 86400), 2)
-        job_rows = [(sde.types[bp]["typeName"] if bp in sde.types else str(bp),
-                     runs, days, jobs)]
+        te_bonus = config["te_bonus"]
+        split_days = config["split_days"]
+        build_all = config.get("build_all", False)
+        need = {}
+        produced = {}
+        job_rows = {}
+
+        def bp_name(b):
+            return sde.types[b]["typeName"] if b in sde.types else str(b)
+
+        def run_jobs(b, a, job_runs, j_me, j_te):
+            secs = Fraction(sde.times.get((b, a), 0)) * Fraction(100 - j_te, 100) \
+                * Fraction(100 - te_bonus, 100)
+            for r in job_runs:
+                days = round(float(secs * r / 86400), 2)
+                key = (bp_name(b), r, days)
+                job_rows[key] = job_rows.get(key, 0) + 1
+                for mid, mq in sde.materials.get((b, a), []):
+                    amt = max(r, ceil_div(mq * r * (100 - j_me), 100))
+                    if build_all and self.component_recipe(mid) is not None:
+                        need[mid] = need.get(mid, 0) + amt
+                    else:
+                        add(mid, amt)
+            return secs
+
+        secs_run = Fraction(sde.times.get((bp, act), 0)) * Fraction(100 - te, 100) \
+            * Fraction(100 - te_bonus, 100)
+        top_runs = []
+        for _ in range(jobs):
+            top_runs.extend(split_runs(runs, secs_run, split_days))
+        run_jobs(bp, act, top_runs, me, te)
+        produced[prod] = produced.get(prod, 0)
+
+        if build_all:
+            cme, cte = config["component_me"], config["component_te"]
+            for tid in self.topo_order(bp, act):
+                total = need.get(tid, 0)
+                if total <= 0:
+                    continue
+                cb, ca, _cp, cq = self.component_recipe(tid)
+                n = ceil_div(total, max(1, cq))
+                produced[tid] = n * cq - total
+                if ca != MANUFACTURING:
+                    j_me, j_te = 0, 0
+                elif self.is_t1_capital(tid):
+                    j_me, j_te = 0, 0
+                else:
+                    j_me, j_te = cme, cte
+                s = Fraction(sde.times.get((cb, ca), 0)) * Fraction(100 - j_te, 100) \
+                    * Fraction(100 - te_bonus, 100)
+                run_jobs(cb, ca, split_runs(n, s, split_days), j_me, j_te)
+
         mat_rows = []
-        for tid, n in buy.items():
+        ids = set(buy) | {t for t, e in produced.items() if e > 0 and t != prod}
+        for tid in ids:
+            n = buy.get(tid, 0)
+            end = produced.get(tid, 0) if tid != prod else 0
+            if n <= 0 and end <= 0:
+                continue
             name = sde.types[tid]["typeName"] if tid in sde.types else str(tid)
             vol = Decimal(sde.volume(tid)) if tid in sde.types else Decimal(0)
             bv = float(round(vol * n, 2))
-            mat_rows.append((name, n, bv, 0, 0))
+            mat_rows.append((name, n, bv, 0, end))
         mat_rows.sort(key=lambda r: r[0])
-        job_rows.sort(key=lambda r: (r[0], r[1], r[3], r[2]))
-        return mat_rows, job_rows
+        rows = [(k[0], k[1], k[2], c) for k, c in job_rows.items()]
+        rows.sort(key=lambda r: (r[0], r[1], r[3], r[2]))
+        return mat_rows, rows
+
+    def component_recipe(self, tid):
+        if not hasattr(self, "_comp_cache"):
+            self._comp_cache = {}
+        if tid not in self._comp_cache:
+            rec = self.sde.recipe_for_product(tid)
+            if rec is not None and not self.sde.published(rec[0]):
+                rec = None
+            self._comp_cache[tid] = rec
+        return self._comp_cache[tid]
+
+    def is_t1_capital(self, tid):
+        t = self.sde.types.get(tid)
+        if t is None:
+            return False
+        g = self.sde.groups.get(to_int(t["groupID"]), {})
+        if g.get("categoryID") != "6" or g.get("groupName") not in CAPITAL_GROUPS:
+            return False
+        return self.sde.tech_level(tid) == "Tech I"
+
+    def topo_order(self, bp, act):
+        """Buildable components reachable from (bp, act), consumers first."""
+        order, state = [], {}
+
+        def visit(tid):
+            if state.get(tid):
+                return
+            state[tid] = 1
+            rec = self.component_recipe(tid)
+            for mid, _q in self.sde.materials.get((rec[0], rec[1]), []):
+                if self.component_recipe(mid) is not None:
+                    visit(mid)
+            order.append(tid)
+
+        for mid, _q in self.sde.materials.get((bp, act), []):
+            if self.component_recipe(mid) is not None:
+                visit(mid)
+        order.reverse()
+        return order
+
+
+CAPITAL_GROUPS = {"Titan", "Dreadnought", "Lancer Dreadnought", "Freighter",
+                  "Carrier", "Supercarrier", "Capital Industrial Ship",
+                  "Jump Freighter", "Force Auxiliary"}
+
+
+def split_runs(n, secs_per_run, split_days):
+    """Split a job of n runs so none exceeds split_days. Returns list of runs."""
+    limit = min(Fraction(30), split_days)
+    # A job reaching the threshold breaches it; split jobs must stay strictly
+    # below it (matches the reference examples, e.g. 30 x 0.1 day -> 2 x 15).
+    if n <= 1 or secs_per_run <= 0 or secs_per_run * n < limit * 86400:
+        return [n]
+    days_per_run = secs_per_run / 86400
+    max_runs = math.ceil(limit / days_per_run) - 1
+    if max_runs < 1:
+        max_runs = 1
+    t = ceil_div(n, max_runs)
+    b, x = n // t, n % t
+    if b + 1 == max_runs and x > Fraction(t, 2) and n // (t + 1) + 1 < max_runs:
+        t += 1
+        b, x = n // t, n % t
+    return [b + 1] * x + [b] * (t - x)
 
 
 def cmd_plan(args):
@@ -644,6 +793,7 @@ def cmd_plan(args):
     except (OSError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    config["build_all"] = getattr(args, "build_all", False)
     sde = SDE(args.sde)
     planner = Planner(sde)
     try:
@@ -717,6 +867,7 @@ def main(argv=None):
     pl.add_argument("--config", required=True)
     pl.add_argument("--sde", required=True)
     pl.add_argument("--output", required=True)
+    pl.add_argument("--build-all", dest="build_all", action="store_true")
     args = p.parse_args(argv)
     if args.command == "plan":
         args.build = " ".join(args.build)
