@@ -3557,7 +3557,9 @@ class HTTPContext(object):
 class Context(object):
     _go_type = 'openmock.Context'
     _tmpl_fields = ('HTTPHeader', 'HTTPBody', 'HTTPPath', 'HTTPQueryString',
-                    'HTTPContext', 'HTTPParams', 'Values')
+                    'HTTPContext', 'HTTPParams', 'Values',
+                    'KafkaTopic', 'KafkaPayload',
+                    'AMQPExchange', 'AMQPRoutingKey', 'AMQPQueue', 'AMQPPayload')
 
     def __init__(self, header, body, path, query):
         self.HTTPHeader = header
@@ -3567,6 +3569,12 @@ class Context(object):
         self.HTTPParams = {}
         self.HTTPContext = HTTPContext('', {}, query)
         self.Values = {}
+        self.KafkaTopic = ''
+        self.KafkaPayload = ''
+        self.AMQPExchange = ''
+        self.AMQPRoutingKey = ''
+        self.AMQPQueue = ''
+        self.AMQPPayload = ''
 
     def with_params(self, route, params):
         self.HTTPParams = params
@@ -4370,6 +4378,8 @@ class Behavior(object):
         self.condition = condition
         self.actions = actions
         self.raw = raw
+        self.kafka_topic = None
+        self.amqp = None
 
 
 def parse_mock(m, source, root=None):
@@ -4427,6 +4437,29 @@ def parse_mock(m, source, root=None):
                 path = '/' + path
     condition = expect.get('condition')
     condition = _scalar_str(condition) if condition is not None else ''
+    kafka_topic = None
+    kexp = expect.get('kafka')
+    if kexp is not None:
+        if not isinstance(kexp, dict):
+            raise LoadError('%s: mock %s: expect.kafka must be a mapping' % (source, key))
+        t = kexp.get('topic')
+        if t is not None and _scalar_str(t) != '':
+            kafka_topic = _scalar_str(t)
+    amqp_exp = None
+    aexp = expect.get('amqp')
+    if aexp is not None:
+        if not isinstance(aexp, dict):
+            raise LoadError('%s: mock %s: expect.amqp must be a mapping' % (source, key))
+        ex = aexp.get('exchange')
+        ex = _scalar_str(ex) if ex is not None else ''
+        rk = aexp.get('routing_key')
+        rk = _scalar_str(rk) if rk is not None else ''
+        q = aexp.get('queue')
+        q = _scalar_str(q) if q is not None else ''
+        if q == '':
+            q = rk
+        if q != '' or ex != '':
+            amqp_exp = {'exchange': ex, 'routing_key': rk, 'queue': q}
 
     raw_actions = m.get('actions') or []
     if not isinstance(raw_actions, list):
@@ -4517,12 +4550,39 @@ def parse_mock(m, source, root=None):
                                               'method': _scalar_str(smethod).strip().upper(),
                                               'headers': headers, 'body': body,
                                               'binary': binary, 'binary_file_name': bname}))
+            elif name in ('publish_kafka', 'publish_amqp'):
+                if not isinstance(spec, dict):
+                    raise LoadError('%s: mock %s: %s must be a mapping' % (source, key, name))
+                if name == 'publish_kafka':
+                    fields = ('topic',)
+                else:
+                    fields = ('exchange', 'routing_key')
+                out = {}
+                for f in fields:
+                    v = spec.get(f)
+                    if v is None or (f != 'exchange' and _scalar_str(v) == ''):
+                        raise LoadError('%s: mock %s: %s.%s is required' % (source, key, name, f))
+                    out[f] = _scalar_str(v)
+                payload = spec.get('payload')
+                pff = spec.get('payload_from_file')
+                has_file = pff is not None and _scalar_str(pff) != ''
+                if payload is None and not has_file:
+                    raise LoadError('%s: mock %s: %s.payload is required unless '
+                                    'payload_from_file is set' % (source, key, name))
+                payload = _scalar_str(payload)
+                if payload == '' and has_file:
+                    payload = _read_body_file(root, _scalar_str(pff), source, key)
+                out['payload'] = payload
+                actions.append((order, name, out))
             else:
                 log('warn', 'unsupported action ignored', key=key, action=str(name))
     # stable sort by order ascending (preserves relative order on ties)
     actions = [(typ, spec) for _, typ, spec in
                sorted(actions, key=lambda x: x[0])]
-    return Behavior(key, kind, method, path, condition, actions, m, values)
+    b = Behavior(key, kind, method, path, condition, actions, m, values)
+    b.kafka_topic = kafka_topic
+    b.amqp = amqp_exp
+    return b
 
 
 def _resolve_body_file(root, rel):
@@ -4950,6 +5010,8 @@ class Handler(BaseHTTPRequestHandler):
                         log('error', 'failed to render redis action', key=b.key, err=str(e))
             elif typ == 'send_http':
                 do_send_http(b, spec, ctx)
+            elif typ in ('publish_kafka', 'publish_amqp'):
+                do_publish(b, typ, spec, ctx)
         return status, res_body, sent
 
 
@@ -5005,6 +5067,663 @@ def do_send_http(b, spec, ctx):
             status=st, res=rbody.decode('utf-8', 'replace'))
     except Exception as e:
         log('error', 'send_http failed', key=b.key, url=url, method=spec['method'], err=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Messaging: Kafka and AMQP
+# ---------------------------------------------------------------------------
+
+import queue as _queue
+
+KAFKA = None   # KafkaManager when HM_KAFKA_ENABLED
+AMQP = None    # AMQPManager when HM_AMQP_ENABLED
+
+
+def run_message_actions(b, ctx):
+    """Execute the actions of a behavior triggered by a Kafka/AMQP message."""
+    for typ, spec in b.actions:
+        try:
+            if typ == 'sleep':
+                time.sleep(spec['duration'])
+            elif typ == 'redis':
+                for item in spec['items']:
+                    try:
+                        render(item, ctx)
+                    except Exception as e:
+                        log('error', 'failed to render redis action', key=b.key, err=str(e))
+            elif typ == 'send_http':
+                do_send_http(b, spec, ctx)
+            elif typ in ('publish_kafka', 'publish_amqp'):
+                do_publish(b, typ, spec, ctx)
+            elif typ == 'reply_http':
+                log('debug', 'reply_http ignored for message-triggered behavior', key=b.key)
+        except Exception as e:  # pragma: no cover - defensive
+            log('error', 'action failed', key=b.key, action=typ, err=repr(e))
+
+
+def do_publish(b, typ, spec, ctx):
+    try:
+        payload = render(spec['payload'], ctx)
+        if typ == 'publish_kafka':
+            topic = render(spec['topic'], ctx).strip()
+        else:
+            exchange = render(spec['exchange'], ctx).strip()
+            routing_key = render(spec['routing_key'], ctx).strip()
+    except Exception as e:
+        log('error', 'failed to render template for %s' % typ, key=b.key, err=str(e))
+        return
+    if typ == 'publish_kafka':
+        if KAFKA is None:
+            log('warn', 'kafka is disabled, publish_kafka skipped', key=b.key, topic=topic)
+            return
+        try:
+            KAFKA.publish(topic, payload)
+            log('info', 'publish_kafka', key=b.key, kafka_topic=topic, kafka_payload=payload)
+        except Exception as e:
+            log('error', 'publish_kafka failed', key=b.key, kafka_topic=topic, err=repr(e))
+    else:
+        if AMQP is None:
+            log('warn', 'amqp is disabled, publish_amqp skipped', key=b.key,
+                exchange=exchange, routing_key=routing_key)
+            return
+        try:
+            AMQP.publish(exchange, routing_key, payload)
+            log('info', 'publish_amqp', key=b.key, amqp_exchange=exchange,
+                amqp_routing_key=routing_key, amqp_payload=payload)
+        except Exception as e:
+            log('error', 'publish_amqp failed', key=b.key, amqp_exchange=exchange,
+                amqp_routing_key=routing_key, err=repr(e))
+
+
+class _Dispatcher(object):
+    """Runs message handlers sequentially on a dedicated thread.
+
+    Keeps the broker I/O threads responsive (heartbeats, fetches) while
+    preserving message order.
+    """
+
+    def __init__(self, name, fn):
+        self.q = _queue.Queue()
+        self.fn = fn
+        t = threading.Thread(target=self._run, name=name, daemon=True)
+        t.start()
+
+    def put(self, *args):
+        self.q.put(args)
+
+    def _run(self):
+        while True:
+            args = self.q.get()
+            try:
+                self.fn(*args)
+            except Exception as e:  # pragma: no cover - defensive
+                log('error', 'message handler failed', err=repr(e))
+
+
+def _env_str(name):
+    v = os.environ.get(name)
+    if v is None:
+        return None
+    v = v.strip()
+    return v if v != '' else None
+
+
+def _env_bool_opt(name):
+    v = _env_str(name)
+    if v is None:
+        return None
+    return v.lower() in ('1', 't', 'true', 'y', 'yes', 'on')
+
+
+def _split_brokers(v):
+    return [x.strip() for x in (v or '').split(',') if x.strip()]
+
+
+def kafka_settings(env=None):
+    """Resolve producer/consumer Kafka settings from the environment."""
+    if env is not None:
+        get = lambda n: (env.get(n).strip() or None) if env.get(n) is not None else None
+    else:
+        get = _env_str
+
+    def getb(n):
+        v = get(n)
+        return None if v is None else v.lower() in ('1', 't', 'true', 'y', 'yes', 'on')
+
+    client_id = get('HM_KAFKA_CLIENT_ID') or 'hmock'
+    seeds = get('HM_KAFKA_SEED_BROKERS') or 'kafka:9092'
+    user = get('HM_KAFKA_SASL_USERNAME') or ''
+    pw = get('HM_KAFKA_SASL_PASSWORD') or ''
+    tls = getb('HM_KAFKA_TLS_ENABLED')
+    tls = bool(tls) if tls is not None else False
+    out = {}
+    for role, up in (('producer', 'PRODUCER'), ('consumer', 'CONSUMER')):
+        b = get('HM_KAFKA_%s_SEED_BROKERS' % up) or seeds
+        u = get('HM_KAFKA_SASL_%s_USERNAME' % up)
+        u = u if u is not None else user
+        p = get('HM_KAFKA_SASL_%s_PASSWORD' % up)
+        p = p if p is not None else pw
+        t = getb('HM_KAFKA_TLS_%s_ENABLED' % up)
+        t = t if t is not None else tls
+        sasl = u != '' and p != ''
+        out[role] = {
+            'client_id': client_id,
+            'brokers': _split_brokers(b),
+            'sasl': sasl,
+            'username': u if sasl else '',
+            'password': p if sasl else '',
+            'tls': t,
+        }
+    return out
+
+
+def _kafka_client_kwargs(cfg):
+    kw = {'bootstrap_servers': cfg['brokers'], 'client_id': cfg['client_id']}
+    if cfg['sasl']:
+        kw['security_protocol'] = 'SASL_SSL' if cfg['tls'] else 'SASL_PLAINTEXT'
+        kw['sasl_mechanism'] = 'PLAIN'
+        kw['sasl_plain_username'] = cfg['username']
+        kw['sasl_plain_password'] = cfg['password']
+    elif cfg['tls']:
+        kw['security_protocol'] = 'SSL'
+    return kw
+
+
+class KafkaManager(object):
+    """Consumes topics referenced by loaded mocks and publishes messages."""
+
+    def __init__(self, settings, get_behaviors):
+        self.settings = settings
+        self.get_behaviors = get_behaviors
+        self.lock = threading.Lock()
+        self.wanted = {}        # topic -> start timestamp (ms)
+        self.changed = threading.Event()
+        self.ready = threading.Event()
+        self.attempted = threading.Event()
+        self.connected = False
+        self.producer = None
+        self.plock = threading.Lock()
+        self.dispatcher = _Dispatcher('hmock-kafka-dispatch', self.handle)
+
+    # -- topic tracking ----------------------------------------------------
+    def update(self, behaviors):
+        topics = []
+        for b in behaviors:
+            if b.kind == KIND_BEHAVIOR and b.kafka_topic and b.kafka_topic not in topics:
+                topics.append(b.kafka_topic)
+        now = int(time.time() * 1000)
+        with self.lock:
+            new = dict((t, self.wanted.get(t, now)) for t in topics)
+            if new != self.wanted:
+                self.wanted = new
+                self.ready.clear()
+                self.changed.set()
+
+    def start(self):
+        threading.Thread(target=self._consume_loop, name='hmock-kafka-consumer',
+                         daemon=True).start()
+
+    # -- consumer ----------------------------------------------------------
+    def _consume_loop(self):
+        from kafka import KafkaConsumer, TopicPartition
+        cfg = self.settings['consumer']
+        positions = {}   # TopicPartition -> next offset to consume
+        consumer = None
+        assigned = {}    # topic -> [TopicPartition]
+        backoff = 0.5
+        retry_at = 0.0
+        while True:
+            try:
+                if consumer is None:
+                    consumer = KafkaConsumer(group_id=None, enable_auto_commit=False,
+                                             auto_offset_reset='latest',
+                                             allow_auto_create_topics=True,
+                                             metadata_max_age_ms=5000,
+                                             request_timeout_ms=30000,
+                                             **_kafka_client_kwargs(cfg))
+                    log('info', 'kafka consumer connected', brokers=','.join(cfg['brokers']))
+                    self.connected = True
+                    self.attempted.set()
+                    assigned = {}
+                    retry_at = 0.0
+                    backoff = 0.5
+                self.changed.clear()
+                with self.lock:
+                    wanted = dict(self.wanted)
+                missing = [t for t in wanted if t not in assigned]
+                removed = [t for t in assigned if t not in wanted]
+                if missing and not removed and time.time() < retry_at:
+                    missing = []
+                if missing or removed:
+                    retry_at = time.time() + 1.0
+                    self._ensure_topics(missing)
+                    for t in removed:
+                        for tp in assigned.pop(t):
+                            positions.pop(tp, None)
+                    for t in missing:
+                        parts = consumer.partitions_for_topic(t)
+                        if not parts:
+                            consumer.topics()  # refresh metadata
+                            parts = consumer.partitions_for_topic(t)
+                        if not parts:
+                            continue
+                        assigned[t] = [TopicPartition(t, p) for p in sorted(parts)]
+                    all_tps = [tp for tps in assigned.values() for tp in tps]
+                    if all_tps:
+                        consumer.assign(all_tps)
+                    elif consumer.assignment():
+                        consumer.unsubscribe()
+                    new_tps = [tp for tp in all_tps if tp not in positions]
+                    if new_tps:
+                        ends = consumer.end_offsets(new_tps)
+                        times = consumer.offsets_for_times(
+                            dict((tp, wanted[tp.topic]) for tp in new_tps))
+                        for tp in new_tps:
+                            ot = times.get(tp)
+                            positions[tp] = ot.offset if ot is not None else ends.get(tp, 0)
+                    for tp in all_tps:
+                        consumer.seek(tp, positions[tp])
+                    if all_tps:
+                        log('info', 'kafka consumer assigned',
+                            topics=','.join(sorted(assigned)))
+                if all(t in assigned for t in wanted):
+                    self.ready.set()
+                if not assigned:
+                    self.changed.wait(0.5 if wanted else 2.0)
+                    continue
+                records = consumer.poll(timeout_ms=200 if len(assigned) == len(wanted) else 100)
+                if len(assigned) != len(wanted):
+                    # retry unresolved topics periodically
+                    self.changed.set()
+                for tp, msgs in records.items():
+                    for m in msgs:
+                        positions[tp] = m.offset + 1
+                        val = m.value
+                        if isinstance(val, bytes):
+                            val = val.decode('utf-8', 'replace')
+                        elif val is None:
+                            val = ''
+                        self.dispatcher.put(tp.topic, val)
+            except Exception as e:
+                log('error', 'kafka consumer error, retrying', err=repr(e))
+                self.connected = False
+                self.attempted.set()
+                if consumer is not None:
+                    try:
+                        consumer.close()
+                    except Exception:
+                        pass
+                consumer = None
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
+
+    def _ensure_topics(self, topics):
+        if not topics:
+            return
+        try:
+            from kafka.admin import KafkaAdminClient, NewTopic
+            admin = KafkaAdminClient(**_kafka_client_kwargs(self.settings['consumer']))
+        except Exception as e:
+            log('debug', 'kafka admin unavailable', err=repr(e))
+            return
+        try:
+            existing = set(admin.list_topics())
+            todo = [t for t in topics if t not in existing]
+            if todo:
+                try:
+                    admin.create_topics([NewTopic(name=t, num_partitions=1,
+                                                  replication_factor=1) for t in todo],
+                                        timeout_ms=10000)
+                    log('info', 'kafka topics created', topics=','.join(todo))
+                except Exception as e:
+                    log('debug', 'kafka create topics failed', topics=','.join(todo),
+                        err=repr(e))
+                # wait briefly for metadata to propagate
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if all(t in set(admin.list_topics()) for t in todo):
+                        break
+                    time.sleep(0.1)
+        except Exception as e:
+            log('debug', 'kafka ensure topics failed', err=repr(e))
+        finally:
+            try:
+                admin.close()
+            except Exception:
+                pass
+
+    def handle(self, topic, payload):
+        log('info', 'kafka message received', kafka_topic=topic, kafka_payload=payload)
+        for b in list(self.get_behaviors()):
+            if b.kind != KIND_BEHAVIOR or b.kafka_topic != topic:
+                continue
+            ctx = Context(Header(()), '', '', '')
+            ctx.KafkaTopic = topic
+            ctx.KafkaPayload = payload
+            ctx.Values = b.values
+            if not condition_passes(b, ctx):
+                continue
+            log('info', 'kafka behavior matched', key=b.key, kafka_topic=topic)
+            run_message_actions(b, ctx)
+
+    # -- producer ----------------------------------------------------------
+    def publish(self, topic, payload):
+        from kafka import KafkaProducer
+        data = payload.encode('utf-8')
+        with self.plock:
+            for attempt in (1, 2):
+                fresh = self.producer is None
+                try:
+                    if self.producer is None:
+                        self.producer = KafkaProducer(
+                            acks=1, retries=3, max_block_ms=5000,
+                            **_kafka_client_kwargs(self.settings['producer']))
+                    self.producer.send(topic, value=data).get(timeout=15)
+                    return
+                except Exception:
+                    if self.producer is not None:
+                        try:
+                            self.producer.close(timeout=1)
+                        except Exception:
+                            pass
+                        self.producer = None
+                    if attempt == 2 or fresh:
+                        raise
+
+
+def _amqp_topic_match(pattern, key):
+    """AMQP topic-exchange binding match ('*' one word, '#' zero or more)."""
+    pw = pattern.split('.')
+    kw = key.split('.')
+
+    def m(i, j):
+        if i == len(pw):
+            return j == len(kw)
+        if pw[i] == '#':
+            return any(m(i + 1, k) for k in range(j, len(kw) + 1))
+        if j == len(kw):
+            return False
+        return (pw[i] == '*' or pw[i] == kw[j]) and m(i + 1, j + 1)
+    return m(0, 0)
+
+
+class AMQPManager(object):
+    """Declares exchanges/queues/bindings for AMQP mocks, consumes, publishes."""
+
+    def __init__(self, url, get_behaviors):
+        self.url = url
+        self.get_behaviors = get_behaviors
+        self.lock = threading.Lock()
+        self.wanted = []        # [(exchange, routing_key, queue)]
+        self.gen = 0            # bumped on every change of wanted bindings
+        self.synced_gen = -1
+        self.connected = False
+        self.attempted = threading.Event()
+        self.cond = threading.Condition(self.lock)
+        self.pconn = None
+        self.pch = None
+        self.plock = threading.Lock()
+        self.dispatcher = _Dispatcher('hmock-amqp-dispatch', self.handle)
+
+    def _params(self, heartbeat=10):
+        import pika
+        p = pika.URLParameters(self.url)
+        p.heartbeat = heartbeat
+        p.blocked_connection_timeout = 30
+        p.socket_timeout = 5
+        p.connection_attempts = 1
+        p.client_properties = {'connection_name': 'hmock'}
+        return p
+
+    def update(self, behaviors):
+        wanted = []
+        for b in behaviors:
+            if b.kind == KIND_BEHAVIOR and b.amqp:
+                t = (b.amqp['exchange'], b.amqp['routing_key'], b.amqp['queue'])
+                if t not in wanted:
+                    wanted.append(t)
+        with self.lock:
+            if wanted != self.wanted:
+                self.wanted = wanted
+                self.gen += 1
+
+    def wait_synced(self, timeout):
+        deadline = time.time() + timeout
+        with self.cond:
+            while self.synced_gen < self.gen:
+                left = deadline - time.time()
+                if left <= 0:
+                    return False
+                self.cond.wait(left)
+        return True
+
+    def start(self):
+        threading.Thread(target=self._consume_loop, name='hmock-amqp-consumer',
+                         daemon=True).start()
+        threading.Thread(target=self._publisher_keepalive, name='hmock-amqp-keepalive',
+                         daemon=True).start()
+
+    # -- consumer ----------------------------------------------------------
+    def _consume_loop(self):
+        import pika
+        backoff = 0.5
+        while True:
+            conn = None
+            try:
+                conn = pika.BlockingConnection(self._params())
+                ch = conn.channel()
+                ch.basic_qos(prefetch_count=100)
+                log('info', 'amqp consumer connected')
+                self.connected = True
+                self.attempted.set()
+                backoff = 0.5
+                state = {'bound': set(), 'consumers': {}, 'gen': -1}
+                while True:
+                    with self.lock:
+                        gen, wanted = self.gen, list(self.wanted)
+                    if gen != state['gen']:
+                        self._sync(conn, ch, wanted, state)
+                        state['gen'] = gen
+                        with self.cond:
+                            self.synced_gen = max(self.synced_gen, gen)
+                            self.cond.notify_all()
+                    conn.process_data_events(time_limit=0.1)
+            except Exception as e:
+                self.connected = False
+                self.attempted.set()
+                log('error', 'amqp consumer disconnected, reconnecting', err=repr(e))
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 2.0)
+
+    def _ensure(self, conn, kind, name, declare):
+        """Passive-check a resource, declaring it if it does not exist."""
+        import pika
+        tmp = conn.channel()
+        try:
+            if kind == 'exchange':
+                tmp.exchange_declare(exchange=name, passive=True)
+            else:
+                tmp.queue_declare(queue=name, passive=True)
+            return
+        except pika.exceptions.ChannelClosedByBroker as e:
+            if e.reply_code != 404:
+                raise
+        finally:
+            if tmp.is_open:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+        tmp = conn.channel()
+        try:
+            declare(tmp)
+            log('info', 'amqp %s declared' % kind, name=name)
+        finally:
+            if tmp.is_open:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+
+    def _sync(self, conn, ch, wanted, state):
+        import pika
+        for ex, rk, q in wanted:
+            if (ex, rk, q) in state['bound']:
+                continue
+            try:
+                if ex != '':
+                    self._ensure(conn, 'exchange', ex,
+                                 lambda c: c.exchange_declare(exchange=ex, exchange_type='topic',
+                                                              durable=True))
+                if q != '':
+                    self._ensure(conn, 'queue', q,
+                                 lambda c: c.queue_declare(queue=q, durable=True))
+                if ex != '' and q != '':
+                    tmp = conn.channel()
+                    try:
+                        tmp.queue_bind(queue=q, exchange=ex, routing_key=rk)
+                    finally:
+                        if tmp.is_open:
+                            tmp.close()
+                state['bound'].add((ex, rk, q))
+                log('info', 'amqp binding ready', exchange=ex, routing_key=rk, queue=q)
+            except (pika.exceptions.ChannelClosedByBroker,
+                    pika.exceptions.ChannelWrongStateError) as e:
+                log('error', 'amqp setup failed', exchange=ex, routing_key=rk, queue=q,
+                    err=repr(e))
+        queues = []
+        for ex, rk, q in wanted:
+            if q != '' and q not in queues and (ex, rk, q) in state['bound']:
+                queues.append(q)
+        for q in list(state['consumers']):
+            if q not in queues:
+                try:
+                    ch.basic_cancel(state['consumers'].pop(q))
+                except Exception as e:
+                    log('debug', 'amqp cancel failed', queue=q, err=repr(e))
+        for q in queues:
+            if q in state['consumers']:
+                continue
+
+            def on_msg(c, method, props, body, q=q):
+                try:
+                    payload = body.decode('utf-8', 'replace') if body is not None else ''
+                    self.dispatcher.put(method.exchange or '', method.routing_key or '', q,
+                                        payload)
+                finally:
+                    c.basic_ack(delivery_tag=method.delivery_tag)
+            state['consumers'][q] = ch.basic_consume(queue=q, on_message_callback=on_msg)
+            log('info', 'amqp consuming', queue=q)
+
+    def handle(self, exchange, routing_key, q, payload):
+        log('info', 'amqp message received', amqp_exchange=exchange,
+            amqp_routing_key=routing_key, amqp_queue=q, amqp_payload=payload)
+        cands = [b for b in list(self.get_behaviors())
+                 if b.kind == KIND_BEHAVIOR and b.amqp and b.amqp['queue'] == q]
+        # When a queue is shared by several bindings, prefer the behaviors
+        # whose binding matches the message's exchange/routing key.
+        exact = [b for b in cands if b.amqp['exchange'] == exchange and
+                 _amqp_topic_match(b.amqp['routing_key'], routing_key)]
+        if exact:
+            cands = exact
+        for b in cands:
+            ctx = Context(Header(()), '', '', '')
+            ctx.AMQPExchange = exchange
+            ctx.AMQPRoutingKey = routing_key
+            ctx.AMQPQueue = q
+            ctx.AMQPPayload = payload
+            ctx.Values = b.values
+            if not condition_passes(b, ctx):
+                continue
+            log('info', 'amqp behavior matched', key=b.key, amqp_queue=q)
+            run_message_actions(b, ctx)
+
+    # -- publisher ---------------------------------------------------------
+    def _close_publisher(self):
+        if self.pconn is not None:
+            try:
+                self.pconn.close()
+            except Exception:
+                pass
+        self.pconn = self.pch = None
+
+    def publish(self, exchange, routing_key, payload):
+        import pika
+        data = payload.encode('utf-8')
+        with self.plock:
+            for attempt in (1, 2):
+                fresh = self.pconn is None or not self.pconn.is_open
+                try:
+                    if self.pconn is None or not self.pconn.is_open:
+                        self._close_publisher()
+                        self.pconn = pika.BlockingConnection(self._params(heartbeat=30))
+                    if self.pch is None or not self.pch.is_open:
+                        self.pch = self.pconn.channel()
+                        self.pch.confirm_delivery()
+                    self.pch.basic_publish(exchange=exchange, routing_key=routing_key,
+                                           body=data,
+                                           properties=pika.BasicProperties(delivery_mode=2))
+                    return
+                except pika.exceptions.ChannelClosedByBroker:
+                    self.pch = None
+                    raise
+                except Exception:
+                    self._close_publisher()
+                    if attempt == 2 or fresh:
+                        raise
+
+    def _publisher_keepalive(self):
+        while True:
+            time.sleep(2)
+            with self.plock:
+                if self.pconn is None:
+                    continue
+                try:
+                    self.pconn.process_data_events(time_limit=0)
+                except Exception:
+                    self._close_publisher()
+
+
+def start_messaging(registry):
+    """Start Kafka/AMQP integrations according to the environment."""
+    global KAFKA, AMQP
+    get = lambda: registry.behaviors
+    if _env_bool('HM_KAFKA_ENABLED', False):
+        settings = kafka_settings()
+        KAFKA = KafkaManager(settings, get)
+        KAFKA.update(registry.behaviors)
+        registry.listeners.append(KAFKA.update)
+        KAFKA.start()
+        log('info', 'kafka enabled', client_id=settings['consumer']['client_id'],
+            consumer_brokers=','.join(settings['consumer']['brokers']),
+            producer_brokers=','.join(settings['producer']['brokers']))
+    if _env_bool('HM_AMQP_ENABLED', False):
+        url = os.environ.get('HM_AMQP_URL') or 'amqp://guest:guest@rabbitmq:5672'
+        AMQP = AMQPManager(url, get)
+        AMQP.update(registry.behaviors)
+
+        def amqp_update(behaviors):
+            AMQP.update(behaviors)
+            if AMQP.connected:
+                AMQP.wait_synced(5.0)
+        registry.listeners.append(amqp_update)
+        AMQP.start()
+        log('info', 'amqp enabled')
+    # Give the brokers a moment so resources exist before serving traffic.
+    deadline = time.time() + 10.0
+    if AMQP is not None and AMQP.wanted:
+        AMQP.attempted.wait(max(deadline - time.time(), 0))
+        if AMQP.connected:
+            AMQP.wait_synced(max(deadline - time.time(), 0))
+    if KAFKA is not None and KAFKA.wanted:
+        KAFKA.attempted.wait(max(deadline - time.time(), 0))
+        if KAFKA.connected:
+            KAFKA.ready.wait(max(deadline - time.time(), 0))
 
 
 # ---------------------------------------------------------------------------
@@ -5171,6 +5890,7 @@ class Registry(object):
         self.sets = {}      # set key -> list of mock dicts
         self.behaviors = []
         self.servers = []
+        self.listeners = []
         self._snapshot = None
         self._fs_sig = None
         self.hot_reload = True
@@ -5214,6 +5934,11 @@ class Registry(object):
         self.behaviors = behaviors
         for srv in self.servers:
             srv.behaviors = behaviors
+        for fn in self.listeners:
+            try:
+                fn(behaviors)
+            except Exception as e:  # pragma: no cover - defensive
+                log('error', 'mock change listener failed', err=repr(e))
 
     def _snap(self, base, sets):
         return _json_dumps([base, sorted(sets.items())])
@@ -5590,6 +6315,7 @@ def main():
         log('error', 'failed to load mocks', err=str(e))
         sys.exit(1)
     log('info', 'mocks loaded', count=len(behaviors), dir=tdir)
+    start_messaging(registry)
     try:
         server = MockServer((host, port), Handler, behaviors, cors=cors)
     except OSError as e:
