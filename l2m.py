@@ -431,7 +431,7 @@ def _clean(text):
     return "\n".join(l for l in lines if l)
 
 
-def convert_lists(text):
+def convert_lists(text, simple=False):
     out = []
     pos = 0
     stack = []  # frames: dict(kind, num, depth, parent)
@@ -520,7 +520,13 @@ def convert_lists(text):
             else:
                 cur = f["start"] + f["num"]
                 f["num"] += 1
-                if f["depth"] == 2:
+                if simple:
+                    if f["depth"] == 2:
+                        label = "    %d.  " % f["num"]
+                    else:
+                        f["last"] = cur
+                        label = "%d.  " % cur
+                elif f["depth"] == 2:
                     letter = chr(ord("a") + (cur - 1) % 26)
                     label = "**%s.%s)** " % (f["parent"], letter)
                 else:
@@ -557,7 +563,7 @@ _END_LINE_RE = re.compile(r"\\end\s*\{([^{}]*)\}")
 
 
 def _recognized(name):
-    return name in ADMONITIONS or name == "solution"
+    return name in ADMONITIONS or name in ("solution", "exercice")
 
 
 def _find_end(lines, start, name):
@@ -585,24 +591,126 @@ def _trim_blank(lines):
     return lines
 
 
-def _render_block(name, content, mode):
-    if name == "solution":
+def _render_block(name, content, mode, title=None, label=None):
+    if name == "exercice":
+        typ = "info"
+        mk_label = label
+    elif name == "solution":
         typ, label = "tip", "Solution:"
+        mk_label = label
+        if title:
+            label = mk_label = "Solution: " + title
     else:
-        typ, label = ADMONITIONS[name]
-        label += ":"
+        typ, base = ADMONITIONS[name]
+        label = base + ":"
+        mk_label = base
+        if title:
+            label = mk_label = base + ": " + title
     if mode == "docusaurus":
         return [":::%s %s" % (typ, label), ""] + content + ["", ":::"]
     if mode == "mkdocs":
-        return ['!!!%s "%s"' % (typ, label[:-1] if name != "solution" else label), ""] + [
+        return ['!!!%s "%s"' % (typ, mk_label), ""] + [
             ("    " + l) if l else "" for l in content
         ]
-    if name == "solution":
-        return ["**Solution:**", ""] + content
+    if name in ("solution", "exercice"):
+        return ["**%s**" % label, ""] + content
     return content
 
 
-def _process_envs(lines, mode):
+def _line_bracket(s, i):
+    """s[i] == '['. Return (content, index after ']') or None if unclosed on this line."""
+    depth = 0
+    j = i
+    while j < len(s):
+        ch = s[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return s[i + 1:j], j + 1
+        j += 1
+    return None
+
+
+def parse_exercice_meta(head):
+    """Parse metadata brackets following \\begin{exercice}.
+
+    Returns (fields, rest, malformed)."""
+    fields = []
+    i = 0
+    malformed = False
+    while True:
+        k = _skip_ws_line(head, i)
+        if k >= len(head) or head[k] != "[":
+            break
+        r = _line_bracket(head, k)
+        if r is None:
+            malformed = True
+            break
+        fields.append(r[0])
+        i = r[1]
+    if len(fields) > 2:
+        raise ConvertError("Error: too many exercice metadata fields")
+    return fields, head[i:], malformed
+
+
+def _skip_ws_line(s, i):
+    while i < len(s) and s[i] in " \t":
+        i += 1
+    return i
+
+
+def exercice_label(num, fields):
+    label = "Exercice %d:" % num
+    if len(fields) > 0 and fields[0].strip(" \t"):
+        label += " " + fields[0].strip(" \t")
+    if len(fields) > 1 and fields[1].strip(" \t"):
+        label += " /%s points" % fields[1].strip(" \t")
+    return label
+
+
+_EXO_RAW = "\x00X%d\x00"
+
+
+def stash_malformed_exercices(text, store):
+    """Replace exercice environments with malformed metadata by placeholders."""
+    lines = text.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        b = _BEGIN_LINE_RE.match(line.strip(" \t"))
+        if b and b.group(1) == "exercice":
+            head = line.strip(" \t")[b.end():]
+            _, _, malformed = parse_exercice_meta(head)
+            if malformed:
+                end = _find_end(lines, i + 1, "exercice")
+                if end is None:
+                    end = i
+                out.append(_EXO_RAW % len(store))
+                store.append(lines[i:end + 1])
+                i = end + 1
+                continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def restore_exercices(text, store):
+    def rep(m):
+        prefix = m.group(1)
+        raw = store[int(m.group(2))]
+        return "\n".join((prefix + l) if l else l for l in raw)
+    return re.sub(r"(?m)^([ \t]*)\x00X(\d+)\x00", rep, text)
+
+
+def _process_envs(lines, mode, counter=None):
+    if counter is None:
+        counter = [0]
     out = []
     i = 0
     n = len(lines)
@@ -628,18 +736,26 @@ def _process_envs(lines, mode):
             raise ConvertError("Error: unterminated environment '%s'" % name)
         stripped = line.strip(" \t")
         head = stripped[b.end():]
-        if head.startswith("["):
-            k = _opt_arg(head, 0)
-            if k is not None:
-                head = head[k:]
+        title = None
+        label = None
+        if name == "exercice":
+            fields, head, _ = parse_exercice_meta(head)
+            counter[0] += 1
+            label = exercice_label(counter[0], fields)
+        elif head.startswith("["):
+            r = _line_bracket(head, 0)
+            if r is None:
+                raise ConvertError("Error: malformed environment title")
+            title = r[0].strip(" \t") or None
+            head = head[r[1]:]
         inner = []
         if head.strip(" \t"):
             inner.append(head.strip(" \t"))
         inner.extend(lines[i + 1:end])
         endline = lines[end].strip(" \t")
         tail = endline[_END_LINE_RE.match(endline).end():].strip(" \t")
-        content = _trim_blank(_process_envs(inner, mode))
-        out.extend(_render_block(name, content, mode))
+        content = _trim_blank(_process_envs(inner, mode, counter))
+        out.extend(_render_block(name, content, mode, title, label))
         if tail:
             out.append(tail)
         i = end + 1
@@ -650,24 +766,27 @@ def convert_admonitions(text, mode):
     return "\n".join(_process_envs(text.split("\n"), mode))
 
 
-def convert(text, mode=None):
+def convert(text, mode=None, simple=False):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = remove_comments(text)
     text = select_body(text)
     text = strip_lines(text)
+    raw_exos = []
+    text = stash_malformed_exercices(text, raw_exos)
     text = convert_includegraphics(text)
     text = convert_parbox(text)
     text = unwrap_envs(text)
     text = convert_np(text)
     store = []
     text = convert_display_math(text, store)
-    text = convert_lists(text)
+    text = convert_lists(text, simple)
     text = convert_commands(text)
     text = delete_skips(text)
     text = re.sub(r"\x00M(\d+)\x00", lambda m: store[int(m.group(1))], text)
     text = convert_admonitions(text, mode)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.strip("\n")
+    text = restore_exercices(text, raw_exos)
     return text + "\n" if text else ""
 
 
@@ -675,6 +794,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="l2m.py")
     p.add_argument("input")
     p.add_argument("-o", "--output")
+    p.add_argument("--simple-enumerate", action="store_true")
     p.add_argument("--docusaurus", action="store_true")
     p.add_argument("--mkdocs", action="store_true")
     args = p.parse_args(argv)
@@ -696,7 +816,7 @@ def main(argv=None):
     else:
         out_path = os.path.splitext(os.path.basename(args.input))[0] + ".md"
     try:
-        result = convert(src, mode)
+        result = convert(src, mode, args.simple_enumerate)
     except (ListError, ConvertError) as e:
         sys.stderr.write(str(e) + "\n")
         return 1
