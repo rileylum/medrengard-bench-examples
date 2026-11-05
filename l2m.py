@@ -148,6 +148,127 @@ def delete_skips(s):
     return _SKIP_RE.sub(lambda m: m.group(1), s)
 
 
+_LIST_RE = re.compile(
+    r"\\begin\{(enumerate|itemize)\}|\\end\{(enumerate|itemize)\}|\\item(?![A-Za-z])"
+)
+_START_RE = re.compile(r"\[start=([0-9]+)\]")
+
+
+class ListError(Exception):
+    pass
+
+
+def _clean(text):
+    lines = [l.strip(" \t") for l in text.split("\n")]
+    return "\n".join(l for l in lines if l)
+
+
+def convert_lists(text):
+    out = []
+    pos = 0
+    stack = []  # frames: dict(kind, num, depth, parent)
+    entries = []  # [is_enum, text, open, has_content]
+    seg_start = 0  # start of text segment inside list
+    block_start = 0
+
+    def add_text(seg):
+        seg = _clean(seg)
+        if not seg:
+            return
+        if entries and entries[-1][2]:
+            e = entries[-1]
+            e[1] = (e[1] + "\n" + seg) if e[3] else e[1] + seg
+            e[3] = True
+        else:
+            entries.append([False, seg, False, True])
+
+    def close_current():
+        if entries:
+            entries[-1][2] = False
+
+    def render():
+        parts = []
+        prev = None
+        for is_enum, t, _, _ in entries:
+            if prev is not None:
+                parts.append("\n\n" if (prev and is_enum) else "\n")
+            parts.append(t.rstrip(" "))
+            prev = is_enum
+        return "".join(parts)
+
+    for m in _LIST_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        if _escaped(text, m.start()):
+            continue
+        tok = m.group(0)
+        if not stack:
+            if m.group(1) is None:
+                continue  # stray \item or \end outside lists
+            out.append(text[pos:m.start()])
+            block_start = m.start()
+        else:
+            add_text(text[seg_start:m.start()])
+        end = m.end()
+        if m.group(1):
+            kind = m.group(1)
+            frame = {"kind": kind, "num": 0, "depth": 0, "parent": None, "start": 1}
+            if kind == "enumerate":
+                if end < len(text) and text[end] == "[":
+                    om = _START_RE.match(text, end)
+                    if not om:
+                        raise ListError("Error: unsupported enumerate options")
+                    frame["start"] = int(om.group(1))
+                    end = om.end()
+                depth = 1
+                if stack and stack[-1]["kind"] == "enumerate":
+                    depth = stack[-1]["depth"] + 1
+                if depth > 2:
+                    raise ListError("Error: enumerate nesting deeper than one level")
+                frame["depth"] = depth
+                if depth == 2:
+                    parent = stack[-1]
+                    frame["parent"] = parent.get("last", parent["start"])
+            close_current()
+            stack.append(frame)
+        elif m.group(2):
+            kind = m.group(2)
+            if stack[-1]["kind"] != kind:
+                # mismatched end: treat as literal text
+                add_text(tok)
+                seg_start = end
+                pos = end
+                continue
+            close_current()
+            stack.pop()
+            if not stack:
+                out.append("\n" + render() + "\n")
+                entries = []
+        else:  # \item
+            close_current()
+            f = stack[-1]
+            if f["kind"] == "itemize":
+                entries.append([False, "-   ", True, False])
+            else:
+                cur = f["start"] + f["num"]
+                f["num"] += 1
+                if f["depth"] == 2:
+                    letter = chr(ord("a") + (cur - 1) % 26)
+                    label = "**%s.%s)** " % (f["parent"], letter)
+                else:
+                    f["last"] = cur
+                    label = "**%d.** " % cur
+                entries.append([True, label, True, False])
+        pos = end
+        seg_start = end
+    if stack:
+        add_text(text[seg_start:])
+        out.append("\n" + render() + "\n")
+    else:
+        out.append(text[pos:])
+    return "".join(out)
+
+
 def convert(text):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = remove_comments(text)
@@ -155,6 +276,7 @@ def convert(text):
     text = strip_lines(text)
     store = []
     text = convert_display_math(text, store)
+    text = convert_lists(text)
     text = convert_commands(text)
     text = delete_skips(text)
     text = re.sub(r"\x00M(\d+)\x00", lambda m: store[int(m.group(1))], text)
@@ -181,8 +303,13 @@ def main(argv=None):
             os.makedirs(parent, exist_ok=True)
     else:
         out_path = os.path.splitext(os.path.basename(args.input))[0] + ".md"
+    try:
+        result = convert(src)
+    except ListError as e:
+        sys.stderr.write(str(e) + "\n")
+        return 1
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(convert(src))
+        f.write(result)
     return 0
 
 
