@@ -9,6 +9,11 @@ Usage:
     python sith.py references <file> <line> <col> [--scope file|project] [--project DIR]
     python sith.py search <query> [--project DIR]
     python sith.py names <file> [--all-scopes] [--project DIR]
+    python sith.py rename <file> <line> <col> --new-name NAME [--diff] [--project DIR]
+    python sith.py inline <file> <line> <col> [--diff] [--project DIR]
+    python sith.py extract-variable <file> <line> <col> --until L:C --name NAME [--diff] [--project DIR]
+    python sith.py extract-function <file> <line> <col> --until L:C --name NAME [--diff] [--project DIR]
+    python sith.py errors <file>
 """
 import ast
 import builtins
@@ -5328,6 +5333,22 @@ def _occ_out(mi, occ):
 
 
 def references(path, line_no, col, scope):
+    mi, occ, hits = find_reference_occs(path, line_no, col, scope)
+    results = {}
+    for m, o in hits:
+        r = _occ_out(m, o)
+        key = (r['module_path'], r['line'], r['column'])
+        if key in results:
+            results[key]['is_definition'] = results[key]['is_definition'] or r['is_definition']
+        else:
+            results[key] = r
+    out = list(results.values())
+    out.sort(key=lambda r: (r['module_path'], r['line'], r['column']))
+    return out
+
+
+def find_reference_occs(path, line_no, col, scope):
+    """Returns (target module, cursor occurrence, [(module, occurrence), ...])."""
     reset_state()
     _deadline[0] = time.time() + 30
     mi, lines = load_target(path, line_no, col)
@@ -5346,9 +5367,10 @@ def references(path, line_no, col, scope):
             m = load_project_module(p)
             if m is not None and m.tree is not None:
                 modules.append(m)
-    results = {}
+    hits = []
     for m in modules:
         occs, pars = _all_occurrences(m)
+        m._ref_parents = pars
         for o in occs:
             if o.name != name or o.kind == 'const':
                 continue
@@ -5359,15 +5381,10 @@ def references(path, line_no, col, scope):
             else:
                 hit = False
             if hit:
-                r = _occ_out(m, o)
-                key = (r['module_path'], r['line'], r['column'])
-                if key in results:
-                    results[key]['is_definition'] = results[key]['is_definition'] or r['is_definition']
-                else:
-                    results[key] = r
-    out = list(results.values())
-    out.sort(key=lambda r: (r['module_path'], r['line'], r['column']))
-    return out
+                hits.append((m, o))
+    mi._ref_target = target
+    mi._ref_parents = parents
+    return mi, occ, hits
 
 
 # ---------------------------------------------------------------------------
@@ -5474,16 +5491,1198 @@ def names(path, all_scopes):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Refactoring
+# ---------------------------------------------------------------------------
+
+class RefactorError(SithError):
+    pass
+
+
+class _Doc(object):
+    """Original text of a file plus a list of pending edits."""
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.text = read_source(self.path)
+        self.lines = self.text.split('\n')
+        self.starts = []
+        o = 0
+        for l in self.lines:
+            self.starts.append(o)
+            o += len(l) + 1
+        self.edits = []
+
+    def line(self, ln):
+        if 1 <= ln <= len(self.lines):
+            return self.lines[ln - 1].rstrip('\r')
+        return ''
+
+    def off(self, ln, ccol):
+        """Absolute offset of a (1-based line, character column) position."""
+        if ln < 1:
+            return 0
+        if ln > len(self.lines):
+            return len(self.text)
+        return self.starts[ln - 1] + max(0, min(ccol, len(self.line(ln))))
+
+    def boff(self, ln, bcol):
+        if ln < 1 or ln > len(self.lines):
+            return self.off(ln, 0)
+        b = self.line(ln).encode('utf-8')
+        return self.starts[ln - 1] + len(b[:bcol].decode('utf-8', errors='ignore'))
+
+    def node_start(self, node):
+        return self.boff(node.lineno, node.col_offset)
+
+    def node_end(self, node):
+        return self.boff(node.end_lineno, node.end_col_offset)
+
+    def pos_of(self, off):
+        import bisect
+        i = bisect.bisect_right(self.starts, off) - 1
+        return i + 1, off - self.starts[i]
+
+    def line_start(self, ln):
+        return self.off(ln, 0)
+
+    def line_end(self, ln):
+        """Offset just after the newline ending line ln (or end of text)."""
+        if ln >= len(self.lines):
+            return len(self.text)
+        return self.starts[ln]
+
+    def replace(self, a, b, text):
+        self.edits.append((a, b, text))
+
+    def new_text(self):
+        out = self.text
+        eds = sorted(set(self.edits), key=lambda e: (e[0], e[1]))
+        for i in range(1, len(eds)):
+            if eds[i][0] < eds[i - 1][1]:
+                raise RefactorError('overlapping edits')
+        for a, b, t in reversed(eds):
+            out = out[:a] + t + out[b:]
+        return out
+
+
+def _check_ident(name):
+    if not name or not _is_ident(name):
+        raise RefactorError('invalid identifier: %r' % (name,))
+
+
+def _rel(path):
+    return rel_module_path(path)
+
+
+def _unified_diff(old, new, from_p, to_p):
+    import difflib
+    old_lines = old.splitlines(True) or ['']
+    new_lines = new.splitlines(True) or ['']
+    if old_lines[-1] and not old_lines[-1].endswith('\n'):
+        old_lines[-1] += '\n'
+    if new_lines[-1] and not new_lines[-1].endswith('\n'):
+        new_lines[-1] += '\n'
+    old_lines = [l for l in old_lines if l]
+    new_lines = [l for l in new_lines if l]
+    return ''.join(difflib.unified_diff(old_lines, new_lines, fromfile=from_p, tofile=to_p))
+
+
+def _map_renamed(path, renames):
+    for old, new in renames:
+        if path == old:
+            return new
+        if path.startswith(old + os.sep):
+            return new + path[len(old):]
+    return path
+
+
+def refactor_result(docs, renames=()):
+    """Build {'changed_files':..., 'renames':...} plus a diff text."""
+    changed = {}
+    diff_parts = []
+    for old, new in renames:
+        diff_parts.append('rename from %s\nrename to %s\n' % (_rel(old), _rel(new)))
+    for path in sorted(docs):
+        d = docs[path]
+        nt = d.new_text()
+        if nt == d.text:
+            continue
+        changed[_rel(path)] = nt
+        diff_parts.append(_unified_diff(d.text, nt, _rel(path), _rel(_map_renamed(path, renames))))
+    ren = dict((_rel(o), _rel(n)) for o, n in renames)
+    return {'changed_files': changed, 'renames': ren}, ''.join(diff_parts)
+
+
+def _get_doc(docs, path):
+    path = os.path.abspath(path)
+    if path not in docs:
+        docs[path] = _Doc(path)
+    return docs[path]
+
+
+def _parents_of(tree):
+    par = {}
+    for node in ast.walk(tree):
+        for c in ast.iter_child_nodes(node):
+            par[c] = node
+    return par
+
+
+def _strict_parse(doc):
+    try:
+        return ast.parse(doc.text)
+    except (SyntaxError, ValueError) as e:
+        raise RefactorError('cannot refactor a file with syntax errors: %s' % getattr(e, 'msg', e))
+
+
+# --- rename -------------------------------------------------------------------
+
+def _module_target(mi, occ, keys):
+    """Path of the local module/package the cursor names (or None)."""
+    for k in keys:
+        if k[0] != 'mod':
+            continue
+        p = k[1]
+        if os.path.isdir(p):
+            base = os.path.basename(p.rstrip(os.sep))
+        elif os.path.basename(p) in ('__init__.py', '__init__.pyi'):
+            base = os.path.basename(os.path.dirname(p))
+        else:
+            base = os.path.splitext(os.path.basename(p))[0]
+        if base == occ.name and occ.kind != 'importas':
+            return p
+    return None
+
+
+def _name_collides(m, o, pars, new_name):
+    try:
+        node = o.node
+        if o.kind == 'attr':
+            s = scope_of_node(m, node, pars)
+            for v in infer_vals(node.value, s, _start(node)):
+                if isinstance(v, (ClassVal, InstVal)):
+                    cls = v if isinstance(v, ClassVal) else v.cls
+                    if class_attr_map(cls, True).get(new_name) or class_attr_map(cls, False).get(new_name):
+                        return True
+                elif isinstance(v, ModVal) and v.local is not None:
+                    if v.local.attr_defs(new_name):
+                        return True
+            return False
+        if o.kind == 'keyword':
+            return False
+        if o.kind == 'defname' and node in pars:
+            s = scope_of_node(m, pars[node], pars)
+        else:
+            s = scope_of_node(m, node, pars)
+        if s is None:
+            return False
+        if o.kind == 'arg':
+            fs = m.node_scope.get(pars.get(pars.get(node)))
+            if fs is not None and new_name in fs.defs:
+                return True
+        if new_name in s.defs:
+            return True
+        return bool(lookup_defs(new_name, s, INF_POS))
+    except RecursionError:
+        return False
+
+
+def rename(path, line_no, col, new_name):
+    _check_ident(new_name)
+    mi, occ, hits = find_reference_occs(path, line_no, col, 'project')
+    keys = mi._ref_target
+    if keys and all(k[0] in ('builtin', 'ext') for k in keys):
+        raise RefactorError('cannot rename a builtin or external name: %s' % occ.name)
+    old = occ.name
+    docs = {}
+    renames = []
+    modpath = _module_target(mi, occ, keys)
+    if modpath is not None:
+        if os.path.isdir(modpath) or os.path.basename(modpath) in ('__init__.py', '__init__.pyi'):
+            src = modpath.rstrip(os.sep) if os.path.isdir(modpath) else os.path.dirname(modpath)
+            dst = os.path.join(os.path.dirname(src), new_name)
+        else:
+            ext = os.path.splitext(modpath)[1]
+            src = modpath
+            dst = os.path.join(os.path.dirname(src), new_name + ext)
+        if src != dst:
+            par = os.path.dirname(src)
+            if os.path.exists(dst) or os.path.exists(os.path.join(par, new_name + '.py')) \
+                    or os.path.isdir(os.path.join(par, new_name)):
+                raise RefactorError('cannot rename module %r: %r already exists' % (old, _rel(dst)))
+            renames.append((src, dst))
+            # Keep a stub next to a renamed module in sync.
+            if not os.path.isdir(src) and src.endswith('.py') and os.path.isfile(src + 'i'):
+                renames.append((src + 'i', dst + 'i'))
+    else:
+        only_mod = keys and all(k[0] == 'mod' for k in keys)
+        if only_mod:
+            hits = [(m, o) for m, o in hits if m is mi]
+        if new_name != old:
+            for m, o in hits:
+                if _name_collides(m, o, getattr(m, '_ref_parents', {}), new_name):
+                    raise RefactorError('new name %r collides with an existing name in scope (%s:%d)'
+                                        % (new_name, _rel(m.path), o.line))
+    if new_name != old:
+        seen = set()
+        for m, o in hits:
+            if m.namespace:
+                continue
+            k = (m.path, o.line, o.bcol)
+            if k in seen:
+                continue
+            seen.add(k)
+            d = _get_doc(docs, m.path)
+            a = d.boff(o.line, o.bcol)
+            b = d.boff(o.line, o.bcol + len(old.encode('utf-8')))
+            if d.text[a:b] != old:
+                continue
+            d.replace(a, b, new_name)
+    return refactor_result(docs, renames)
+
+
+# --- precedence ---------------------------------------------------------------
+
+_ATOM = 16
+
+_BINOP_PREC = {ast.BitOr: 7, ast.BitXor: 8, ast.BitAnd: 9, ast.LShift: 10, ast.RShift: 10,
+               ast.Add: 11, ast.Sub: 11, ast.Mult: 12, ast.MatMult: 12, ast.Div: 12,
+               ast.FloorDiv: 12, ast.Mod: 12, ast.Pow: 14}
+
+
+def _expr_prec(node):
+    if isinstance(node, (ast.NamedExpr, ast.Tuple, ast.Yield, ast.YieldFrom, ast.Starred)):
+        return 0
+    if isinstance(node, ast.Lambda):
+        return 1
+    if isinstance(node, ast.IfExp):
+        return 2
+    if isinstance(node, ast.BoolOp):
+        return 3 if isinstance(node.op, ast.Or) else 4
+    if isinstance(node, ast.UnaryOp):
+        return 5 if isinstance(node.op, ast.Not) else 13
+    if isinstance(node, ast.Compare):
+        return 6
+    if isinstance(node, ast.BinOp):
+        return _BINOP_PREC.get(type(node.op), 12)
+    if isinstance(node, ast.Await):
+        return 15
+    return _ATOM
+
+
+def _required_prec(node, parent):
+    """Minimum precedence an expression replacing `node` needs to keep its meaning."""
+    if parent is None:
+        return 1
+    if isinstance(parent, ast.BinOp):
+        p = _BINOP_PREC.get(type(parent.op), 12)
+        if isinstance(parent.op, ast.Pow):
+            return 15 if node is parent.left else 13
+        return p if node is parent.left else p + 1
+    if isinstance(parent, ast.UnaryOp):
+        return 5 if isinstance(parent.op, ast.Not) else 13
+    if isinstance(parent, ast.BoolOp):
+        return (3 if isinstance(parent.op, ast.Or) else 4) + 1
+    if isinstance(parent, ast.Compare):
+        return 7
+    if isinstance(parent, ast.IfExp):
+        return 2 if node is parent.orelse else 3
+    if isinstance(parent, ast.Await):
+        return _ATOM
+    if isinstance(parent, (ast.Attribute, ast.Subscript)) and node is parent.value:
+        return _ATOM
+    if isinstance(parent, ast.Call) and node is parent.func:
+        return _ATOM
+    if isinstance(parent, ast.Starred):
+        return 7
+    if isinstance(parent, ast.comprehension) and node is not parent.target:
+        return 3
+    if isinstance(parent, ast.FormattedValue):
+        return 3
+    if isinstance(parent, (ast.Dict,)) or isinstance(parent, ast.keyword) and parent.arg is None:
+        return 7 if isinstance(parent, ast.keyword) else 1
+    return 1
+
+
+def _wrapped_in_parens(code):
+    """True if code (already blanked) is enclosed in one pair of matching brackets."""
+    code = code.strip()
+    if len(code) < 2 or code[0] != '(' or code[-1] != ')':
+        return False
+    depth = 0
+    for i, c in enumerate(code):
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if depth == 0 and i != len(code) - 1:
+                return False
+    return True
+
+
+def _is_bracketed(code):
+    code = code.strip()
+    if len(code) < 2 or code[0] not in '([{':
+        return False
+    close = {'(': ')', '[': ']', '{': '}'}[code[0]]
+    if code[-1] != close:
+        return False
+    depth = 0
+    for i, c in enumerate(code):
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if depth == 0 and i != len(code) - 1:
+                return False
+    return True
+
+
+# --- inline -------------------------------------------------------------------
+
+def _value_text(doc, stmt, value):
+    """Source of an assignment's value, including any parentheses around it."""
+    a = doc.node_start(value)
+    b = doc.node_end(value)
+    code = blank_code(doc.text)
+    lo = doc.node_start(stmt)
+    hi = doc.node_end(stmt)
+    while True:
+        i = a - 1
+        while i > lo and code[i] in ' \t\\\r\n':
+            i -= 1
+        j = b
+        while j < hi and code[j] in ' \t\\\r\n':
+            j += 1
+        if i >= lo and j < hi and code[i] == '(' and code[j] == ')':
+            a, b = i, j + 1
+        else:
+            break
+    return doc.text[a:b], code[a:b]
+
+
+def _block_of(stmt, parents):
+    par = parents.get(stmt)
+    if par is None:
+        return None
+    for field in ('body', 'orelse', 'finalbody', 'handlers'):
+        lst = getattr(par, field, None)
+        if isinstance(lst, list) and stmt in lst:
+            return lst
+    return None
+
+
+def _remove_stmt(doc, stmt, parents):
+    """Delete a simple statement from the document."""
+    a = doc.node_start(stmt)
+    b = doc.node_end(stmt)
+    code = blank_code(doc.text)
+    ls = doc.line_start(stmt.lineno)
+    before = code[ls:a]
+    j = b
+    while j < len(code) and code[j] in ' \t':
+        j += 1
+    has_semi_after = j < len(code) and code[j] == ';'
+    block = _block_of(stmt, parents)
+    if block is not None and len(block) == 1:
+        doc.replace(a, b, 'pass')
+        return
+    if before.strip() == '':
+        if has_semi_after:
+            k = j + 1
+            while k < len(code) and code[k] in ' \t':
+                k += 1
+            doc.replace(a, k, '')
+            return
+        # whole line(s)
+        le = doc.line_end(stmt.end_lineno)
+        rest = code[b:le].strip()
+        if rest == '' or rest.startswith('#') or set(rest) <= set(' '):
+            doc.replace(ls, le, '')
+        else:
+            doc.replace(a, b, '')
+        return
+    # something precedes on the same line, i.e. "...; x = 1"
+    k = a - 1
+    while k > ls and code[k] in ' \t':
+        k -= 1
+    if code[k] == ';':
+        doc.replace(k, b, '')
+    else:
+        doc.replace(a, b, '')
+
+
+def inline(path, line_no, col):
+    mi, occ, hits = find_reference_occs(path, line_no, col, 'project')
+    defs = []
+    refs = []
+    for m, o in hits:
+        if o.kind == 'defname':
+            raise RefactorError('cannot inline a function/class definition')
+        if occ_is_definition(m, o):
+            defs.append((m, o))
+        elif o.kind in ('name', 'attr'):
+            refs.append((m, o))
+    if not defs:
+        raise RefactorError('no definition found to inline')
+    for m, o in defs:
+        if o.kind == 'arg':
+            raise RefactorError('cannot inline a parameter')
+        if o.kind in ('importname', 'importas', 'importmod'):
+            raise RefactorError('cannot inline an import')
+        if o.kind != 'name' and o.kind != 'attr':
+            raise RefactorError('cannot inline this name')
+    if len(defs) > 1:
+        raise RefactorError('cannot inline a name with multiple definitions')
+    dm, do = defs[0]
+    pars = getattr(dm, '_ref_parents', {})
+    stmt = pars.get(do.node)
+    if isinstance(stmt, ast.Assign):
+        if len(stmt.targets) != 1 or stmt.targets[0] is not do.node:
+            raise RefactorError('cannot inline a statement with multiple definitions')
+        value = stmt.value
+    elif isinstance(stmt, ast.AnnAssign) and stmt.target is do.node:
+        if stmt.value is None:
+            raise RefactorError('cannot inline a statement that is defined by an annotation')
+        value = stmt.value
+    else:
+        raise RefactorError('can only inline a simple assignment (x = <expr>)')
+    if not refs:
+        raise RefactorError('name has no references to inline')
+    docs = {}
+    ddoc = _get_doc(docs, dm.path)
+    vtext, vcode = _value_text(ddoc, stmt, value)
+    if _wrapped_in_parens(vcode) or _is_bracketed(vcode):
+        prec = _ATOM
+    else:
+        prec = _expr_prec(value)
+    multiline = '\n' in vtext
+    if multiline and prec != _ATOM:
+        vtext = '(' + vtext + ')'
+        prec = _ATOM
+    is_number = isinstance(value, ast.Constant) and isinstance(value.value, (int, float, complex)) \
+        and not isinstance(value.value, bool) and prec == _ATOM and not vcode.strip().startswith('(')
+    for m, o in refs:
+        d = _get_doc(docs, m.path)
+        mp = getattr(m, '_ref_parents', {})
+        node = o.node
+        parent = mp.get(node)
+        need = _required_prec(node, parent)
+        s = vtext
+        if prec < need or (is_number and isinstance(parent, ast.Attribute) and node is parent.value):
+            s = '(' + vtext + ')'
+        d.replace(d.node_start(node), d.node_end(node), s)
+    _remove_stmt(ddoc, stmt, pars)
+    return refactor_result(docs)
+
+
+# --- extract variable ---------------------------------------------------------
+
+def _parse_until(text):
+    try:
+        a, b = text.split(':', 1)
+        return int(a), int(b)
+    except (ValueError, AttributeError):
+        raise RefactorError('--until must be <line>:<col>')
+
+
+def _check_pos(doc, ln, col, what):
+    if ln < 1 or ln > len(doc.lines):
+        raise RefactorError('%s line out of range' % what)
+    if col < 0 or col > len(doc.line(ln)):
+        raise RefactorError('%s column out of range' % what)
+
+
+def _selection(doc, line_no, col, until):
+    ul, uc = until
+    _check_pos(doc, line_no, col, 'start')
+    _check_pos(doc, ul, uc, 'end')
+    a = doc.off(line_no, col)
+    b = doc.off(ul, uc)
+    if b < a:
+        a, b = b, a
+    return a, b
+
+
+def _bound_names(node):
+    """Names bound inside a lambda/comprehension node (its own scope)."""
+    out = set()
+    if isinstance(node, ast.Lambda):
+        a = node.args
+        for p in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg]:
+            if p is not None:
+                out.add(p.arg)
+    elif isinstance(node, COMP_TYPES):
+        for g in node.generators:
+            for n in ast.walk(g.target):
+                if isinstance(n, ast.Name):
+                    out.add(n.id)
+    return out
+
+
+def _enclosing_stmt(node, parents):
+    n = node
+    while n is not None and not isinstance(n, ast.stmt):
+        n = parents.get(n)
+    return n
+
+
+def extract_variable(path, line_no, col, until, name):
+    _check_ident(name)
+    doc = _Doc(path)
+    tree = _strict_parse(doc)
+    a, b = _selection(doc, line_no, col, until)
+    code = blank_code(doc.text)
+    while a < b and code[a] in ' \t\r\n\\':
+        a += 1
+    while b > a and code[b - 1] in ' \t\r\n\\':
+        b -= 1
+    if a >= b:
+        raise RefactorError('selection is not a complete expression')
+    parents = _parents_of(tree)
+    spans = [(a, b)]
+    # Selection with surrounding parentheses: also try the inner expression.
+    aa, bb = a, b
+    while _wrapped_in_parens(code[aa:bb]):
+        aa += 1
+        bb -= 1
+        while aa < bb and code[aa] in ' \t\r\n\\':
+            aa += 1
+        while bb > aa and code[bb - 1] in ' \t\r\n\\':
+            bb -= 1
+        spans.append((aa, bb))
+    found = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.expr) or not hasattr(node, 'end_lineno'):
+            continue
+        sp = (doc.node_start(node), doc.node_end(node))
+        if sp in spans:
+            found = node
+            break
+    if found is None:
+        raise RefactorError('selection is not a complete expression')
+    node = found
+    if isinstance(getattr(node, 'ctx', None), (ast.Store, ast.Del)):
+        raise RefactorError('cannot extract an assignment target')
+    if isinstance(node, (ast.Starred, ast.Slice)):
+        raise RefactorError('selection is not a complete expression')
+    par = parents.get(node)
+    if isinstance(par, (ast.JoinedStr,)):
+        raise RefactorError('selection is not a complete expression')
+    # Names bound by enclosing lambdas / comprehensions cannot be extracted.
+    used = set(n.id for n in ast.walk(node) if isinstance(n, ast.Name))
+    p = par
+    while p is not None and not isinstance(p, ast.stmt):
+        if isinstance(p, (ast.Lambda,) + COMP_TYPES) and used & _bound_names(p):
+            raise RefactorError('cannot extract an expression using names local to a lambda/comprehension')
+        p = parents.get(p)
+    stmt = _enclosing_stmt(node, parents)
+    if stmt is None:
+        raise RefactorError('selection is not inside a statement')
+    # elif headers: insert before the whole if/elif chain
+    while isinstance(stmt, ast.If):
+        up = parents.get(stmt)
+        if isinstance(up, ast.If) and up.orelse == [stmt] and doc.line(stmt.lineno).lstrip().startswith('elif'):
+            stmt = up
+        else:
+            break
+    expr_text = doc.text[a:b]
+    expr_code = code[a:b]
+    if (node is found and (a, b) == spans[0]) and not (_is_bracketed(expr_code)):
+        if '\n' in expr_text or isinstance(node, (ast.NamedExpr,)):
+            expr_text = '(' + expr_text + ')'
+    start_line = stmt.lineno
+    start_off = doc.node_start(stmt)
+    decos = getattr(stmt, 'decorator_list', None)
+    if decos:
+        dl = min(dd.lineno for dd in decos)
+        start_line = dl
+        # the '@' precedes the decorator expression
+        ls = doc.line_start(dl)
+        start_off = ls + leading_ws(doc.line(dl))
+    ls = doc.line_start(start_line)
+    docs = {doc.path: doc}
+    if code[ls:start_off].strip() == '':
+        indent = doc.line(start_line)[:leading_ws(doc.line(start_line))]
+        doc.replace(ls, ls, '%s%s = %s\n' % (indent, name, expr_text))
+    else:
+        doc.replace(start_off, start_off, '%s = %s; ' % (name, expr_text))
+    doc.replace(a, b, name)
+    return refactor_result(docs)
+
+
+# --- extract function ---------------------------------------------------------
+
+_BODY_FIELDS = ('body', 'orelse', 'finalbody')
+
+
+def _sub_bodies(st):
+    out = []
+    for f in _BODY_FIELDS:
+        lst = getattr(st, f, None)
+        if isinstance(lst, list) and lst and isinstance(lst[0], ast.stmt):
+            out.append(lst)
+    for h in getattr(st, 'handlers', None) or []:
+        out.append(h.body)
+    for c in getattr(st, 'cases', None) or []:
+        out.append(c.body)
+    return out
+
+
+def _stmt_span(doc, st):
+    a = doc.node_start(st)
+    decos = getattr(st, 'decorator_list', None)
+    if decos:
+        dl = min(d.lineno for d in decos)
+        a = min(a, doc.line_start(dl) + leading_ws(doc.line(dl)))
+    return a, doc.node_end(st)
+
+
+def _find_selected_stmts(doc, tree, a, b):
+    code = blank_code(doc.text)
+    body = tree.body
+    while True:
+        over = []
+        for st in body:
+            sa, sb = _stmt_span(doc, st)
+            if sa < b and sb > a:
+                over.append((st, sa, sb))
+        if not over:
+            raise RefactorError('selection does not contain any statements')
+        full = [sa >= a and sb <= b + (1 if sb - 1 >= a else 0) for st, sa, sb in over]
+        if all(full):
+            break
+        if len(over) == 1:
+            st = over[0][0]
+            sub = None
+            for lst in _sub_bodies(st):
+                lo = _stmt_span(doc, lst[0])[0]
+                hi = _stmt_span(doc, lst[-1])[1]
+                if lo < b and hi > a:
+                    if sub is not None:
+                        raise RefactorError('selection is not a complete set of statements')
+                    sub = lst
+            if sub is None:
+                raise RefactorError('selection is not a complete set of statements')
+            body = sub
+            continue
+        raise RefactorError('selection is not a complete set of statements')
+    stmts = [o[0] for o in over]
+    first_a = over[0][1]
+    last_b = max(over[-1][2], over[-1][1])
+    if code[min(a, first_a):first_a].strip() not in ('',) or code[last_b:max(b, last_b)].strip(' \t\r\n;') != '':
+        raise RefactorError('selection is not a complete set of statements')
+    # Whole lines only: nothing else may share the first/last line.
+    ls = doc.line_start(stmts[0].lineno if not getattr(stmts[0], 'decorator_list', None)
+                        else doc.pos_of(first_a)[0])
+    if code[ls:first_a].strip() != '':
+        raise RefactorError('selection must span complete lines')
+    le = doc.line_end(stmts[-1].end_lineno)
+    if code[last_b:le].strip() != '':
+        raise RefactorError('selection must span complete lines')
+    return stmts, body, first_a, last_b
+
+
+class _NameFlow(object):
+    """Walks statements in evaluation order collecting reads/writes."""
+
+    def __init__(self):
+        self.events = []   # (kind, name, node) with kind in 'load'/'store'
+
+    def load(self, name, node):
+        self.events.append(('load', name, node))
+
+    def store(self, name, node):
+        self.events.append(('store', name, node))
+
+    def target(self, t):
+        if isinstance(t, ast.Name):
+            if isinstance(t.ctx, ast.Del):
+                return
+            self.store(t.id, t)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                self.target(e)
+        elif isinstance(t, ast.Starred):
+            self.target(t.value)
+        else:
+            self.expr(t)
+
+    def nested_free(self, node, bound):
+        stores = set(bound)
+        loads = []
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name):
+                if isinstance(n.ctx, ast.Load):
+                    loads.append(n)
+                else:
+                    stores.add(n.id)
+            elif isinstance(n, ast.arg):
+                stores.add(n.arg)
+            elif isinstance(n, FUNC_TYPES + (ast.ClassDef,)) and n is not node:
+                stores.add(n.name)
+        for n in sorted(loads, key=lambda x: (x.lineno, x.col_offset)):
+            if n.id not in stores:
+                self.load(n.id, n)
+
+    def expr(self, n):
+        if n is None:
+            return
+        if isinstance(n, ast.Name):
+            if isinstance(n.ctx, ast.Load):
+                self.load(n.id, n)
+            else:
+                self.store(n.id, n)
+            return
+        if isinstance(n, ast.NamedExpr):
+            self.expr(n.value)
+            self.target(n.target)
+            return
+        if isinstance(n, ast.Lambda):
+            for d in n.args.defaults + [x for x in n.args.kw_defaults if x is not None]:
+                self.expr(d)
+            self.nested_free(n.body, _bound_names(n))
+            return
+        if isinstance(n, COMP_TYPES):
+            self.expr(n.generators[0].iter)
+            parts = [g for g in n.generators]
+            bound = _bound_names(n)
+            for i, g in enumerate(parts):
+                if i:
+                    self.nested_free(g.iter, bound)
+                for c in g.ifs:
+                    self.nested_free(c, bound)
+            if isinstance(n, ast.DictComp):
+                self.nested_free(n.key, bound)
+                self.nested_free(n.value, bound)
+            else:
+                self.nested_free(n.elt, bound)
+            return
+        for c in ast.iter_child_nodes(n):
+            if isinstance(c, ast.expr):
+                self.expr(c)
+            elif isinstance(c, ast.keyword):
+                self.expr(c.value)
+            elif isinstance(c, ast.comprehension):
+                pass
+            else:
+                for cc in ast.walk(c):
+                    if isinstance(cc, ast.expr):
+                        self.expr(cc)
+                        break
+
+    def stmts(self, lst):
+        for s in lst:
+            self.stmt(s)
+
+    def stmt(self, s):
+        if isinstance(s, ast.Assign):
+            self.expr(s.value)
+            for t in s.targets:
+                self.target(t)
+        elif isinstance(s, ast.AugAssign):
+            if isinstance(s.target, ast.Name):
+                self.load(s.target.id, s.target)
+            else:
+                self.expr(s.target)
+            self.expr(s.value)
+            if isinstance(s.target, ast.Name):
+                self.store(s.target.id, s.target)
+        elif isinstance(s, ast.AnnAssign):
+            self.expr(s.value)
+            if s.value is not None or not isinstance(s.target, ast.Name):
+                self.target(s.target)
+        elif isinstance(s, (ast.For, ast.AsyncFor)):
+            self.expr(s.iter)
+            self.target(s.target)
+            self.stmts(s.body)
+            self.stmts(s.orelse)
+        elif isinstance(s, (ast.While, ast.If)):
+            self.expr(s.test)
+            self.stmts(s.body)
+            self.stmts(s.orelse)
+        elif isinstance(s, (ast.With, ast.AsyncWith)):
+            for it in s.items:
+                self.expr(it.context_expr)
+                if it.optional_vars is not None:
+                    self.target(it.optional_vars)
+            self.stmts(s.body)
+        elif isinstance(s, ast.Try) or (hasattr(ast, 'TryStar') and isinstance(s, ast.TryStar)):
+            self.stmts(s.body)
+            for h in s.handlers:
+                self.expr(h.type)
+                if h.name:
+                    self.store(h.name, h)
+                self.stmts(h.body)
+            self.stmts(s.orelse)
+            self.stmts(s.finalbody)
+        elif isinstance(s, FUNC_TYPES):
+            for d in s.decorator_list:
+                self.expr(d)
+            a = s.args
+            for d in a.defaults + [x for x in a.kw_defaults if x is not None]:
+                self.expr(d)
+            bound = set(p.arg for p in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg]
+                        if p is not None)
+            for st in s.body:
+                self.nested_free(st, bound)
+            self.store(s.name, s)
+        elif isinstance(s, ast.ClassDef):
+            for d in s.decorator_list:
+                self.expr(d)
+            for e in s.bases:
+                self.expr(e)
+            for k in s.keywords:
+                self.expr(k.value)
+            for st in s.body:
+                self.nested_free(st, set())
+            self.store(s.name, s)
+        elif isinstance(s, (ast.Import, ast.ImportFrom)):
+            for al in s.names:
+                if al.name == '*':
+                    continue
+                nm = al.asname or al.name.split('.')[0]
+                self.store(nm, s)
+        elif isinstance(s, (ast.Global, ast.Nonlocal)):
+            pass
+        elif isinstance(s, ast.Delete):
+            for t in s.targets:
+                if not isinstance(t, ast.Name):
+                    self.expr(t)
+        elif hasattr(ast, 'Match') and isinstance(s, ast.Match):
+            self.expr(s.subject)
+            for c in s.cases:
+                for n in ast.walk(c.pattern):
+                    if isinstance(n, ast.expr):
+                        self.expr(n)
+                    nm = getattr(n, 'name', None) if not isinstance(n, ast.expr) else None
+                    if isinstance(nm, str):
+                        self.store(nm, n)
+                    if isinstance(n, ast.MatchMapping) and n.rest:
+                        self.store(n.rest, n)
+                self.expr(c.guard)
+                self.stmts(c.body)
+        else:
+            for c in ast.iter_child_nodes(s):
+                if isinstance(c, ast.expr):
+                    self.expr(c)
+
+
+def _walk_no_scopes(nodes):
+    """Walk nodes without descending into nested functions/classes/lambdas."""
+    stack = list(nodes)
+    while stack:
+        n = stack.pop()
+        yield n
+        for c in ast.iter_child_nodes(n):
+            if isinstance(c, FUNC_TYPES + (ast.ClassDef, ast.Lambda)):
+                continue
+            stack.append(c)
+
+
+def _func_locals(fn):
+    """Names local to function fn (parameters and assigned names)."""
+    a = fn.args
+    out = set(p.arg for p in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg] if p is not None)
+    declared = set()
+    for n in _walk_no_scopes(fn.body):
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            declared.update(n.names)
+    flow = _NameFlow()
+    flow.stmts(fn.body)
+    for kind, nm, node in flow.events:
+        if kind == 'store':
+            out.add(nm)
+    return out - declared
+
+
+def _module_names(tree):
+    flow = _NameFlow()
+    flow.stmts(tree.body)
+    return set(nm for kind, nm, node in flow.events if kind == 'store')
+
+
+def _deco_name(d):
+    if isinstance(d, ast.Name):
+        return d.id
+    if isinstance(d, ast.Attribute):
+        return d.attr
+    return None
+
+
+def extract_function(path, line_no, col, until, name):
+    _check_ident(name)
+    doc = _Doc(path)
+    tree = _strict_parse(doc)
+    a, b = _selection(doc, line_no, col, until)
+    parents = _parents_of(tree)
+    stmts, body, first_a, last_b = _find_selected_stmts(doc, tree, a, b)
+    # Enclosing function / class.
+    container = None
+    p = parents.get(stmts[0])
+    while p is not None:
+        if isinstance(p, FUNC_TYPES + (ast.ClassDef,)):
+            container = p
+            break
+        p = parents.get(p)
+    sel_nodes = set()
+    for st in stmts:
+        for n in ast.walk(st):
+            sel_nodes.add(n)
+    # Control-flow checks.
+    last = stmts[-1]
+    ends_with_return = isinstance(last, ast.Return)
+    loops_inside = set()
+    for n in _walk_no_scopes(stmts):
+        if isinstance(n, (ast.For, ast.AsyncFor, ast.While)):
+            for c in _walk_no_scopes(n.body + n.orelse):
+                loops_inside.add(c)
+    for n in _walk_no_scopes(stmts):
+        if isinstance(n, ast.Return) and not (ends_with_return and n is last):
+            raise RefactorError('cannot extract a return statement that is not the last selected statement')
+        if isinstance(n, (ast.Yield, ast.YieldFrom)):
+            raise RefactorError('cannot extract code containing yield')
+        if isinstance(n, (ast.Break, ast.Continue)) and n not in loops_inside:
+            raise RefactorError('cannot extract break/continue outside of a selected loop')
+    is_async = any(isinstance(n, (ast.Await, ast.AsyncFor, ast.AsyncWith)) for n in _walk_no_scopes(stmts))
+    # Which names are "outside" variables?
+    fn = container if isinstance(container, FUNC_TYPES) else None
+    if fn is not None:
+        outer = _func_locals(fn)
+    elif container is None:
+        outer = _module_names(tree)
+    else:
+        outer = set()
+        f2 = _NameFlow()
+        f2.stmts(container.body)
+        outer = set(nm for k, nm, nd in f2.events if k == 'store')
+    flow = _NameFlow()
+    flow.stmts(stmts)
+    assigned = set()
+    param_first = {}
+    stored_order = []
+    for kind, nm, node in flow.events:
+        if kind == 'load':
+            if nm in assigned or nm in param_first:
+                continue
+            if nm in outer or (container is None and not hasattr(builtins, nm)):
+                pos = (getattr(node, 'lineno', 0), getattr(node, 'col_offset', 0))
+                param_first[nm] = pos
+        else:
+            assigned.add(nm)
+            if nm not in stored_order:
+                stored_order.append(nm)
+    # first appearance in source order
+    first_seen = {}
+    for n in ast.walk(ast.Module(body=list(stmts), type_ignores=[])):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in param_first:
+            pos = (n.lineno, n.col_offset)
+            if n.id not in first_seen or pos < first_seen[n.id]:
+                first_seen[n.id] = pos
+    params = sorted(param_first, key=lambda k: first_seen.get(k, param_first[k]))
+    # Return values: assigned here and read after the selection.
+    scope_root = fn if fn is not None else (container if container is not None else tree)
+    after = set()
+    sel_end = (stmts[-1].end_lineno, stmts[-1].end_col_offset)
+    for n in ast.walk(scope_root):
+        if n in sel_nodes:
+            continue
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and (n.lineno, n.col_offset) > sel_end:
+            after.add(n.id)
+        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and \
+                (n.lineno, n.col_offset) > sel_end:
+            after.add(n.target.id)
+    # Loops: names read earlier in an enclosing loop body are also live.
+    p = parents.get(stmts[0])
+    while p is not None and p is not scope_root:
+        if isinstance(p, (ast.For, ast.AsyncFor, ast.While)):
+            for n in ast.walk(p):
+                if n not in sel_nodes and isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    after.add(n.id)
+        p = parents.get(p)
+    returns = [] if ends_with_return else [nm for nm in stored_order if nm in after]
+    # Method handling.
+    self_name = None
+    decorator = ''
+    call_prefix = ''
+    if fn is not None and isinstance(parents.get(fn), ast.ClassDef):
+        cls = parents.get(fn)
+        decos = [_deco_name(d) for d in fn.decorator_list]
+        allp = fn.args.posonlyargs + fn.args.args
+        if 'staticmethod' in decos:
+            decorator = '@staticmethod'
+            call_prefix = cls.name + '.'
+        elif allp:
+            self_name = allp[0].arg
+            if 'classmethod' in decos:
+                decorator = '@classmethod'
+            call_prefix = self_name + '.'
+            params = [x for x in params if x != self_name]
+        else:
+            decorator = '@staticmethod'
+            call_prefix = cls.name + '.'
+    # Source of the selection.
+    code = blank_code(doc.text)
+    first_line = doc.pos_of(first_a)[0]
+    last_line = stmts[-1].end_lineno
+    orig_lines = [doc.line(ln) for ln in range(first_line, last_line + 1)]
+    orig_indent = doc.line(first_line)[:leading_ws(doc.line(first_line))]
+    # Lines that lie inside multi-line strings must not be re-indented.
+    in_string = set()
+    for n in ast.walk(ast.Module(body=list(stmts), type_ignores=[])):
+        if isinstance(n, (ast.Constant, ast.JoinedStr)) and isinstance(getattr(n, 'value', None), (str, bytes, list)) \
+                and n.end_lineno > n.lineno:
+            for ln in range(n.lineno + 1, n.end_lineno + 1):
+                in_string.add(ln)
+    if fn is not None or container is not None:
+        ins_node = container
+        ins_line = ins_node.lineno
+        if getattr(ins_node, 'decorator_list', None):
+            ins_line = min([ins_line] + [d.lineno for d in ins_node.decorator_list])
+        ins_indent = doc.line(ins_line)[:leading_ws(doc.line(ins_line))]
+    else:
+        ins_line = first_line
+        ins_indent = orig_indent
+    unit = '\t' if orig_indent.startswith('\t') or ins_indent.startswith('\t') else '    '
+    body_indent = ins_indent + unit
+    new_body = []
+    for i, l in enumerate(orig_lines):
+        ln = first_line + i
+        if ln in in_string:
+            new_body.append(l)
+        elif not l.strip():
+            new_body.append('')
+        elif l.startswith(orig_indent):
+            new_body.append(body_indent + l[len(orig_indent):])
+        else:
+            new_body.append(body_indent + l.lstrip())
+    if returns:
+        new_body.append(body_indent + 'return ' + ', '.join(returns))
+    sig = ([self_name] if self_name else []) + params
+    head = []
+    if decorator:
+        head.append(ins_indent + decorator)
+    head.append('%s%sdef %s(%s):' % (ins_indent, 'async ' if is_async else '', name, ', '.join(sig)))
+    blank = '\n\n' if ins_indent == '' else '\n'
+    func_text = '\n'.join(head + new_body) + '\n' + blank
+    call = '%s%s(%s)' % (call_prefix, name, ', '.join(params))
+    if is_async:
+        call = 'await ' + call
+    if ends_with_return:
+        call_line = orig_indent + 'return ' + call
+    elif returns:
+        call_line = orig_indent + ', '.join(returns) + ' = ' + call
+    else:
+        call_line = orig_indent + call
+    rs = doc.line_start(first_line)
+    re_ = doc.off(last_line, len(doc.line(last_line)))
+    docs = {doc.path: doc}
+    if container is None:
+        doc.replace(rs, re_, func_text + call_line)
+    else:
+        il = doc.line_start(ins_line)
+        doc.replace(il, il, func_text)
+        doc.replace(rs, re_, call_line)
+    return refactor_result(docs)
+
+
+# --- syntax errors ------------------------------------------------------------
+
+def _syntax_error_entry(e, lines):
+    ln = getattr(e, 'lineno', None) or 1
+    off = getattr(e, 'offset', None)
+    col = max(0, (off or 1) - 1)
+    eln = getattr(e, 'end_lineno', None)
+    eoff = getattr(e, 'end_offset', None)
+    if not eln or eln < ln:
+        eln = ln
+    ecol = (eoff - 1) if eoff and eoff > 0 else None
+    if ecol is None or (eln == ln and ecol <= col):
+        eln = ln
+        ecol = col + 1
+    msg = getattr(e, 'msg', None) or str(e)
+    return {'line': ln, 'column': col, 'until_line': eln, 'until_column': ecol, 'message': msg}
+
+
+def _first_syntax_error(text, path):
+    with warnings_off():
+        try:
+            tree = ast.parse(text, filename=path)
+        except SyntaxError as e:
+            return e
+        except (ValueError, MemoryError, RecursionError) as e:
+            err = SyntaxError(str(e))
+            err.lineno, err.offset = 1, 1
+            return err
+        try:
+            compile(tree, path, 'exec', dont_inherit=True)
+        except SyntaxError as e:
+            return e
+        except Exception:
+            pass
+    return None
+
+
+@contextlib.contextmanager
+def warnings_off():
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        yield
+
+
+def syntax_errors(path):
+    text = read_source(path)
+    lines = [l.rstrip('\r') for l in text.split('\n')]
+    errors = []
+    work = list(lines)
+    last_line = 0
+    for _ in range(20):
+        e = _first_syntax_error('\n'.join(work), path)
+        if e is None:
+            break
+        ent = _syntax_error_entry(e, lines)
+        if errors and ent['line'] <= last_line:
+            break
+        errors.append(ent)
+        last_line = ent['until_line']
+        # Neutralise the offending lines and look for further errors.
+        lo, hi = ent['line'], ent['until_line']
+        if isinstance(e, IndentationError) or lo < 1 or lo > len(work):
+            break
+        ind = leading_ws(work[lo - 1])
+        nxt = hi
+        while nxt < len(work) and not work[nxt].strip():
+            nxt += 1
+        opens_block = nxt < len(work) and leading_ws(work[nxt]) > ind
+        work[lo - 1] = work[lo - 1][:ind] + ('if 1:' if opens_block else 'pass')
+        for k in range(lo, min(hi, len(work))):
+            work[k] = ''
+    if len(errors) > 1:
+        # Only keep follow-up errors that are not artefacts of an unclosed bracket etc.
+        errors = errors[:1] + [x for x in errors[1:] if x['line'] > errors[0]['until_line']]
+    return errors
+
+
 USAGE = ('usage: sith.py complete <file> <line> <col> [--fuzzy] [--project DIR]\n'
          '       sith.py infer <file> <line> <col> [--project DIR]\n'
          '       sith.py goto <file> <line> <col> [--follow-imports] [--project DIR]\n'
          '       sith.py signatures <file> <line> <col> [--project DIR]\n'
          '       sith.py references <file> <line> <col> [--scope file|project] [--project DIR]\n'
          '       sith.py search <query> [--project DIR]\n'
-         '       sith.py names <file> [--all-scopes] [--project DIR]\n')
+         '       sith.py names <file> [--all-scopes] [--project DIR]\n'
+         '       sith.py rename <file> <line> <col> --new-name NAME [--diff] [--project DIR]\n'
+         '       sith.py inline <file> <line> <col> [--diff] [--project DIR]\n'
+         '       sith.py extract-variable <file> <line> <col> --until L:C --name NAME [--diff] [--project DIR]\n'
+         '       sith.py extract-function <file> <line> <col> --until L:C --name NAME [--diff] [--project DIR]\n'
+         '       sith.py errors <file>\n')
 
 _ARITY = {'complete': 4, 'infer': 4, 'goto': 4, 'signatures': 4, 'references': 4,
-          'search': 2, 'names': 2}
+          'search': 2, 'names': 2, 'rename': 4, 'inline': 4, 'extract-variable': 4,
+          'extract-function': 4, 'errors': 2}
+
+_VALUE_OPTS = ('--project', '--scope', '--new-name', '--name', '--until')
 
 
 def _emit(obj):
@@ -5503,6 +6702,8 @@ def main(argv):
     project = None
     scope = 'file'
     all_scopes = False
+    diff = False
+    opts = {}
     rest = []
     i = 0
     while i < len(args):
@@ -5513,23 +6714,23 @@ def main(argv):
             _FOLLOW[0] = True
         elif a == '--all-scopes':
             all_scopes = True
-        elif a in ('--project', '--scope'):
+        elif a == '--diff':
+            diff = True
+        elif a in _VALUE_OPTS:
             if i + 1 >= len(args):
                 sys.stderr.write(USAGE)
                 return 1
-            if a == '--project':
-                project = args[i + 1]
-            else:
-                scope = args[i + 1]
+            opts[a] = args[i + 1]
             i += 1
-        elif a.startswith('--project='):
-            project = a.split('=', 1)[1]
-        elif a.startswith('--scope='):
-            scope = a.split('=', 1)[1]
+        elif '=' in a and a.split('=', 1)[0] in _VALUE_OPTS:
+            k, v = a.split('=', 1)
+            opts[k] = v
         else:
             rest.append(a)
         i += 1
     args = rest
+    project = opts.get('--project', project)
+    scope = opts.get('--scope', scope)
     if not args or args[0] not in _ARITY or len(args) != _ARITY[args[0]]:
         sys.stderr.write(USAGE)
         return 1
@@ -5567,6 +6768,34 @@ def main(argv):
             _emit({'definitions': search(args[1])})
         elif cmd == 'names':
             _emit({'definitions': names(args[1], all_scopes)})
+        elif cmd == 'errors':
+            _emit({'errors': syntax_errors(args[1])})
+        else:
+            if cmd == 'rename':
+                if '--new-name' not in opts:
+                    raise RefactorError('--new-name is required')
+                res = rename(args[1], line_no, col, opts['--new-name'])
+            elif cmd == 'inline':
+                res = inline(args[1], line_no, col)
+            else:
+                if '--name' not in opts:
+                    raise RefactorError('--name is required')
+                if '--until' not in opts:
+                    raise RefactorError('--until is required')
+                _check_ident(opts['--name'])
+                until = _parse_until(opts['--until'])
+                fn = extract_variable if cmd == 'extract-variable' else extract_function
+                res = fn(args[1], line_no, col, until, opts['--name'])
+            obj, text = res
+            if diff:
+                out = sys.stdout
+                try:
+                    out.buffer.write(text.encode('utf-8'))
+                    out.flush()
+                except AttributeError:
+                    out.write(text)
+            else:
+                _emit(obj)
     except NotAName:
         sys.stderr.write('error: no name at cursor position\n')
         return 1
