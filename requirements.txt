@@ -1,0 +1,2 @@
+# No third-party dependencies: dynamic_buffer.py and the generated modules use only the
+# Python standard library (and Node.js built-ins for --javascript output).
