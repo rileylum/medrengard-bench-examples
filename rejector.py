@@ -16,7 +16,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import yaml
@@ -40,6 +41,13 @@ NUMBER_RE = re.compile(r"[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)")
 
 class ConfigError(Exception):
     pass
+
+
+class BudgetExceeded(BaseException):
+    """Raised when a request may not be sent because the cost budget is exhausted.
+
+    Derives from BaseException so generic `except Exception` handlers do not swallow it.
+    """
 
 
 def fail(msg):
@@ -85,12 +93,29 @@ def read_config(path):
     return raw
 
 
+def _top_defaults(raw):
+    """Defaults applied to every task: top-level rate_limits/cost (lowest priority), then `defaults`."""
+    base = {}
+    for key in ("rate_limits", "cost"):
+        if isinstance(raw.get(key), dict):
+            base[key] = copy.deepcopy(raw[key])
+    defaults = raw.get("defaults")
+    if isinstance(defaults, dict):
+        base = deep_merge(base, defaults)
+    elif defaults is not None:
+        raise ConfigError("config 'defaults' must be a mapping")
+    return base
+
+
 def parse_config(raw):
     """Return (multi, [(name, task_mapping, prefix), ...]) without validating task contents."""
     if "task" in raw:
         task = raw["task"]
         if not isinstance(task, dict):
             raise ConfigError("config 'task' must be a mapping")
+        defaults = _top_defaults(raw)
+        if defaults:
+            task = deep_merge(defaults, task)
         name = task.get("name")
         if name is not None and not isinstance(name, str):
             name = str(name)
@@ -105,6 +130,7 @@ def parse_config(raw):
         defaults = {}
     if not isinstance(defaults, dict):
         raise ConfigError("config 'defaults' must be a mapping")
+    defaults = _top_defaults(raw)
     out = []
     for name, t in tasks.items():
         name = str(name)
@@ -141,10 +167,32 @@ def build_task(name, task, P, args, config_dir="."):
         raise ConfigError(f"{P}.model is required and must be a non-empty string")
     cfg["model"] = model
 
-    rpm = args.rpm if args.rpm is not None else task.get("rpm", 60)
-    if not _is_int(rpm) or rpm <= 0:
-        raise ConfigError(f"{P}.rpm must be a positive integer, got {rpm!r}")
+    rl = task.get("rate_limits")
+    if rl is None:
+        rl = {}
+    if not isinstance(rl, dict):
+        raise ConfigError(f"{P}.rate_limits must be a mapping")
+    if args.rpm is not None:
+        rpm = args.rpm
+    elif "rpm" in rl:
+        rpm = rl.get("rpm")
+    else:
+        rpm = task.get("rpm")
+    if rpm is not None and (not _is_int(rpm) or rpm <= 0):
+        raise ConfigError(f"{P}.rate_limits.rpm must be a positive integer, got {rpm!r}")
     cfg["rpm"] = rpm
+    tpm = args.tpm if getattr(args, "tpm", None) is not None else rl.get("tpm")
+    if tpm is not None and (not _is_int(tpm) or tpm <= 0):
+        raise ConfigError(f"{P}.rate_limits.tpm must be a positive integer, got {tpm!r}")
+    cfg["tpm"] = tpm
+    mc = (args.max_concurrent if getattr(args, "max_concurrent", None) is not None
+          else rl.get("max_concurrent"))
+    if mc is not None and (not _is_int(mc) or mc <= 0):
+        raise ConfigError(f"{P}.rate_limits.max_concurrent must be a positive integer, got {mc!r}")
+    cfg["max_concurrent"] = mc
+
+    cfg["cost"] = build_cost(task.get("cost"), P, args)
+    cfg["output_schema"] = build_schema(task.get("output_schema"), P)
 
     prompt = task.get("prompt")
     if not isinstance(prompt, dict):
@@ -193,7 +241,8 @@ def build_task(name, task, P, args, config_dir="."):
         n = 1
     cfg["n"] = n
 
-    cfg["evaluation"] = build_evaluation(task.get("evaluation"), P, scheme, model, args)
+    cfg["evaluation"] = build_evaluation(task.get("evaluation"), P, scheme, model, args,
+                                         has_schema=cfg["output_schema"] is not None)
 
     of = task.get("output_field", "output")
     if not isinstance(of, str) or not of:
@@ -238,6 +287,87 @@ def build_task(name, task, P, args, config_dir="."):
     cfg["max_iterations"] = mi
     cfg["tools"] = build_tools(task.get("tools"), P)
     return cfg
+
+
+def build_cost(cost, P, args):
+    C = f"{P}.cost"
+    budget_cli = getattr(args, "budget", None)
+    if cost is None:
+        if budget_cli is None:
+            return None
+        cost = {}
+    if not isinstance(cost, dict):
+        raise ConfigError(f"{C} must be a mapping")
+    out = {}
+    for key in ("prompt_cost_per_1k", "completion_cost_per_1k"):
+        v = cost.get(key, 0.0)
+        if v is None:
+            v = 0.0
+        if not _is_num(v) or v < 0:
+            raise ConfigError(f"{C}.{key} must be a non-negative number, got {v!r}")
+        out[key] = float(v)
+    budget = budget_cli if budget_cli is not None else cost.get("budget")
+    if budget is not None and (not _is_num(budget) or budget < 0):
+        raise ConfigError(f"{C}.budget must be a non-negative number, got {budget!r}")
+    out["budget"] = float(budget) if budget is not None else None
+    return out
+
+
+SCHEMA_TYPES = ("string", "number", "integer", "boolean", "object", "array", "null")
+
+
+def _check_schema(schema, where):
+    if isinstance(schema, bool):
+        return
+    if not isinstance(schema, dict):
+        raise ConfigError(f"{where} must be a mapping")
+    t = schema.get("type")
+    if t is not None:
+        types = t if isinstance(t, list) else [t]
+        for x in types:
+            if x not in SCHEMA_TYPES:
+                raise ConfigError(f"{where}.type must be one of {', '.join(SCHEMA_TYPES)}, got {x!r}")
+    req = schema.get("required")
+    if req is not None and (not isinstance(req, list) or not all(isinstance(r, str) for r in req)):
+        raise ConfigError(f"{where}.required must be a list of strings")
+    props = schema.get("properties")
+    if props is not None:
+        if not isinstance(props, dict):
+            raise ConfigError(f"{where}.properties must be a mapping")
+        for k, sub in props.items():
+            _check_schema(sub, f"{where}.properties.{k}")
+    items = schema.get("items")
+    if items is not None:
+        if isinstance(items, list):
+            for i, sub in enumerate(items):
+                _check_schema(sub, f"{where}.items[{i}]")
+        else:
+            _check_schema(items, f"{where}.items")
+    if "enum" in schema and not isinstance(schema["enum"], list):
+        raise ConfigError(f"{where}.enum must be a list")
+    for key in ("minimum", "maximum"):
+        if key in schema and not _is_num(schema[key]):
+            raise ConfigError(f"{where}.{key} must be a number")
+    for key in ("minLength", "maxLength"):
+        if key in schema and (not _is_int(schema[key]) or schema[key] < 0):
+            raise ConfigError(f"{where}.{key} must be a non-negative integer")
+    if "pattern" in schema:
+        pat = schema["pattern"]
+        if not isinstance(pat, str):
+            raise ConfigError(f"{where}.pattern must be a string")
+        try:
+            re.compile(pat)
+        except re.error as e:
+            raise ConfigError(f"{where}.pattern is not a valid regex: {e}")
+
+
+def build_schema(schema, P):
+    if schema is None:
+        return None
+    if not isinstance(schema, dict):
+        raise ConfigError(f"{P}.output_schema must be a mapping")
+    _check_schema(schema, f"{P}.output_schema")
+    return schema
 
 
 def build_tools(tools, P):
@@ -412,11 +542,11 @@ def build_icl(icl, P, cfg, args, config_dir):
     return {"setups": setups, "k": k, "strategy": strategy}
 
 
-def build_evaluation(ev, P, scheme, model, args):
+def build_evaluation(ev, P, scheme, model, args, has_schema=False):
     E = f"{P}.evaluation"
     if ev is None:
-        if scheme == "rejection":
-            raise ConfigError(f"{E} is required for scheme 'rejection'")
+        if scheme == "rejection" and not has_schema:
+            raise ConfigError(f"{E} (or {P}.output_schema) is required for scheme 'rejection'")
         return None
     if not isinstance(ev, dict):
         raise ConfigError(f"{E} must be a mapping")
@@ -693,6 +823,149 @@ def evaluate_judge(client, cfg, ev, text, row, idx):
     return score >= ev["threshold"], extracted, score, jmeta
 
 
+# ---------------------------------------------------------------- structured output
+
+
+FENCE_RE = re.compile(r"```[ \t]*(?:json|JSON)?[ \t]*\n?(.*?)```", re.DOTALL)
+
+
+def _json_type(v):
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, int):
+        return "integer"
+    if isinstance(v, float):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return type(v).__name__
+
+
+def _type_ok(v, t):
+    if t == "null":
+        return v is None
+    if t == "boolean":
+        return isinstance(v, bool)
+    if t == "integer":
+        return (isinstance(v, int) and not isinstance(v, bool)) or (isinstance(v, float) and v.is_integer())
+    if t == "number":
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    if t == "string":
+        return isinstance(v, str)
+    if t == "array":
+        return isinstance(v, list)
+    if t == "object":
+        return isinstance(v, dict)
+    return True
+
+
+def _json_equal(a, b):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_json_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+    return type(a) is type(b) and a == b
+
+
+def _join_path(path, key):
+    if isinstance(key, int):
+        return f"{path}[{key}]"
+    return f"{path}.{key}" if path else str(key)
+
+
+def schema_errors(schema, v, path=""):
+    """Return a human-readable message for the first violation, or None if `v` is valid."""
+    if schema is False:
+        return f"{'Field ' + repr(path) + ': ' if path else ''}no value is allowed"
+    if not isinstance(schema, dict):
+        return None
+    at = f"Field '{path}': " if path else ""
+    t = schema.get("type")
+    if t is not None:
+        types = t if isinstance(t, list) else [t]
+        if not any(_type_ok(v, x) for x in types):
+            return f"{at}expected type {' or '.join(types)}, got {_json_type(v)}"
+    if "enum" in schema and not any(_json_equal(v, e) for e in schema["enum"]):
+        return f"{at}value {json.dumps(v, ensure_ascii=False)} is not one of " \
+               f"{json.dumps(schema['enum'], ensure_ascii=False)}"
+    if isinstance(v, str):
+        if "minLength" in schema and len(v) < schema["minLength"]:
+            return f"{at}string length {len(v)} is shorter than minLength {schema['minLength']}"
+        if "maxLength" in schema and len(v) > schema["maxLength"]:
+            return f"{at}string length {len(v)} is longer than maxLength {schema['maxLength']}"
+        if "pattern" in schema and not re.search(schema["pattern"], v):
+            return f"{at}string {json.dumps(v, ensure_ascii=False)} does not match pattern " \
+                   f"{json.dumps(schema['pattern'])}"
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if "minimum" in schema and v < schema["minimum"]:
+            return f"{at}value {v} is less than minimum {schema['minimum']}"
+        if "maximum" in schema and v > schema["maximum"]:
+            return f"{at}value {v} is greater than maximum {schema['maximum']}"
+    if isinstance(v, dict):
+        for r in schema.get("required") or []:
+            if r not in v:
+                return f"Missing required field: {_join_path(path, r)}"
+        for k, sub in (schema.get("properties") or {}).items():
+            if k in v:
+                err = schema_errors(sub, v[k], _join_path(path, k))
+                if err:
+                    return err
+    if isinstance(v, list) and "items" in schema:
+        items = schema["items"]
+        if isinstance(items, list):
+            for i, (x, sub) in enumerate(zip(v, items)):
+                err = schema_errors(sub, x, _join_path(path, i))
+                if err:
+                    return err
+        else:
+            for i, x in enumerate(v):
+                err = schema_errors(items, x, _join_path(path, i))
+                if err:
+                    return err
+    return None
+
+
+def parse_json_response(text):
+    """Return (ok, value, error)."""
+    if text is None:
+        return False, None, "Invalid JSON: empty response"
+    s = text.strip()
+    try:
+        return True, json.loads(s), None
+    except (json.JSONDecodeError, ValueError) as e:
+        first = e
+    m = FENCE_RE.search(s)
+    if m:
+        try:
+            return True, json.loads(m.group(1).strip()), None
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if not s:
+        return False, None, "Invalid JSON: empty response"
+    return False, None, f"Invalid JSON: {first}"
+
+
+def validate_output(schema, text):
+    """Return (valid, parsed_value, error_message)."""
+    ok, value, err = parse_json_response(text)
+    if not ok:
+        return False, None, err
+    err = schema_errors(schema, value)
+    if err:
+        return False, None, err
+    return True, value, None
+
+
 # ---------------------------------------------------------------- client
 
 
@@ -716,37 +989,35 @@ class Stats:
 
 
 class Transport:
-    """Shared per-server connection limiter."""
+    """Posts JSON bodies to one server."""
 
-    def __init__(self, api_url, max_inflight, stats):
+    def __init__(self, api_url, stats):
         self.base = api_url
-        self.sem = threading.BoundedSemaphore(max_inflight)
         self.stats = stats
 
     def post(self, body, counter, path="/v1/chat/completions"):
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(self.base + path, data=data, method="POST",
                                      headers={"Content-Type": "application/json"})
-        with self.sem:
-            t0 = time.monotonic()
-            self.stats.start(t0)
-            counter.incr()
-            status, payload, err = None, None, None
+        t0 = time.monotonic()
+        self.stats.start(t0)
+        counter.incr()
+        status, payload, err = None, None, None
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                status = resp.status
+                payload = resp.read()
+        except urllib.error.HTTPError as e:
+            status = e.code
             try:
-                with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                    status = resp.status
-                    payload = resp.read()
-            except urllib.error.HTTPError as e:
-                status = e.code
-                try:
-                    payload = e.read()
-                except Exception:
-                    payload = b""
-                err = f"HTTP {e.code}"
-            except Exception as e:  # connection errors, timeouts
-                err = f"{type(e).__name__}: {e}"
-            t1 = time.monotonic()
-            self.stats.end(t1)
+                payload = e.read()
+            except Exception:
+                payload = b""
+            err = f"HTTP {e.code}"
+        except Exception as e:  # connection errors, timeouts
+            err = f"{type(e).__name__}: {e}"
+        t1 = time.monotonic()
+        self.stats.end(t1)
         return status, payload, err, int(round((t1 - t0) * 1000))
 
 
@@ -760,13 +1031,223 @@ class Counter:
             self.value += 1
 
 
+class CostTracker:
+    """Global running cost across all tasks, with an optional budget."""
+
+    def __init__(self, budget):
+        self.lock = threading.Lock()
+        self.budget = budget
+        self.prompt = 0.0
+        self.completion = 0.0
+        self.exceeded = budget is not None and budget <= 0
+        self.limiters = []
+
+    @property
+    def total(self):
+        return self.prompt + self.completion
+
+    def add(self, prompt_cost, completion_cost):
+        wake = False
+        with self.lock:
+            self.prompt += prompt_cost
+            self.completion += completion_cost
+            if (self.budget is not None and not self.exceeded
+                    and self.prompt + self.completion >= self.budget):
+                self.exceeded = True
+                wake = True
+        if wake:
+            for lim in self.limiters:
+                lim.wake()
+
+
+WINDOW = 60.0
+
+
+class Limiter:
+    """Per-task scheduler: sliding-window RPM and TPM budgets plus a concurrency cap.
+
+    Rate capacity is granted in FIFO order. Concurrency slots are separate so a
+    thread that already holds a slot (an agentic loop) never waits behind one
+    that needs a slot.
+    """
+
+    def __init__(self, rpm, tpm, max_concurrent, cost):
+        self.rpm = rpm
+        self.tpm = tpm
+        self.max_concurrent = max_concurrent
+        self.cost = cost
+        self.cond = threading.Condition()
+        self.inflight = 0
+        self.req_times = deque()
+        self.tok = deque()  # entries [timestamp, tokens, in_flight]
+        self.queue = deque()
+        self.slot_queue = deque()
+        self.local = threading.local()
+        cost.limiters.append(self)
+
+    def wake(self):
+        with self.cond:
+            self.cond.notify_all()
+
+    # -- concurrency slots
+    def _take_slot(self):
+        with self.cond:
+            me = object()
+            self.slot_queue.append(me)
+            try:
+                while True:
+                    if self.cost.exceeded:
+                        raise BudgetExceeded()
+                    if self.slot_queue[0] is me and self.inflight < self.max_concurrent:
+                        self.inflight += 1
+                        return
+                    self.cond.wait(1.0)
+            finally:
+                self.slot_queue.remove(me)
+                self.cond.notify_all()
+
+    def _give_slot(self):
+        with self.cond:
+            self.inflight -= 1
+            self.cond.notify_all()
+
+    def holding(self):
+        return getattr(self.local, "held", False)
+
+    class _Hold:
+        def __init__(self, lim):
+            self.lim = lim
+            self.owner = False
+
+        def __enter__(self):
+            if not self.lim.holding():
+                self.lim._take_slot()
+                self.lim.local.held = True
+                self.owner = True
+            return self
+
+        def __exit__(self, *exc):
+            if self.owner:
+                self.lim.local.held = False
+                self.lim._give_slot()
+            return False
+
+    def hold(self):
+        """Context manager holding one concurrency slot for its whole lifetime."""
+        return Limiter._Hold(self)
+
+    # -- rate budgets
+    def _prune(self, now):
+        cutoff = now - WINDOW
+        while self.req_times and self.req_times[0] <= cutoff:
+            self.req_times.popleft()
+        if self.tok:
+            self.tok = deque(e for e in self.tok if e[2] or e[0] > cutoff)
+
+    def _wait_time(self, now, reserve):
+        waits = []
+        if self.rpm is not None and len(self.req_times) >= self.rpm:
+            waits.append(self.req_times[0] + WINDOW - now)
+        if self.tpm is not None:
+            done = sorted(e[0] for e in self.tok if not e[2])
+            if done:
+                waits.append(done[0] + WINDOW - now)
+        if not waits:
+            return 1.0
+        return min(1.0, max(0.005, min(waits)))
+
+    def _rate_ok(self, now, reserve):
+        if self.rpm is not None and len(self.req_times) >= self.rpm:
+            return False
+        if self.tpm is not None and self.tok:
+            used = sum(e[1] for e in self.tok)
+            if used + reserve > self.tpm:
+                return False
+        return True
+
+    def acquire(self, reserve):
+        """Block until a request may be sent. Returns a ticket for release()."""
+        need_slot = not self.holding()
+        if need_slot:
+            self._take_slot()
+        try:
+            with self.cond:
+                me = object()
+                self.queue.append(me)
+                try:
+                    while True:
+                        if self.cost.exceeded:
+                            raise BudgetExceeded()
+                        now = time.monotonic()
+                        self._prune(now)
+                        if self.queue[0] is me and self._rate_ok(now, reserve):
+                            break
+                        self.cond.wait(self._wait_time(now, reserve) if self.queue[0] is me else 1.0)
+                finally:
+                    self.queue.remove(me)
+                    self.cond.notify_all()
+                self.req_times.append(now)
+                entry = [now, reserve, True]
+                if self.tpm is not None:
+                    self.tok.append(entry)
+        except BaseException:
+            if need_slot:
+                self._give_slot()
+            raise
+        return (entry, need_slot)
+
+    def release(self, ticket, actual_tokens):
+        entry, had_slot = ticket
+        with self.cond:
+            entry[0] = time.monotonic()
+            entry[1] = max(0, int(actual_tokens))
+            entry[2] = False
+            if had_slot:
+                self.inflight -= 1
+            self.cond.notify_all()
+
+
+def count_words(messages):
+    n = 0
+    for m in messages:
+        c = m.get("content")
+        if c is None:
+            c = ""
+        if not isinstance(c, str):
+            c = _stringify(c)
+        n += len(c.split())
+        for tc in m.get("tool_calls") or []:
+            fn = (tc or {}).get("function") or {}
+            n += len(_stringify(fn.get("name") or "").split())
+            n += len(_stringify(fn.get("arguments") or "").split())
+    return n
+
+
+def estimate_prompt_tokens(messages):
+    return int(math.ceil(count_words(messages) / 0.75))
+
+
 class Client:
     """Per-task client: knows the task's generation settings, counts its calls."""
 
-    def __init__(self, cfg, transport):
+    def __init__(self, cfg, transport, limiter, cost):
         self.cfg = cfg
         self.transport = transport
+        self.limiter = limiter
+        self.cost = cost
         self.counter = Counter()
+        self.lock = threading.Lock()
+        self.prompt_cost = 0.0
+        self.completion_cost = 0.0
+
+    def _charge(self, prompt_tokens, completion_tokens):
+        c = self.cfg.get("cost") or {}
+        pc = prompt_tokens / 1000.0 * c.get("prompt_cost_per_1k", 0.0)
+        cc = completion_tokens / 1000.0 * c.get("completion_cost_per_1k", 0.0)
+        with self.lock:
+            self.prompt_cost += pc
+            self.completion_cost += cc
+        self.cost.add(pc, cc)
 
     def complete(self, messages, model=None, temperature=None, max_tokens=None):
         """One logical attempt with retries. Returns (ok, text, meta)."""
@@ -806,8 +1287,20 @@ class Client:
                                                "parameters": t["parameters"]}} for t in tools]
             path = "/v1/chat/completions"
         meta = None
+        if completions:
+            est = int(math.ceil(len(body["prompt"].split()) / 0.75))
+        else:
+            est = estimate_prompt_tokens(messages)
+        reserve = est + max_tokens
         for _ in range(MAX_HTTP_TRIES):
-            status, payload, err, latency = self.transport.post(body, self.counter, path)
+            ticket = self.limiter.acquire(reserve)
+            actual = 0
+            try:
+                status, payload, err, latency = self.transport.post(body, self.counter, path)
+                if status is not None and 200 <= status < 300:
+                    actual = _usage_tokens(payload)
+            finally:
+                self.limiter.release(ticket, actual)
             meta = {"model": model, "prompt_tokens": 0, "completion_tokens": 0,
                     "total_tokens": 0, "latency_ms": latency, "finish_reason": None}
             if status is not None and 200 <= status < 300:
@@ -836,13 +1329,28 @@ class Client:
                     meta["total_tokens"] = int(usage.get("total_tokens")
                                                or meta["prompt_tokens"] + meta["completion_tokens"])
                     meta["finish_reason"] = choice.get("finish_reason")
-                    return True, text, calls, meta
                 except Exception:
+                    self._charge(*_usage_pair(payload))
                     return False, None, [], meta
+                self._charge(meta["prompt_tokens"], meta["completion_tokens"])
+                return True, text, calls, meta
             if status is not None and status < 500:
                 return False, None, [], meta  # 4xx: not retryable
             # 5xx or connection-level failure: retry
         return False, None, [], meta
+
+
+def _usage_pair(payload):
+    try:
+        usage = json.loads(payload.decode("utf-8")).get("usage") or {}
+        return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+    except Exception:
+        return 0, 0
+
+
+def _usage_tokens(payload):
+    p, c = _usage_pair(payload)
+    return p + c
 
 
 # ---------------------------------------------------------------- templates
@@ -1029,6 +1537,27 @@ def run_agentic(client, cfg, messages):
     details, tool_calls = [], []
     text, finish, api_ok = None, "max_iterations", True
     iterations = 0
+    with client.limiter.hold():
+        loop_out = _agentic_iterations(client, cfg, convo, tools, tools_by_name, completions,
+                                       details, tool_calls)
+    text, finish, api_ok, iterations = loop_out
+    latency = int(round((time.monotonic() - t0) * 1000))
+    agg = {
+        "model": cfg["model"],
+        "total_prompt_tokens": sum(d["prompt_tokens"] for d in details),
+        "total_completion_tokens": sum(d["completion_tokens"] for d in details),
+        "total_tokens": sum(d["total_tokens"] for d in details),
+        "latency_ms": latency,
+        "finish_reason": finish,
+        "iterations_detail": details,
+    }
+    return {"text": text, "iterations": iterations, "tool_calls": tool_calls,
+            "meta": agg, "api_ok": api_ok}
+
+
+def _agentic_iterations(client, cfg, convo, tools, tools_by_name, completions, details, tool_calls):
+    text, finish, api_ok = None, "max_iterations", True
+    iterations = 0
     for it in range(1, cfg["max_iterations"] + 1):
         ok, rtext, calls, meta = client.request(convo, tools=tools)
         iterations = it
@@ -1084,18 +1613,7 @@ def run_agentic(client, cfg, messages):
             convo.append({"role": "assistant", "content": rtext, "tool_calls": raw_calls})
             for c, res in results:
                 convo.append({"role": "tool", "tool_call_id": c["id"], "content": res})
-    latency = int(round((time.monotonic() - t0) * 1000))
-    agg = {
-        "model": cfg["model"],
-        "total_prompt_tokens": sum(d["prompt_tokens"] for d in details),
-        "total_completion_tokens": sum(d["completion_tokens"] for d in details),
-        "total_tokens": sum(d["total_tokens"] for d in details),
-        "latency_ms": latency,
-        "finish_reason": finish,
-        "iterations_detail": details,
-    }
-    return {"text": text, "iterations": iterations, "tool_calls": tool_calls,
-            "meta": agg, "api_ok": api_ok}
+    return text, finish, api_ok, iterations
 
 
 # ---------------------------------------------------------------- processing
@@ -1104,12 +1622,18 @@ def run_agentic(client, cfg, messages):
 def process_row_agentic(client, cfg, row, messages, idx):
     ev = cfg["evaluation"]
     is_judge = ev is not None and ev["type"] == "llm_judge"
+    schema = cfg.get("output_schema")
     loop = run_agentic(client, cfg, messages)
     meta = loop["meta"]
     text = loop["text"]
     judge_score = None
+    sv = None
+    if text is not None and schema is not None:
+        sv = validate_output(schema, text)
     if text is None:
-        passed, extracted = (False if ev is not None else None), None
+        passed, extracted = (False if (ev is not None or schema is not None) else None), None
+    elif sv is not None and not sv[0]:
+        passed, extracted = False, None
     elif ev is None:
         passed, extracted = None, None
     elif ev["type"] == "script":
@@ -1119,12 +1643,21 @@ def process_row_agentic(client, cfg, row, messages, idx):
         meta["judge_meta"] = jmeta
     else:
         passed, extracted = evaluate_local(ev, text, row)
+    if sv is not None and sv[0] and ev is None:
+        passed = True
     r = {"passed": passed, "extracted_answer": extracted, "attempts": 1}
     if is_judge:
         r["judge_score"] = judge_score
     r["iterations"] = loop["iterations"]
     r["tool_calls"] = loop["tool_calls"]
-    output = {cfg["output_field"]: text} if text is not None else None
+    if sv is not None:
+        r["schema_valid"] = sv[0]
+        if not sv[0]:
+            r["schema_error"] = sv[2]
+    if text is None or (sv is not None and not sv[0]):
+        output = None
+    else:
+        output = {cfg["output_field"]: sv[1] if sv is not None else text}
     return {"output": output, "result": r, "metas": [meta], "api_ok": loop["api_ok"]}
 
 
@@ -1133,15 +1666,21 @@ def process_row(client, cfg, row, messages, idx):
     if cfg["scheme"] == "agentic":
         return process_row_agentic(client, cfg, row, messages, idx)
     scheme = cfg["scheme"]
+    schema = cfg.get("output_schema")
     is_judge = ev is not None and ev["type"] == "llm_judge"
     attempts = cfg["n"] if scheme == "rejection" else 1
     metas = []
     judge_score = None
+    last_sv = None
 
-    def result(passed, extracted, n_attempts):
+    def result(passed, extracted, n_attempts, sv=None):
         r = {"passed": passed, "extracted_answer": extracted, "attempts": n_attempts}
         if is_judge:
             r["judge_score"] = judge_score
+        if schema is not None and sv is not None:
+            r["schema_valid"] = sv[0]
+            if not sv[0]:
+                r["schema_error"] = sv[2]
         return r
 
     for i in range(attempts):
@@ -1150,10 +1689,21 @@ def process_row(client, cfg, row, messages, idx):
         if not ok:
             # API failure after retries: row failed
             return {"output": None,
-                    "result": result(False if ev is not None else None, None, i + 1),
+                    "result": result(False if (ev is not None or schema is not None) else None,
+                                     None, i + 1, last_sv),
                     "metas": metas, "api_ok": False}
+        sv = None
+        if schema is not None:
+            sv = validate_output(schema, text)
+            last_sv = sv
+            meta["schema_valid"] = sv[0]
+            if not sv[0]:
+                if scheme == "rejection":
+                    continue
+                return {"output": None, "result": result(False, None, i + 1, sv),
+                        "metas": metas, "api_ok": True}
         if ev is None:
-            passed, extracted = None, None
+            passed, extracted = (True if schema is not None else None), None
         elif ev["type"] == "script":
             passed, extracted = evaluate_script(ev, text, row, idx)
         elif is_judge:
@@ -1162,10 +1712,11 @@ def process_row(client, cfg, row, messages, idx):
         else:
             passed, extracted = evaluate_local(ev, text, row)
         if scheme != "rejection" or passed:
-            return {"output": {cfg["output_field"]: text},
-                    "result": result(passed, extracted, i + 1),
+            value = sv[1] if sv is not None else text
+            return {"output": {cfg["output_field"]: value},
+                    "result": result(passed, extracted, i + 1, sv),
                     "metas": metas, "api_ok": True}
-    return {"output": None, "result": result(False, None, attempts),
+    return {"output": None, "result": result(False, None, attempts, last_sv),
             "metas": metas, "api_ok": True}
 
 
@@ -1185,7 +1736,7 @@ def _evaluate(client, cfg, text, row, idx, meta):
 
 
 def _one_attempt(client, cfg, row, idx, messages, setup_name):
-    """Return (text_or_None, passed, meta)."""
+    """Return (has_output, value, passed, meta)."""
     ev = cfg["evaluation"]
     if cfg["scheme"] == "agentic":
         try:
@@ -1209,17 +1760,28 @@ def _one_attempt(client, cfg, row, idx, messages, setup_name):
         meta = {"model": cfg["model"], "prompt_tokens": 0, "completion_tokens": 0,
                 "total_tokens": 0, "latency_ms": 0, "finish_reason": None}
     meta["icl_setup"] = setup_name
+    schema = cfg.get("output_schema")
     if not ok:
-        meta["evaluation_passed"] = False if ev is not None else None
-        return None, meta["evaluation_passed"], meta
+        meta["evaluation_passed"] = False if (ev is not None or schema is not None) else None
+        return False, None, meta["evaluation_passed"], meta
+    value = text
+    if schema is not None:
+        valid, value, err = validate_output(schema, text)
+        meta["schema_valid"] = valid
+        if not valid:
+            meta["schema_error"] = err
+            meta["evaluation_passed"] = False
+            return False, None, False, meta
     try:
         passed = _evaluate(client, cfg, text, row, idx, meta)
     except Exception as e:
         print(f"warning: task {cfg.get('name')!r} row {idx}: evaluation error: "
               f"{type(e).__name__}: {e}", file=sys.stderr)
         passed = False
+    if ev is None and schema is not None:
+        passed = True
     meta["evaluation_passed"] = passed
-    return text, passed, meta
+    return True, value, passed, meta
 
 
 def process_row_multi(client, cfg, row, prepared, idx):
@@ -1243,8 +1805,8 @@ def process_row_multi(client, cfg, row, prepared, idx):
     else:  # rejection
         target, max_att = N, cfg["max_attempts"]
 
-    def keep(text, passed):
-        if text is None:
+    def keep(has, passed):
+        if not has:
             return False
         if scheme == "rejection":
             return passed is True
@@ -1278,27 +1840,34 @@ def process_row_multi(client, cfg, row, prepared, idx):
             with ThreadPoolExecutor(max_workers=batch) as ex:
                 futs = [ex.submit(_one_attempt, client, cfg, row, idx, m, nm) for m, nm in plan]
                 outs = [f.result() for f in futs]
-        for (text, passed, meta), (_, nm) in zip(outs, plan):
-            attempts.append((text, passed, meta, nm))
-            if keep(text, passed):
+        for (has, value, passed, meta), (_, nm) in zip(outs, plan):
+            attempts.append((has, value, passed, meta, nm))
+            if keep(has, passed):
                 collected += 1
 
     of = cfg["output_field"]
-    output = [{of: text, "icl_setup": nm} for text, passed, _, nm in attempts if keep(text, passed)]
+    output = [{of: value, "icl_setup": nm} for has, value, passed, _, nm in attempts if keep(has, passed)]
     n_att = len(attempts)
-    if ev is not None:
-        n_passed = sum(1 for _, passed, _, _ in attempts if passed is True)
+    if ev is not None or cfg.get("output_schema") is not None:
+        n_passed = sum(1 for a in attempts if a[2] is True)
     else:
         n_passed = len(output)
     result = {"passed": n_passed, "failed": n_att - n_passed, "attempts": n_att}
-    return {"output": output, "result": result, "metas": [a[2] for a in attempts], "api_ok": True}
+    return {"output": output, "result": result, "metas": [a[3] for a in attempts], "api_ok": True}
+
+
+ABORTED = None  # result marker for rows cut short by the cost budget
 
 
 def _safe_process(client, cfg, row, messages, idx):
+    if client.cost.exceeded:
+        return ABORTED
     try:
         if cfg.get("list_mode"):
             return process_row_multi(client, cfg, row, messages, idx)
         return process_row(client, cfg, row, messages, idx)
+    except BudgetExceeded:
+        return ABORTED
     except Exception as e:  # never let a single row kill the run
         print(f"warning: task {cfg.get('name')!r} row {idx}: {type(e).__name__}: {e}", file=sys.stderr)
         if cfg.get("list_mode"):
@@ -1351,9 +1920,9 @@ def resolve_jobs(args):
             path = inputs[0]
             if name and path.startswith(name + "=") and not os.path.exists(path):
                 path = path[len(name) + 1:]
-        if args.output is None:
+        if args.output is None and not args.dry_run:
             raise ConfigError("--output is required")
-        if os.path.isdir(args.output):
+        if args.output is not None and os.path.isdir(args.output):
             raise ConfigError(f"--output {args.output} is a directory; single-task configs write a file")
         cfg = build_task(name, task, prefix, args, config_dir)
         rows = load_input(path)
@@ -1397,9 +1966,9 @@ def resolve_jobs(args):
                 raise ConfigError(f"no --input given for task {n!r}")
             paths[n] = mapping[n]
 
-    if args.output is None:
+    if args.output is None and not args.dry_run:
         raise ConfigError("--output is required")
-    if os.path.exists(args.output) and not os.path.isdir(args.output):
+    if args.output is not None and os.path.exists(args.output) and not os.path.isdir(args.output):
         raise ConfigError(f"--output {args.output} must be a directory for multi-task configs")
 
     by_name = {t[0]: t for t in tasks}
@@ -1410,8 +1979,267 @@ def resolve_jobs(args):
         rows = load_input(paths[n])
         prepared = prepare(cfg, rows)
         jobs.append({"cfg": cfg, "rows": rows, "prepared": prepared,
-                     "output_path": os.path.join(args.output, f"{n}.jsonl")})
+                     "output_path": os.path.join(args.output, f"{n}.jsonl") if args.output else None})
     return True, jobs
+
+
+def _first_messages(prepared_row):
+    """The message list for a prepared row (first ICL setup when ICL is configured)."""
+    if prepared_row and isinstance(prepared_row[0], list):
+        return prepared_row[0]
+    return prepared_row
+
+
+def dry_run_estimate(jobs):
+    tasks = {}
+    total_inputs = total_tokens = 0
+    total_cost = 0.0
+    minutes = 0.0
+    for job in jobs:
+        cfg = job["cfg"]
+        n = len(job["rows"])
+        words = sum(count_words(_first_messages(p)) for p in job["prepared"])
+        avg_words = words / n if n else 0.0
+        est_prompt = int(round(avg_words * 1.33 * n))
+        est_completion = n * cfg["max_tokens"]
+        est_total = est_prompt + est_completion
+        c = cfg.get("cost") or {}
+        est_cost = (est_prompt / 1000.0 * c.get("prompt_cost_per_1k", 0.0)
+                    + est_completion / 1000.0 * c.get("completion_cost_per_1k", 0.0))
+        avg_attempts = cfg["n"] if cfg["scheme"] == "rejection" else 1
+        rpm = cfg["rpm"] if cfg["rpm"] is not None else 60
+        minutes += n * avg_attempts / rpm
+        name = cfg["name"] or "task"
+        tasks[name] = {
+            "inputs": n,
+            "est_prompt_tokens": est_prompt,
+            "est_completion_tokens": est_completion,
+            "est_total_tokens": est_total,
+            "est_cost": round(est_cost, 4),
+        }
+        total_inputs += n
+        total_tokens += est_total
+        total_cost += est_cost
+    return {
+        "tasks": tasks,
+        "total_inputs": total_inputs,
+        "est_total_tokens": total_tokens,
+        "est_total_cost": round(total_cost, 4),
+        "est_time_minutes": round(minutes, 4),
+    }
+
+
+def line_complete(cfg, obj):
+    """Whether a previously written output line is a finished result for its row."""
+    if not isinstance(obj, dict) or "output" not in obj or "result" not in obj:
+        return False
+    out, res = obj["output"], obj["result"]
+    if not isinstance(res, dict):
+        return False
+    scheme = cfg["scheme"]
+    if cfg.get("list_mode"):
+        if not isinstance(out, list):
+            return False
+        if scheme in ("rejection", "sample", "agentic"):
+            return len(out) >= cfg["num_solutions"]
+        return True
+    if scheme == "rejection":
+        return res.get("passed") is True
+    return True
+
+
+def read_existing(path, nrows):
+    """Return (lines, complete_flags_placeholder, byte_ends) for non-blank lines of an output file."""
+    with open(path, "rb") as f:
+        data = f.read()
+    lines, ends = [], []
+    pos = 0
+    for raw in data.splitlines(keepends=True):
+        pos += len(raw)
+        text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not text.strip():
+            continue
+        if len(lines) >= nrows:
+            break
+        lines.append(text)
+        ends.append(pos)
+    return lines, ends
+
+
+def classify(cfg, res):
+    """Return 'passed', 'failed' or None (neither) for a processed row."""
+    if cfg.get("list_mode"):
+        return "passed" if res["result"]["passed"] > 0 else "failed"
+    rp = res["result"]["passed"]
+    if res["output"] is None or rp is False:
+        return "failed"
+    if rp is True or (rp is None and res["api_ok"]):
+        return "passed"
+    return None
+
+
+class TaskWriter:
+    """Writes one task's output lines strictly in input order as results arrive."""
+
+    def __init__(self, job, f, start, old_lines, old_complete):
+        self.job = job
+        self.cfg = job["cfg"]
+        self.f = f
+        self.n = len(job["rows"])
+        self.next = start
+        self.old = old_lines
+        self.old_complete = old_complete
+        self.slots = {}
+        self.stopped = False
+        self.written = self.passed = self.failed = 0
+        self.tp = self.tc = self.sols = 0
+
+    def put(self, i, res):
+        self.slots[i] = res
+        self.drain()
+
+    def drain(self):
+        wrote = False
+        while not self.stopped and self.next < self.n:
+            i = self.next
+            if i < len(self.old) and self.old_complete[i]:
+                self.f.write(self.old[i] + "\n")
+            elif i not in self.slots:
+                break
+            else:
+                res = self.slots.pop(i)
+                if res is ABORTED:
+                    if i < len(self.old):
+                        self.f.write(self.old[i] + "\n")
+                    else:
+                        self.stopped = True
+                        break
+                else:
+                    self.f.write(self._line(self.job["rows"][i], res) + "\n")
+            self.next += 1
+            wrote = True
+        if wrote:
+            self.f.flush()
+
+    def _line(self, row, res):
+        metas = res["metas"]
+        for m in metas:
+            self.tp += m.get("total_prompt_tokens", m.get("prompt_tokens", 0))
+            self.tc += m.get("total_completion_tokens", m.get("completion_tokens", 0))
+            jm = m.get("judge_meta")
+            if jm:
+                self.tp += jm["prompt_tokens"]
+                self.tc += jm["completion_tokens"]
+        if self.cfg.get("list_mode"):
+            self.sols += len(res["output"])
+            meta_out = metas
+        else:
+            if res["output"] is not None:
+                self.sols += 1
+            meta_out = metas[0] if len(metas) == 1 else metas
+        c = classify(self.cfg, res)
+        if c == "passed":
+            self.passed += 1
+        elif c == "failed":
+            self.failed += 1
+        self.written += 1
+        return json.dumps({"input": row, "output": res["output"], "result": res["result"],
+                           "meta": meta_out}, ensure_ascii=False)
+
+
+class Progress:
+    def __init__(self, total, show_eval, show_cost, cost, stats, t_start):
+        self.total = total
+        self.show_eval = show_eval
+        self.show_cost = show_cost
+        self.cost = cost
+        self.stats = stats
+        self.t_start = t_start
+        self.done = self.passed = self.failed = 0
+        self.lock = threading.Lock()
+        self.last_print = t_start
+        self.last_bucket = 0
+        self.stop_ev = threading.Event()
+        self.thread = threading.Thread(target=self._tick, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def _tick(self):
+        while not self.stop_ev.wait(0.2):
+            with self.lock:
+                if time.monotonic() - self.last_print >= 5.0:
+                    self._print()
+
+    def update(self, outcome):
+        with self.lock:
+            self.done += 1
+            if outcome == "passed":
+                self.passed += 1
+            elif outcome == "failed":
+                self.failed += 1
+            bucket = (self.done * 10 // self.total) if self.total else 10
+            if bucket > self.last_bucket:
+                self.last_bucket = bucket
+                self._print()
+
+    def finish(self):
+        self.stop_ev.set()
+        self.thread.join(timeout=1.0)
+
+    def _print(self):
+        now = time.monotonic()
+        self.last_print = now
+        elapsed = now - self.t_start
+        pct = int(self.done * 100 / self.total) if self.total else 100
+        parts = [f"[{self.done}/{self.total}] {pct}% complete"]
+        if self.show_eval:
+            parts.append(f"{self.passed} passed, {self.failed} failed")
+        rpm = self.stats.calls / elapsed * 60 if elapsed > 0 else 0.0
+        parts.append(f"{rpm:.1f} rpm")
+        if self.show_cost:
+            parts.append(f"${self.cost.total:.2f} spent")
+        if self.done > 0:
+            eta = int(round(elapsed / self.done * (self.total - self.done)))
+            parts.append(f"ETA: {eta}s")
+        else:
+            parts.append("ETA: ?")
+        print(" | ".join(parts), file=sys.stderr, flush=True)
+
+
+def _open_output(job, resume):
+    """Open a task's output file. Returns (file, start_index, old_lines, old_complete, resumed_from)."""
+    path = job["output_path"]
+    cfg = job["cfg"]
+    n = len(job["rows"])
+    if resume and os.path.isfile(path):
+        lines, ends = read_existing(path, n)
+        complete = []
+        for text in lines:
+            try:
+                obj = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                obj = None
+            complete.append(line_complete(cfg, obj))
+        k = 0
+        while k < len(lines) and complete[k]:
+            k += 1
+        f = open(path, "r+b")
+        f.truncate(ends[k - 1] if k > 0 else 0)
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                f.seek(0, os.SEEK_END)
+                f.write(b"\n")
+        f.close()
+        f = open(path, "a", encoding="utf-8")
+        return f, k, lines, complete, sum(1 for c in complete if c)
+    return open(path, "w", encoding="utf-8"), 0, [], [], 0
+
+
+def _r(x):
+    return round(x, 6)
 
 
 def run(args):
@@ -1420,107 +2248,127 @@ def run(args):
     except ConfigError as e:
         fail(str(e))
 
+    if args.dry_run:
+        print(json.dumps(dry_run_estimate(jobs)))
+        sys.stdout.flush()
+        return 0
+
     if multi:
         try:
             os.makedirs(args.output, exist_ok=True)
         except OSError as e:
             fail(f"cannot create output directory {args.output}: {e}")
-    files = []
+    writers = []
+    resumed = []
     for job in jobs:
         try:
-            files.append(open(job["output_path"], "w", encoding="utf-8"))
+            f, start, old, complete, rf = _open_output(job, args.resume)
         except OSError as e:
-            for f in files:
-                f.close()
+            for w in writers:
+                w.f.close()
             fail(f"cannot open output file {job['output_path']}: {e}")
+        writers.append(TaskWriter(job, f, start, old, complete))
+        resumed.append(rf)
 
-    # The server queues requests, so keep plenty in flight: enough to cover
-    # the configured per-minute capacity even with multi-second latencies.
+    cost_cfgs = [job["cfg"]["cost"] for job in jobs if job["cfg"].get("cost") is not None]
+    cost_enabled = bool(cost_cfgs)
+    budgets = [c["budget"] for c in cost_cfgs if c["budget"] is not None]
+    budget = args.budget if args.budget is not None else (min(budgets) if budgets else None)
+    cost = CostTracker(budget)
+
     stats = Stats()
     transports = {}
-    url_inflight = {}
+    clients = []
     for job in jobs:
         cfg = job["cfg"]
-        mi = max(8, min(cfg["rpm"], 256))
-        url_inflight[cfg["api_url"]] = max(url_inflight.get(cfg["api_url"], 0), mi)
-    for url, mi in url_inflight.items():
-        transports[url] = Transport(url, mi, stats)
-    clients = [Client(job["cfg"], transports[job["cfg"]["api_url"]]) for job in jobs]
+        url = cfg["api_url"]
+        if url not in transports:
+            transports[url] = Transport(url, stats)
+        mc = cfg["max_concurrent"]
+        if mc is None:
+            mc = max(8, min(cfg["rpm"], 256)) if cfg["rpm"] is not None else 64
+        limiter = Limiter(cfg["rpm"], cfg["tpm"], mc, cost)
+        clients.append(Client(cfg, transports[url], limiter, cost))
 
-    total_rows = sum(len(job["rows"]) for job in jobs)
-    # Extra workers beyond the in-flight limit let script evaluations overlap with requests.
-    workers = max(1, min(total_rows, 2 * sum(url_inflight.values()) + 8, 512))
-    results = [[None] * len(job["rows"]) for job in jobs]
-    if total_rows:
+    todo = []
+    for j, (job, w) in enumerate(zip(jobs, writers)):
+        idxs = [i for i in range(len(job["rows"]))
+                if i >= len(w.old) or not w.old_complete[i]]
+        todo.append(idxs)
+        w.drain()
+    total_todo = sum(len(t) for t in todo)
+
+    progress = None
+    t_start = time.monotonic()
+    if args.progress:
+        show_eval = any(job["cfg"]["evaluation"] is not None or job["cfg"].get("output_schema") is not None
+                        for job in jobs)
+        progress = Progress(total_todo, show_eval, cost_enabled, cost, stats, t_start)
+        progress.start()
+
+    if total_todo:
+        cap = sum(c.limiter.max_concurrent for c in clients)
+        workers = max(1, min(total_todo, 2 * cap + 8, 512))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = []
+            futs = {}
+            longest = max(len(t) for t in todo)
             # interleave submission across tasks so all tasks make progress together
-            longest = max(len(job["rows"]) for job in jobs)
-            for i in range(longest):
+            for k in range(longest):
                 for j, job in enumerate(jobs):
-                    if i < len(job["rows"]):
-                        futs.append((j, i, pool.submit(_safe_process, clients[j], job["cfg"],
-                                                       job["rows"][i], job["prepared"][i], i)))
-            for j, i, fut in futs:
-                results[j][i] = fut.result()
+                    if k < len(todo[j]):
+                        i = todo[j][k]
+                        fut = pool.submit(_safe_process, clients[j], job["cfg"],
+                                          job["rows"][i], job["prepared"][i], i)
+                        futs[fut] = (j, i)
+            for fut in as_completed(futs):
+                j, i = futs[fut]
+                res = fut.result()
+                if progress is not None and res is not ABORTED:
+                    progress.update(classify(jobs[j]["cfg"], res))
+                writers[j].put(i, res)
+    if progress is not None:
+        progress.finish()
+
+    for w in writers:
+        w.drain()
+        w.f.close()
 
     g_passed = g_failed = g_tp = g_tc = g_total = 0
     task_summaries = {}
-    for j, job in enumerate(jobs):
-        passed = failed = tp = tc = sols = 0
-        list_mode = job["cfg"].get("list_mode")
-        with files[j] as out_f:
-            for row, res in zip(job["rows"], results[j]):
-                metas = res["metas"]
-                for m in metas:
-                    tp += m.get("total_prompt_tokens", m.get("prompt_tokens", 0))
-                    tc += m.get("total_completion_tokens", m.get("completion_tokens", 0))
-                    jm = m.get("judge_meta")
-                    if jm:
-                        tp += jm["prompt_tokens"]
-                        tc += jm["completion_tokens"]
-                if list_mode:
-                    sols += len(res["output"])
-                    if res["result"]["passed"] > 0:
-                        passed += 1
-                    else:
-                        failed += 1
-                    meta_out = metas
-                else:
-                    rp = res["result"]["passed"]
-                    if res["output"] is not None:
-                        sols += 1
-                    if res["output"] is None or rp is False:
-                        failed += 1
-                    elif rp is True or (rp is None and res["api_ok"]):
-                        passed += 1
-                    meta_out = metas[0] if len(metas) == 1 else metas
-                line = {"input": row, "output": res["output"], "result": res["result"], "meta": meta_out}
-                out_f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    for j, (job, w) in enumerate(zip(jobs, writers)):
         name = job["cfg"]["name"] or "task"
-        task_summaries[name] = {
-            "total": len(job["rows"]),
-            "passed": passed,
-            "failed": failed,
-            "total_solutions": sols,
-            "avg_solutions_per_input": (sols / len(job["rows"])) if job["rows"] else 0.0,
+        ts = {
+            "total": w.written,
+            "passed": w.passed,
+            "failed": w.failed,
+            "total_solutions": w.sols,
+            "avg_solutions_per_input": (w.sols / w.written) if w.written else 0.0,
             "total_api_calls": clients[j].counter.value,
-            "total_prompt_tokens": tp,
-            "total_completion_tokens": tc,
+            "total_prompt_tokens": w.tp,
+            "total_completion_tokens": w.tc,
         }
-        g_total += len(job["rows"])
-        g_passed += passed
-        g_failed += failed
-        g_tp += tp
-        g_tc += tc
+        if args.resume:
+            ts["resumed_from"] = resumed[j]
+        if job["cfg"].get("cost") is not None:
+            c = clients[j]
+            ts["cost"] = {"total": _r(c.prompt_cost + c.completion_cost),
+                          "prompt": _r(c.prompt_cost), "completion": _r(c.completion_cost)}
+        task_summaries[name] = ts
+        g_total += w.written
+        g_passed += w.passed
+        g_failed += w.failed
+        g_tp += w.tp
+        g_tc += w.tc
 
     if stats.first_start is not None and stats.last_end is not None:
         elapsed = max(0.0, stats.last_end - stats.first_start)
     else:
         elapsed = 0.0
     throughput = (stats.calls / elapsed * 60) if elapsed > 0 else 0.0
-    summary = {
-        "total": g_total,
+    summary = {"total": g_total}
+    if args.resume:
+        summary["resumed_from"] = sum(resumed)
+    summary.update({
         "passed": g_passed,
         "failed": g_failed,
         "total_prompt_tokens": g_tp,
@@ -1528,8 +2376,18 @@ def run(args):
         "total_api_calls": stats.calls,
         "elapsed_seconds": round(elapsed, 1),
         "throughput_rpm": round(throughput, 1),
-        "tasks": task_summaries,
-    }
+    })
+    if cost_enabled:
+        total = cost.total
+        summary["cost"] = {
+            "total": _r(total),
+            "prompt": _r(cost.prompt),
+            "completion": _r(cost.completion),
+            "budget": budget,
+            "budget_remaining": _r(max(0.0, budget - total)) if budget is not None else None,
+            "budget_exceeded": bool(cost.exceeded),
+        }
+    summary["tasks"] = task_summaries
     print(json.dumps(summary))
     sys.stdout.flush()
     return 0
@@ -1551,7 +2409,7 @@ def main(argv=None):
     r.add_argument("--input", action="append",
                    help="input JSONL path (single-task) or <task>=<path> (multi-task, repeatable)")
     r.add_argument("--input-dir", dest="input_dir", help="directory containing <task_name>.jsonl files")
-    r.add_argument("--output", required=True,
+    r.add_argument("--output",
                    help="output JSONL file (single-task) or directory (multi-task)")
     r.add_argument("--task", action="append", help="run only this task (repeatable)")
     r.add_argument("--api-url", dest="api_url")
@@ -1568,6 +2426,12 @@ def main(argv=None):
     r.add_argument("--icl-k", dest="icl_k", type=int)
     r.add_argument("--api-type", dest="api_type", choices=API_TYPES)
     r.add_argument("--chat-template", dest="chat_template", choices=CHAT_TEMPLATES)
+    r.add_argument("--tpm", type=int)
+    r.add_argument("--max-concurrent", dest="max_concurrent", type=int)
+    r.add_argument("--budget", type=float)
+    r.add_argument("--resume", action="store_true")
+    r.add_argument("--dry-run", dest="dry_run", action="store_true")
+    r.add_argument("--progress", action="store_true")
     args = p.parse_args(argv)
     if args.command != "run":
         p.error("a command is required: run")
