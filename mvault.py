@@ -965,6 +965,186 @@ def listing_html(v, category, highlight=None):
     return _page(f"{v.name} - {category}", "\n".join(body))
 
 
+
+def _hist_points(hist, ver):
+    """Chronological [(iso_timestamp, value)] pairs for a history object."""
+    if not isinstance(hist, dict) or not hist:
+        return []
+    if ver == 1:
+        keys = sorted(hist, key=_epoch_sort_key)
+    else:
+        keys = sorted(hist, key=str)
+    out = []
+    for k in keys:
+        ts = str(k)
+        if ver == 1:
+            try:
+                ts = epoch_to_iso(ts)
+            except ValueError:
+                pass
+        out.append((ts, hist[k]))
+    return out
+
+
+def _latest(hist, ver):
+    vals = _sorted_values(hist, ver)
+    return vals[-1] if vals else None
+
+
+def _usable_name(n):
+    return not n.startswith(".") and not n.lower().endswith(PARTIAL_SUFFIXES)
+
+
+def _match_file(directory, entry_id):
+    """Saved filename in directory containing entry_id (exact base preferred)."""
+    eid = str(entry_id)
+    if not eid:
+        return None
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return None
+    cands = [n for n in names if eid in n and _usable_name(n)
+             and os.path.isfile(os.path.join(directory, n))]
+    if not cands:
+        return None
+    for pred in (lambda n: n == eid,
+                 lambda n: n.startswith(eid + ".") and "." not in n[len(eid) + 1:],
+                 lambda n: n.startswith(eid + "."),
+                 lambda n: n.startswith(eid)):
+        for n in cands:
+            if pred(n):
+                return n
+    return cands[0]
+
+
+def _source_link(v, eid):
+    if v.version == 1:
+        sid = v.cat.get("source_id")
+        return f"{SOURCE_PREFIX}{sid if isinstance(sid, str) else str(sid)}/entry/{eid}"
+    return f"{v.cat.get('source')}/entry/{eid}"
+
+
+def _json_script(obj, elem_id):
+    data = json.dumps(obj, ensure_ascii=False)
+    data = data.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return f"<script type=\"application/json\" id=\"{elem_id}\">{data}</script>"
+
+
+def detail_html(v, category, e):
+    qn = _quote(v.name, safe="")
+    eid = str(e["id"])
+    title = _latest(e.get("title"), v.version)
+    desc = _latest(e.get("description"), v.version)
+    title_s = title if isinstance(title, str) else eid
+    desc_s = "" if desc is None else str(desc)
+    published = e.get("published", "")
+    width = e.get("width", "")
+    height = e.get("height", "")
+    src_link = _source_link(v, eid)
+    back = f"/catalog/{qn}/{_quote(category, safe='')}"
+    removed = v.removed(e)
+    body = [f"<p><a class=\"back\" id=\"back\" href=\"{_esc(back)}\">&larr; Back to "
+            f"{_esc(v.name)} / {_esc(category)}</a></p>",
+            f"<h1 class=\"entry-title\" id=\"title\">{_esc(title_s)}</h1>"]
+    if removed:
+        body.append("<p class=\"removed-state removed\">Removed from source</p>")
+    body.append(
+        "<dl class=\"entry-meta\">"
+        f"<dt>ID</dt><dd class=\"entry-id\"><code>{_esc(eid)}</code></dd>"
+        f"<dt>Description</dt><dd class=\"description\" id=\"description\">{_esc(desc_s)}</dd>"
+        f"<dt>Published</dt><dd class=\"published\" id=\"published\">{_esc(published)}</dd>"
+        f"<dt>Dimensions</dt><dd class=\"dimensions\" id=\"dimensions\">"
+        f"<span class=\"width\">{_esc(width)}</span> &times; "
+        f"<span class=\"height\">{_esc(height)}</span> ({_esc(width)}x{_esc(height)})</dd>"
+        f"<dt>Source</dt><dd><a class=\"source-link\" id=\"source-link\" "
+        f"href=\"{_esc(src_link)}\">{_esc(src_link)}</a></dd>"
+        "</dl>")
+    media = _match_file(os.path.join(v.name, "media"), eid)
+    preview = _match_file(os.path.join(v.name, "previews"), eid)
+    prev_url = f"/vault/{qn}/preview/{_quote(eid, safe='')}" if preview else None
+    if media:
+        murl = f"/vault/{qn}/media/{_quote(media, safe='')}"
+        poster = f" poster=\"{_esc(prev_url)}\"" if prev_url else ""
+        body.append(f"<div class=\"media\"><video controls preload=\"metadata\" "
+                    f"src=\"{_esc(murl)}\"{poster}></video>"
+                    f"<p><a class=\"media-link\" href=\"{_esc(murl)}\">{_esc(media)}</a></p></div>")
+    else:
+        body.append("<p class=\"no-media\">Media not downloaded.</p>")
+        if prev_url:
+            body.append(f"<p><img class=\"preview\" alt=\"preview\" src=\"{_esc(prev_url)}\" "
+                        f"style=\"max-width:480px\"></p>")
+    charts = {}
+    for f in ("views", "likes"):
+        pts = _hist_points(e.get(f), v.version)
+        charts[f] = [{"timestamp": t, "value": val} for t, val in pts]
+    body.append(_json_script(charts, "chart-data"))
+    for f in ("views", "likes"):
+        pts = charts[f]
+        if not pts:
+            continue
+        body.append(f"<h2>{f.capitalize()}</h2>")
+        body.append(_svg_chart(pts))
+        rows = "".join(f"<tr><td>{_esc(p['timestamp'])}</td>"
+                       f"<td>{'&mdash;' if p['value'] is None else _esc(p['value'])}</td></tr>"
+                       for p in pts)
+        body.append(f"<table class=\"history {f}\"><tr><th>Timestamp</th><th>{f}</th></tr>"
+                    f"{rows}</table>")
+    return _page(f"{title_s} - {v.name}", "\n".join(body))
+
+
+def _svg_chart(pts):
+    vals = [(i, p["value"]) for i, p in enumerate(pts) if is_int(p["value"])]
+    if len(pts) < 2 or not vals:
+        return ""
+    w, h, pad = 480, 160, 10
+    lo = min(x for _, x in vals)
+    hi = max(x for _, x in vals)
+    span = (hi - lo) or 1
+    n = len(pts) - 1
+    coords = " ".join(f"{pad + (w - 2 * pad) * i / n:.1f},"
+                      f"{h - pad - (h - 2 * pad) * (x - lo) / span:.1f}" for i, x in vals)
+    return (f"<svg class=\"chart\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\" "
+            f"role=\"img\"><polyline fill=\"none\" stroke=\"#36c\" stroke-width=\"2\" "
+            f"points=\"{coords}\"/></svg>")
+
+
+_MIME_BY_EXT = {}
+for _mt, _ext in MIME_EXT.items():
+    _MIME_BY_EXT.setdefault(_ext, _mt)
+
+
+def _guess_mime(path, kind):
+    import mimetypes
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        head = b""
+    if kind == "image":
+        if head.startswith(b"\x89PNG"):
+            return "image/png"
+        if head.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if head.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "image/webp"
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    mt = _MIME_BY_EXT.get(ext) or mimetypes.guess_type(path)[0]
+    if mt and mt != "application/octet-stream":
+        if kind == "image" and not mt.startswith("image/"):
+            return "image/jpeg"
+        return mt
+    if kind == "image":
+        return "image/jpeg"
+    if head[4:8] == b"ftyp":
+        return "video/mp4"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm"
+    return "application/octet-stream"
+
+
 def make_handler():
     from http.server import BaseHTTPRequestHandler
 
@@ -1046,6 +1226,9 @@ def make_handler():
                 err = q.get("error", [None])[0]
                 self._send(200, landing_html(self._recent(), nf, err))
                 return
+            if parts[0] == "vault":
+                self._static(parts)
+                return
             if parts[0] != "catalog" or len(parts) < 2:
                 self._send(404, _page("Not found", "<h1>404 Not Found</h1>"
                                                    "<p><a href=\"/\">Home</a></p>"))
@@ -1074,8 +1257,108 @@ def make_handler():
                 self._send(200, listing_html(v, category), cookies)
                 return
             eid = "/".join(parts[3:])
-            found = any(str(e["id"]) == eid for e in v.entries(category))
-            self._send(200 if found else 404, listing_html(v, category, eid), cookies)
+            match = [e for e in v.entries(category) if str(e["id"]) == eid]
+            if match:
+                self._send(200, detail_html(v, category, match[0]), cookies)
+            else:
+                self._send(404, listing_html(v, category, eid), cookies)
+
+        def _not_found(self, status=404):
+            msg = "403 Forbidden" if status == 403 else "404 Not Found"
+            self._send(status, _page(msg, f"<h1>{msg}</h1><p><a href=\"/\">Home</a></p>"))
+
+        def _static(self, parts):
+            if len(parts) < 2:
+                self._not_found()
+                return
+            name = parts[1]
+            try:
+                v = ViewerVault(name)
+            except Exception:
+                self._redirect("/?notfound=" + _quote(name, safe=""))
+                return
+            if len(parts) < 3 or parts[2] not in ("media", "preview"):
+                self._not_found()
+                return
+            rest = parts[3:]
+            if len(rest) != 1:
+                self._not_found(403 if any(p in ("..", ".") for p in rest) or len(rest) > 1
+                                else 404)
+                return
+            item = rest[0]
+            if (item in (".", "..") or "/" in item or "\\" in item or "\0" in item
+                    or ".." in item.replace("\\", "/").split("/")):
+                self._not_found(403)
+                return
+            if parts[2] == "media":
+                base = os.path.join(v.name, "media")
+                fname = item
+                kind = "media"
+            else:
+                base = os.path.join(v.name, "previews")
+                fname = _match_file(base, item)
+                kind = "image"
+                if fname is None:
+                    self._not_found()
+                    return
+            full = os.path.join(base, fname)
+            try:
+                real_base = os.path.realpath(base)
+                real = os.path.realpath(full)
+            except (OSError, ValueError):
+                self._not_found()
+                return
+            if os.path.commonpath([real_base, real]) != real_base or real == real_base:
+                self._not_found(403)
+                return
+            if not os.path.isfile(real):
+                self._not_found()
+                return
+            self._send_file(real, _guess_mime(real, kind))
+
+        def _send_file(self, path, ctype):
+            try:
+                size = os.path.getsize(path)
+                f = open(path, "rb")
+            except OSError:
+                self._not_found()
+                return
+            with f:
+                start, end, status = 0, size - 1, 200
+                rng = self.headers.get("Range")
+                m = re.fullmatch(r"\s*bytes=(\d*)-(\d*)\s*", rng or "")
+                if m and (m.group(1) or m.group(2)) and size > 0:
+                    if m.group(1):
+                        start = int(m.group(1))
+                        if m.group(2):
+                            end = min(int(m.group(2)), size - 1)
+                    else:
+                        start = max(0, size - int(m.group(2)))
+                    if start >= size or start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    status = 206
+                length = max(0, end - start + 1)
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                if self.command == "HEAD":
+                    return
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
 
         def _post(self):
             path, parts = self._path_parts()
