@@ -33,11 +33,12 @@ def select_body(text):
     b = text.find(begin)
     if b == -1:
         return text
+    macros = extract_macros(text[:b])
     rest = text[b + len(begin):]
     e = rest.find(end)
     if e != -1:
         rest = rest[:e]
-    return rest
+    return expand_macros(rest, macros)
 
 
 def strip_lines(text):
@@ -146,6 +147,273 @@ _SKIP_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\(?:medskip|smallskip|bigskip)(?![A-Z
 
 def delete_skips(s):
     return _SKIP_RE.sub(lambda m: m.group(1), s)
+
+
+class ConvertError(Exception):
+    pass
+
+
+_NAME_RE = re.compile(r"\\([A-Za-z]+|.)")
+
+
+def _skip_ws(s, i):
+    while i < len(s) and s[i] in " \t\n":
+        i += 1
+    return i
+
+
+def extract_macros(preamble):
+    """Return {name: replacement} for parameter-free \\def / \\newcommand definitions."""
+    macros = {}
+    pat = re.compile(r"\\(def|newcommand|renewcommand|providecommand)(?![A-Za-z])(\*?)")
+    pos = 0
+    while True:
+        m = pat.search(preamble, pos)
+        if not m:
+            break
+        pos = m.end()
+        if _escaped(preamble, m.start()):
+            continue
+        i = _skip_ws(preamble, m.end())
+        if m.group(1) == "def":
+            nm = _NAME_RE.match(preamble, i)
+            if not nm:
+                continue
+            name = nm.group(1)
+            j = nm.end()
+            if j >= len(preamble) or preamble[j] != "{":
+                continue  # parameterised (#1...) or malformed
+            arg = _brace_arg(preamble, j)
+            if arg is None:
+                continue
+            macros[name] = arg[0]
+            pos = arg[1]
+        else:
+            if i < len(preamble) and preamble[i] == "{":
+                a = _brace_arg(preamble, i)
+                if a is None:
+                    continue
+                nm = _NAME_RE.fullmatch(a[0].strip())
+                if not nm:
+                    continue
+                name = nm.group(1)
+                j = a[1]
+            else:
+                nm = _NAME_RE.match(preamble, i)
+                if not nm:
+                    continue
+                name = nm.group(1)
+                j = nm.end()
+            j = _skip_ws(preamble, j)
+            if j < len(preamble) and preamble[j] == "[":
+                continue  # parameterised definition: ignore
+            arg = _brace_arg(preamble, j)
+            if arg is None:
+                continue
+            macros[name] = arg[0]
+            pos = arg[1]
+    return macros
+
+
+def _macro_re(name):
+    if name[0].isalpha():
+        return re.compile(r"\\" + re.escape(name) + r"(?![A-Za-z])")
+    return re.compile(r"\\" + re.escape(name))
+
+
+def _refs(text, regex):
+    for m in regex.finditer(text):
+        if not _escaped(text, m.start()):
+            return True
+    return False
+
+
+def _sub_macro(text, regex, repl):
+    out = []
+    pos = 0
+    for m in regex.finditer(text):
+        if _escaped(text, m.start()):
+            continue
+        out.append(text[pos:m.start()])
+        out.append(repl)
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def check_cycles(macros, regexes):
+    graph = {n: [k for k in macros if _refs(macros[n], regexes[k])] for n in macros}
+    state = {}
+
+    def visit(n):
+        state[n] = 1
+        for k in graph[n]:
+            s = state.get(k)
+            if s == 1:
+                return True
+            if s is None and visit(k):
+                return True
+        state[n] = 2
+        return False
+
+    for n in macros:
+        if n not in state and visit(n):
+            raise ConvertError("Error: cyclic macro definition")
+
+
+def expand_macros(body, macros):
+    if not macros:
+        return body
+    regexes = {n: _macro_re(n) for n in macros}
+    check_cycles(macros, regexes)
+    while True:
+        new = body
+        for n, r in regexes.items():
+            new = _sub_macro(new, r, macros[n])
+        if new == body:
+            return body
+        body = new
+
+
+def _opt_arg(s, i):
+    """Skip an optional [..] argument at s[i]; return index after it, or None if unclosed."""
+    if i < len(s) and s[i] == "[":
+        depth = 0
+        j = i
+        while j < len(s):
+            if s[j] == "\\":
+                j += 2
+                continue
+            if s[j] == "[":
+                depth += 1
+            elif s[j] == "]":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        return None
+    return i
+
+
+def _cmd_iter(s, name):
+    regex = re.compile(r"\\" + name + r"(?![A-Za-z])")
+    pos = 0
+    while True:
+        m = regex.search(s, pos)
+        if not m:
+            return
+        if _escaped(s, m.start()):
+            pos = m.start() + 1
+            continue
+        yield m
+        pos = m.start() + 1
+
+
+def convert_includegraphics(s):
+    err = "Error: malformed includegraphics command"
+    while True:
+        m = next(_cmd_iter(s, "includegraphics"), None)
+        if m is None:
+            return s
+        i = _skip_ws(s, m.end())
+        if i < len(s) and s[i] == "*":
+            i = _skip_ws(s, i + 1)
+        i = _opt_arg(s, i)
+        if i is None:
+            raise ConvertError(err)
+        i = _skip_ws(s, i)
+        arg = _brace_arg(s, i)
+        if arg is None:
+            raise ConvertError(err)
+        path = arg[0].strip()
+        s = s[:m.start()] + "![image](" + path + ")" + s[arg[1]:]
+
+
+def convert_parbox(s):
+    err = "Error: malformed parbox command"
+    while True:
+        m = next(_cmd_iter(s, "parbox"), None)
+        if m is None:
+            return s
+        i = _skip_ws(s, m.end())
+        for _ in range(3):  # optional [pos][height][inner-pos]
+            if i < len(s) and s[i] == "[":
+                i = _opt_arg(s, i)
+                if i is None:
+                    raise ConvertError(err)
+                i = _skip_ws(s, i)
+        a1 = _brace_arg(s, i)
+        if a1 is None:
+            raise ConvertError(err)
+        j = _skip_ws(s, a1[1])
+        a2 = _brace_arg(s, j)
+        if a2 is None:
+            raise ConvertError(err)
+        s = s[:m.start()] + a2[0] + s[a2[1]:]
+
+
+_ENV_RE = re.compile(r"\\(begin|end)\s*\{(multicols\*?|minipage)\}")
+
+
+def unwrap_envs(s):
+    out = []
+    pos = 0
+    while True:
+        m = _ENV_RE.search(s, pos)
+        if not m:
+            break
+        if _escaped(s, m.start()):
+            out.append(s[pos:m.start() + 1])
+            pos = m.start() + 1
+            continue
+        end = m.end()
+        if m.group(1) == "begin":
+            i = end
+            if m.group(2) == "minipage":
+                for _ in range(3):
+                    if i < len(s) and s[i] == "[":
+                        k = _opt_arg(s, i)
+                        if k is None:
+                            break
+                        i = k
+            a = _brace_arg(s, i)
+            if a is not None:
+                end = a[1]
+                if m.group(2).startswith("multicols") and end < len(s) and s[end] == "[":
+                    k = _opt_arg(s, end)
+                    if k is not None:
+                        end = k
+        before = s[pos:m.start()]
+        # drop the whole line if the token stands alone on it
+        line_start = before.rfind("\n") + 1
+        rest_end = s.find("\n", end)
+        if rest_end == -1:
+            rest_end = len(s)
+        if before[line_start:].strip(" \t") == "" and s[end:rest_end].strip(" \t") == "":
+            out.append(before[:line_start])
+            pos = rest_end + 1 if rest_end < len(s) else rest_end
+        else:
+            out.append(before)
+            pos = end
+    out.append(s[pos:])
+    return "".join(out)
+
+
+def convert_np(s):
+    while True:
+        m = next(_cmd_iter(s, "np"), None)
+        if m is None:
+            return s
+        i = _skip_ws(s, m.end())
+        if i < len(s) and s[i] == "[":
+            k = _opt_arg(s, i)
+            if k is not None:
+                i = _skip_ws(s, k)
+        a = _brace_arg(s, i)
+        if a is None:
+            # leave malformed \np as literal text (escape-mark to avoid looping)
+            return s[:m.end()] + convert_np(s[m.end():])
+        s = s[:m.start()] + a[0] + s[a[1]:]
 
 
 _LIST_RE = re.compile(
@@ -274,6 +542,10 @@ def convert(text):
     text = remove_comments(text)
     text = select_body(text)
     text = strip_lines(text)
+    text = convert_includegraphics(text)
+    text = convert_parbox(text)
+    text = unwrap_envs(text)
+    text = convert_np(text)
     store = []
     text = convert_display_math(text, store)
     text = convert_lists(text)
@@ -305,7 +577,7 @@ def main(argv=None):
         out_path = os.path.splitext(os.path.basename(args.input))[0] + ".md"
     try:
         result = convert(src)
-    except ListError as e:
+    except (ListError, ConvertError) as e:
         sys.stderr.write(str(e) + "\n")
         return 1
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
