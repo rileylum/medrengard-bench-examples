@@ -6,6 +6,7 @@ import csv
 import io
 import math
 import os
+import re
 import sys
 from fractions import Fraction
 from decimal import Decimal, InvalidOperation
@@ -116,10 +117,8 @@ def relic_info(name):
     return None
 
 
-def invention(args, name, sde, types, by_name, product_bps, bp_products,
-              times, header, is_pub):
-    skill = args.skill
-    # invention data: source -> list of (act, product blueprint, runs)
+def load_invention_data(sde):
+    # invention data: target blueprint -> list of (act, source, runs)
     inv_out = {}   # target blueprint -> list of (act, source, runs)
     for row in read_csv(sde, "industryActivityProducts.csv.bz2"):
         act = to_int(row.get("activityID"))
@@ -158,6 +157,13 @@ def invention(args, name, sde, types, by_name, product_bps, bp_products,
         if sid not in lst:
             lst.append(sid)
 
+    return inv_out, probs, imats, iskills
+
+
+def invention(args, name, sde, types, by_name, product_bps, bp_products,
+              times, header, is_pub):
+    skill = args.skill
+    inv_out, probs, imats, iskills = load_invention_data(sde)
     ids = by_name.get(name, [])
     if not ids:
         print(f"Error: no published item named '{name}'", file=sys.stderr)
@@ -276,6 +282,225 @@ def invention(args, name, sde, types, by_name, product_bps, bp_products,
     return 0
 
 
+def parse_build_string(s, by_name):
+    """Return dict describing the build, or None."""
+    s = " ".join(s.split())
+    jobs = 1
+    m = re.match(r"^(.*\S)\s+[xX](\d+)$", s)
+    if m:
+        s, jobs = m.group(1), int(m.group(2))
+    dec_alt = "|".join(re.escape(d[0]) for d in DECRYPTORS)
+    relic_alt = "|".join(re.escape(r[0]) for r in RELICS)
+
+    def dec_canon(t):
+        for d in DECRYPTORS:
+            if d[0].lower() == t.lower():
+                return d
+        return None
+
+    cands = []
+    m = re.match(rf"^(.+?) (\d+) ({dec_alt}) ((?:{relic_alt})(?: .+)?)$", s, re.I)
+    if m:
+        cands.append(dict(kind="re", name=m.group(1), runs=int(m.group(2)),
+                          decryptor=dec_canon(m.group(3)), relic=m.group(4)))
+    m = re.match(rf"^(.+) (\d+) ({dec_alt})$", s, re.I)
+    if m:
+        cands.append(dict(kind="invention", name=m.group(1), runs=int(m.group(2)),
+                          decryptor=dec_canon(m.group(3))))
+    m = re.match(r"^(.+) (\d+) (\d+) (\d+)$", s)
+    if m:
+        cands.append(dict(kind="normal", name=m.group(1), runs=int(m.group(2)),
+                          me=int(m.group(3)), te=int(m.group(4))))
+    m = re.match(r"^(.+) (\d+)$", s)
+    if m:
+        cands.append(dict(kind="normal", name=m.group(1), runs=int(m.group(2)),
+                          me=0, te=0))
+    cands.append(dict(kind="normal", name=s, runs=1, me=0, te=0))
+    for c in cands:
+        c["jobs"] = jobs
+    for c in cands:
+        if c["name"] in by_name:
+            return c
+    lower = {k.lower(): k for k in by_name}
+    for c in cands:
+        if c["name"].lower() in lower:
+            c["name"] = lower[c["name"].lower()]
+            return c
+    return cands[0]
+
+
+def load_config(path):
+    cfg = {}
+    if path:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        try:
+            import yaml
+            data = yaml.safe_load(text)
+            if isinstance(data, dict):
+                cfg = data
+        except Exception:
+            for line in text.splitlines():
+                line = line.split("#", 1)[0]
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    cfg[k.strip()] = v.strip()
+    te_bonus = int(cfg.get("te_bonus", 0) or 0)
+    skill = int(cfg.get("invention_skill", 5) or 5)
+    return te_bonus, skill
+
+
+def frac_of(x):
+    return Fraction(Decimal(str(x)))
+
+
+def plan(args, build, sde, types, by_name, product_bps, bp_products, times,
+         mats, is_pub, groups, cats):
+    te_bonus, skill = load_config(args.config)
+    spec = parse_build_string(build, by_name)
+    name = spec["name"]
+    ids = by_name.get(name, [])
+    if not ids:
+        print(f"Error: no published item named '{name}'", file=sys.stderr)
+        return 1
+    runs, njobs = spec["runs"], spec["jobs"]
+
+    def tname(t):
+        return types[t]["name"] if t in types else str(t)
+
+    buy = {}
+
+    def add(tid, qty):
+        if qty:
+            buy[tid] = buy.get(tid, 0) + qty
+
+    def pick_bp(tid, need_inv=None):
+        cands = [c for c in product_bps.get(tid, [])
+                 if need_inv is None or c[1] in need_inv]
+        cands.sort(key=lambda c: (0 if is_pub(c[1]) else 1,
+                                  0 if (c[1], c[0]) in mats else 1,
+                                  0 if c[0] == MANUFACTURING else 1, c[1]))
+        return cands[0] if cands else None
+
+    if spec["kind"] == "normal":
+        choice = None
+        for tid in sorted(ids):
+            choice = pick_bp(tid)
+            if choice:
+                break
+        if choice is None:
+            print(f"Error: no recipe for '{name}'", file=sys.stderr)
+            return 1
+        act, bp, _ = choice
+        me, te = spec["me"], spec["te"]
+    else:
+        inv_out, probs, imats, iskills = load_invention_data(sde)
+        choice = None
+        for tid in sorted(ids):
+            choice = pick_bp(tid, inv_out)
+            if choice:
+                break
+        if choice is None:
+            print(f"Error: no invention recipe for '{name}'", file=sys.stderr)
+            return 1
+        act, bp, _ = choice
+        dname, dmult, druns, dme, dte = spec["decryptor"]
+        sources = inv_out[bp]
+        if spec["kind"] == "re":
+            rel = spec["relic"].lower()
+            src = None
+            for s in sources:
+                if tname(s[1]).lower() == rel:
+                    src = s
+                    break
+            if src is None:
+                matches = sorted(
+                    [s for s in sources if tname(s[1]).lower().startswith(rel)],
+                    key=lambda s: (tname(s[1]), s[1]))
+                if matches:
+                    src = matches[0]
+            if src is None:
+                print(f"Error: no relic '{spec['relic']}' for '{name}'",
+                      file=sys.stderr)
+                return 1
+            ri = relic_info(tname(src[1]))
+            base = frac_of(ri[1]) if ri else frac_of(
+                probs.get((src[1], src[0], bp), 0))
+            bp_runs = (ri[2] if ri else src[2]) + druns
+        else:
+            src = sorted(sources, key=lambda s: (
+                0 if is_pub(s[1]) else 1, 0 if s[0] == 8 else 1, s[1]))[0]
+            base = frac_of(probs.get((src[1], src[0], bp), 0))
+            bp_runs = src[2] + druns
+        sact, ssrc, _ = src
+        skill_ids = iskills.get((ssrc, sact), [])
+        factor = Fraction(1)
+        for sid in skill_ids:
+            if "Encryption Methods" in tname(sid):
+                factor += Fraction(skill, 40)
+            else:
+                factor += Fraction(skill, 30)
+        p = base * factor * (1 + Fraction(dmult, 100))
+        p = max(Fraction(0), min(Fraction(1), p))
+        bp_runs = max(1, bp_runs)
+        n_bps = math.ceil(Fraction(runs * njobs, bp_runs))
+        if p <= 0:
+            print(f"Error: invention impossible for '{name}'", file=sys.stderr)
+            return 1
+        attempts = math.ceil(n_bps / p)
+        for mid, q in imats.get((ssrc, sact), []):
+            add(mid, q * attempts)
+        if spec["kind"] == "re":
+            add(ssrc, attempts)
+        if dname != "None":
+            dec_ids = by_name.get(dname, [])
+            if dec_ids:
+                add(sorted(dec_ids)[0], attempts)
+        me, te = 2 + dme, 4 + dte
+
+    if act != MANUFACTURING:
+        me = 0
+    for mid, q in mats.get((bp, act), []):
+        per_job = max(runs, math.ceil(Fraction(q) * runs * (1 - Fraction(me, 100))))
+        add(mid, per_job * njobs)
+
+    secs = Fraction(times.get((bp, act), 0)) * runs * (1 - Fraction(te, 100)) \
+        * (1 - Fraction(te_bonus, 100))
+    days = round(float(secs / 86400), 2)
+
+    ship_vols = load_ship_volumes(sde)
+
+    def unit_volume(tid):
+        t = types.get(tid)
+        if not t:
+            return Decimal(0)
+        gname, cid = groups.get(t["group"], ("Unknown", None))
+        if cats.get(cid) == "Ship" and gname in ship_vols:
+            return ship_vols[gname]
+        return t["volume"] if t["volume"] is not None else Decimal(0)
+
+    os.makedirs(args.output, exist_ok=True)
+    rows = []
+    for tid, qty in buy.items():
+        rows.append((tname(tid), qty, fmt_plain(unit_volume(tid) * qty)))
+    rows.sort(key=lambda r: r[0])
+    with open(os.path.join(args.output, "materials.csv"), "w",
+              newline="", encoding="utf-8") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(["name", "to_buy", "buy_volume", "start_amount", "end_amount"])
+        for n, q, v in rows:
+            w.writerow([n, q, v, 0, 0])
+    jobs = [(tname(bp), runs, days, njobs)]
+    jobs.sort(key=lambda j: (j[0], j[1], j[3], j[2]))
+    with open(os.path.join(args.output, "jobs.csv"), "w",
+              newline="", encoding="utf-8") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(["name", "runs", "days", "count"])
+        for n, r, d, c in jobs:
+            w.writerow([n, r, d, c])
+    return 0
+
+
 def _ranged_int(lo, hi, even=False):
     def conv(v):
         try:
@@ -311,6 +536,11 @@ def main(argv=None):
     inv.add_argument("name", nargs="+")
     inv.add_argument("--sde", required=True)
     inv.add_argument("--skill", type=int, default=5, choices=[1, 2, 3, 4, 5])
+    pl = sub.add_parser("plan")
+    pl.add_argument("name", nargs="+")
+    pl.add_argument("--config", default=None)
+    pl.add_argument("--sde", required=True)
+    pl.add_argument("--output", required=True)
     args = p.parse_args(argv)
     name = " ".join(args.name)
     sde = args.sde
@@ -394,6 +624,10 @@ def main(argv=None):
                 "Structure Tech I": "Tech I", "Structure Tech II": "Tech II"}.get(
             mgname, "Tech I")
         return item, cname, gname, market, tech
+
+    if args.cmd == "plan":
+        return plan(args, name, sde, types, by_name, product_bps, bp_products,
+                    times, mats, is_pub, groups, cats)
 
     if args.cmd == "invention":
         return invention(args, name, sde, types, by_name, product_bps,
