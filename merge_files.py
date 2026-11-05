@@ -18,7 +18,13 @@ Exit codes:
   4  invalid schema file, or cast failure with --on-type-error=fail
   5  input parse error (malformed CSV/TSV/JSONL/Parquet, bad UTF-8,
      compression mismatch)
-  6  unsupported nested structure in JSONL/Parquet input
+  6  nested structure in JSONL/Parquet input without --schema, or Parquet
+     nesting that does not match the provided schema
+
+Nested types (struct, array<T>, map<string,T>, json) may be declared in
+--schema; nested columns are written as canonical (minified) JSON text.
+--key / --partition-by accept field paths such as user.id, items.0.qty and
+attrs["country"], which must resolve to primitive types.
 """
 
 import argparse
@@ -57,9 +63,10 @@ EXIT_NESTED = 6
 class MergeError(Exception):
     """Fatal user-facing error."""
 
-    def __init__(self, code, msg):
+    def __init__(self, code, msg, raw=False):
         Exception.__init__(self, msg)
         self.code = code
+        self.raw = raw
 
 
 class CastError(Exception):
@@ -246,6 +253,8 @@ def to_text(v):
         return v.isoformat()
     if isinstance(v, (bytes, bytearray)):
         return bytes(v).decode("utf-8", "replace")
+    if isinstance(v, (dict, list, tuple)):
+        return stringify(v)
     return str(v)
 
 
@@ -270,6 +279,8 @@ def value_support(v, is_text):
 
 def cast_value(v, typ):
     """Cast a non-null value to the target type; raises CastError."""
+    if isinstance(v, (dict, list, tuple)):
+        raise CastError
     if isinstance(v, str):
         return PARSERS[typ](v)
     if typ == "string":
@@ -429,6 +440,8 @@ class Source(object):
         self.is_text = fmt in ("csv", "tsv")
         self.tier = FORMAT_TIER[fmt]
         self._pq_path = None
+        self.schema_types = None   # {name: type} when --schema is given
+        self.cur_line = 0
 
     # -- text formats -----------------------------------------------------
 
@@ -448,6 +461,7 @@ class Source(object):
             f = io.TextIOWrapper(b, encoding="utf-8-sig", newline="")
             reader = csv.reader(f, **kw)
             for row in reader:
+                self.cur_line = reader.line_num
                 yield row
 
     def _tsv_rows(self):
@@ -472,6 +486,7 @@ class Source(object):
                     continue
                 if line == "":
                     continue
+                self.cur_line = lineno
                 fields = line.split("\t")
                 if len(fields) > ncols:
                     raise MergeError(
@@ -530,12 +545,15 @@ class Source(object):
                     raise MergeError(EXIT_PARSE,
                                      "%s line %d: expected a JSON object"
                                      % (self.path, lineno))
+                self.cur_line = lineno
                 for k, v in obj.items():
                     if isinstance(v, (dict, list)):
-                        raise MergeError(
-                            EXIT_NESTED,
-                            "nested value for field %r in %s line %d"
-                            % (k, self.path, lineno))
+                        if self.schema_types is None:
+                            raise MergeError(
+                                EXIT_NESTED,
+                                "ERR 6 nested structure requires provided --schema",
+                                raw=True)
+                        continue
                     if isinstance(v, int) and not isinstance(v, bool):
                         if not (-(1 << 63) <= v < (1 << 63)):
                             try:
@@ -575,14 +593,24 @@ class Source(object):
             raise MergeError(EXIT_PARSE, "cannot read Parquet file %s: %s"
                              % (self.path, e))
         import pyarrow as pa
+        st = self.schema_types
         for field in pf.schema_arrow:
             t = field.type
             if pa.types.is_dictionary(t):
                 t = t.value_type
-            if pa.types.is_nested(t):
-                raise MergeError(EXIT_NESTED,
-                                 "nested Parquet column %r (%s) in %s"
-                                 % (field.name, field.type, self.path))
+            if st is None:
+                if pa.types.is_nested(t):
+                    raise MergeError(
+                        EXIT_NESTED,
+                        "ERR 6 nested structure requires provided --schema",
+                        raw=True)
+            elif field.name in st and not arrow_compatible(t, st[field.name]):
+                raise MergeError(
+                    EXIT_NESTED,
+                    'ERR 6 Parquet column "%s" (%s) in %s does not match schema '
+                    "type %s" % (field.name, field.type, self.path,
+                                 type_name(st[field.name])),
+                    raw=True)
         return pf
 
     def _batch_rows(self, pf):
@@ -615,6 +643,11 @@ class Source(object):
                         arr = pc.cast(arr, pa.duration("us"), safe=False)
                     elif pa.types.is_time64(t) and t.unit == "ns":
                         arr = pc.cast(arr, pa.time64("us"), safe=False)
+                    if pa.types.is_nested(t):
+                        arr = _cast_nested_ns(arr)
+                        t = arr.type
+                        arrays.append([arrow_to_py(v, t) for v in arr.to_pylist()])
+                        continue
                     arrays.append(arr.to_pylist())
                 yield arrays
         except MergeError:
@@ -639,6 +672,7 @@ class Source(object):
             return
         for arrays in self._parquet_batches(pf, cols):
             for vals in zip(*arrays):
+                self.cur_line += 1
                 yield [None if i is None else _pq_norm(vals[i]) for i in src]
 
     # -- public API -----------------------------------------------------------
@@ -743,9 +777,45 @@ class Source(object):
         return cols, cands
 
 
+def _ns_to_us(t):
+    import pyarrow as pa
+    if pa.types.is_timestamp(t) and t.unit == "ns":
+        return pa.timestamp("us", t.tz)
+    if pa.types.is_duration(t) and t.unit == "ns":
+        return pa.duration("us")
+    if pa.types.is_time64(t) and t.unit == "ns":
+        return pa.time64("us")
+    if pa.types.is_dictionary(t):
+        return _ns_to_us(t.value_type)
+    if pa.types.is_struct(t):
+        return pa.struct([pa.field(t.field(i).name, _ns_to_us(t.field(i).type))
+                          for i in range(t.num_fields)])
+    if pa.types.is_map(t):
+        return pa.map_(_ns_to_us(t.key_type), _ns_to_us(t.item_type))
+    if pa.types.is_large_list(t):
+        return pa.large_list(_ns_to_us(t.value_type))
+    if pa.types.is_list(t):
+        return pa.list_(_ns_to_us(t.value_type))
+    if pa.types.is_fixed_size_list(t):
+        return pa.list_(_ns_to_us(t.value_type), t.list_size)
+    return t
+
+
+def _cast_nested_ns(arr):
+    """Downcast nanosecond temporal types nested inside arr to microseconds."""
+    import pyarrow.compute as pc
+    target = _ns_to_us(arr.type)
+    if target.equals(arr.type):
+        return arr
+    try:
+        return pc.cast(arr, target, safe=False)
+    except Exception:
+        return arr
+
+
 def _pq_norm(v):
     if v is None or isinstance(v, (str, bool, int, float, _dt.date,
-                                   decimal.Decimal)):
+                                   decimal.Decimal, dict, list)):
         return v
     if isinstance(v, (bytes, bytearray)):
         try:
@@ -772,7 +842,7 @@ def open_sources(args, tmpdir):
 # Schema
 # ---------------------------------------------------------------------------
 
-def load_schema(path):
+def load_schema(path, aliases=None):
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -789,20 +859,693 @@ def load_schema(path):
         raise MergeError(EXIT_SCHEMA, "schema must be an object with a 'columns' list")
     cols = []
     seen = set()
+    resolver = TypeResolver(aliases)
     for c in cols_in:
         if not isinstance(c, dict) or not isinstance(c.get("name"), str):
             raise MergeError(EXIT_SCHEMA, "each schema column must have a string 'name'")
         typ = c.get("type", "string")
-        if not isinstance(typ, str) or typ.lower() not in VALID_TYPES:
-            raise MergeError(EXIT_SCHEMA,
-                             "invalid type %r for column %r" % (typ, c["name"]))
+        try:
+            rtyp = resolver.resolve(typ)
+        except TypeSpecError as e:
+            raise MergeError(EXIT_SCHEMA, "invalid type %s for column %r: %s"
+                             % (json.dumps(typ, sort_keys=True), c["name"], e))
+        except AliasCycleError as e:
+            raise MergeError(EXIT_USAGE, "type alias cycle: %s" % e)
         if c["name"] in seen:
             raise MergeError(EXIT_SCHEMA, "duplicate column %r in schema" % c["name"])
         seen.add(c["name"])
-        cols.append((c["name"], typ.lower()))
+        cols.append((c["name"], rtyp))
     if not cols:
         raise MergeError(EXIT_SCHEMA, "schema has no columns")
     return cols
+
+
+# ---------------------------------------------------------------------------
+# Nested types, aliases and field paths
+# ---------------------------------------------------------------------------
+#
+# Type representation:
+#   primitive        -> one of VALID_TYPES (a str)
+#   arbitrary JSON   -> JSON_T
+#   struct           -> ("struct", ((name, T), ...))
+#   array<T>         -> ("array", T)
+#   map<string,T>    -> ("map", T)
+
+JSON_T = "json"
+
+BUILTIN_ALIASES = {
+    "integer": "int",
+    "long": "int",
+    "double": "float",
+    "number": "float",
+    "boolean": "bool",
+    "datetime": "timestamp",
+    "timestamptz": "timestamp",
+    "text": "string",
+    "varchar": "string",
+}
+_GENERIC_KINDS = ("array", "list", "map", "struct")
+_RESERVED = set(VALID_TYPES) | {JSON_T} | set(_GENERIC_KINDS)
+
+
+def is_primitive(t):
+    return isinstance(t, str) and t in VALID_TYPES
+
+
+def is_nested(t):
+    return not is_primitive(t)
+
+
+def type_name(t):
+    if isinstance(t, str):
+        return t
+    kind = t[0]
+    if kind == "array":
+        return "array<%s>" % type_name(t[1])
+    if kind == "map":
+        return "map<string,%s>" % type_name(t[1])
+    return "struct<%s>" % ",".join("%s:%s" % (n, type_name(ft)) for n, ft in t[1])
+
+
+class TypeSpecError(Exception):
+    pass
+
+
+class AliasCycleError(Exception):
+    pass
+
+
+class TypeResolver(object):
+    """Resolves type expressions (strings or JSON objects) with aliases."""
+
+    def __init__(self, user_aliases=None):
+        self.user = dict(user_aliases or {})
+        self._cache = {}
+        self._stack = []
+
+    # -- names ----------------------------------------------------------------
+
+    def resolve_name(self, name):
+        low = name.strip().lower()
+        if low in VALID_TYPES or low == JSON_T:
+            return low
+        if low in self._cache:
+            return self._cache[low]
+        if low in self.user:
+            if low in self._stack:
+                raise AliasCycleError(" -> ".join(self._stack[self._stack.index(low):]
+                                                 + [low]))
+            self._stack.append(low)
+            try:
+                t = self.resolve(self.user[low])
+            finally:
+                self._stack.pop()
+            self._cache[low] = t
+            return t
+        if low in BUILTIN_ALIASES:
+            return BUILTIN_ALIASES[low]
+        raise TypeSpecError("unknown type %r" % name)
+
+    # -- expressions ----------------------------------------------------------
+
+    def resolve(self, spec):
+        if isinstance(spec, str):
+            return self._parse_string(spec)
+        if isinstance(spec, dict):
+            return self._parse_object(spec)
+        raise TypeSpecError("invalid type specification %r" % (spec,))
+
+    def _parse_object(self, spec):
+        if len(spec) != 1:
+            if "type" in spec:
+                return self.resolve(spec["type"])
+            raise TypeSpecError("invalid type specification %s"
+                                % json.dumps(spec, sort_keys=True))
+        kind, body = next(iter(spec.items()))
+        k = kind.strip().lower() if isinstance(kind, str) else kind
+        if k == "struct":
+            fields = body.get("fields") if isinstance(body, dict) else body
+            if not isinstance(fields, list):
+                raise TypeSpecError("struct requires a 'fields' list")
+            out = []
+            seen = set()
+            for f in fields:
+                if not isinstance(f, dict) or not isinstance(f.get("name"), str):
+                    raise TypeSpecError("each struct field needs a string 'name'")
+                if f["name"] in seen:
+                    raise TypeSpecError("duplicate struct field %r" % f["name"])
+                seen.add(f["name"])
+                out.append((f["name"], self.resolve(f.get("type", "string"))))
+            return ("struct", tuple(out))
+        if k in ("array", "list"):
+            elem = body
+            if isinstance(body, dict) and ("element" in body or "items" in body
+                                           or "item" in body):
+                elem = body.get("element", body.get("items", body.get("item")))
+            return ("array", self.resolve(elem))
+        if k == "map":
+            if not isinstance(body, dict) or "value" not in body:
+                raise TypeSpecError("map requires 'key' and 'value'")
+            kt = self.resolve(body.get("key", "string"))
+            if kt != "string":
+                raise TypeSpecError("map keys must be string, got %s" % type_name(kt))
+            return ("map", self.resolve(body["value"]))
+        if k == "type":
+            return self.resolve(body)
+        raise TypeSpecError("unknown type kind %r" % (kind,))
+
+    _TOKEN_RE = re.compile(r"\s*(?:([A-Za-z_][A-Za-z0-9_\-]*)|(.))")
+
+    def _parse_string(self, s):
+        toks = []
+        for m in self._TOKEN_RE.finditer(s):
+            if m.group(1) is not None:
+                toks.append(("id", m.group(1)))
+            elif m.group(2) is not None and not m.group(2).isspace():
+                toks.append(("p", m.group(2)))
+        if not toks:
+            raise TypeSpecError("empty type")
+        pos = [0]
+
+        def peek():
+            return toks[pos[0]] if pos[0] < len(toks) else (None, None)
+
+        def take(kind=None, val=None):
+            t = peek()
+            if t[0] is None or (kind and t[0] != kind) or (val and t[1] != val):
+                raise TypeSpecError("malformed type %r" % s)
+            pos[0] += 1
+            return t[1]
+
+        def parse_t():
+            name = take("id")
+            low = name.lower()
+            if peek() == ("p", "<"):
+                take("p", "<")
+                if low in ("array", "list"):
+                    inner = parse_t()
+                    take("p", ">")
+                    return ("array", inner)
+                if low == "map":
+                    kt = parse_t()
+                    take("p", ",")
+                    vt = parse_t()
+                    take("p", ">")
+                    if kt != "string":
+                        raise TypeSpecError("map keys must be string, got %s"
+                                            % type_name(kt))
+                    return ("map", vt)
+                if low == "struct":
+                    fields = []
+                    seen = set()
+                    if peek() != ("p", ">"):
+                        while True:
+                            fname = take("id")
+                            take("p", ":")
+                            if fname in seen:
+                                raise TypeSpecError("duplicate struct field %r" % fname)
+                            seen.add(fname)
+                            fields.append((fname, parse_t()))
+                            if peek() == ("p", ","):
+                                take("p", ",")
+                                continue
+                            break
+                    take("p", ">")
+                    return ("struct", tuple(fields))
+                raise TypeSpecError("type %r takes no parameters" % name)
+            if low in _GENERIC_KINDS:
+                raise TypeSpecError("type %r requires parameters" % name)
+            return self.resolve_name(name)
+
+        t = parse_t()
+        if pos[0] != len(toks):
+            raise TypeSpecError("malformed type %r" % s)
+        return t
+
+
+def load_aliases(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError as e:
+        raise MergeError(EXIT_USAGE, "cannot read type alias file %r: %s" % (path, e))
+    except ValueError as e:
+        raise MergeError(EXIT_USAGE, "invalid type alias JSON in %r: %s" % (path, e))
+    if isinstance(data, dict) and "aliases" in data:
+        data = data["aliases"]
+    if not isinstance(data, dict):
+        raise MergeError(EXIT_USAGE, "type alias file must contain an 'aliases' object")
+    aliases = {}
+    for name in sorted(data):
+        low = name.strip().lower()
+        if not low:
+            raise MergeError(EXIT_USAGE, "empty alias name in type alias file")
+        if low in _RESERVED:
+            raise MergeError(EXIT_USAGE, "cannot redefine built-in type %r" % name)
+        if low in aliases:
+            raise MergeError(EXIT_USAGE, "duplicate alias %r (case-insensitive)" % name)
+        aliases[low] = data[name]
+    resolver = TypeResolver(aliases)
+    for low in sorted(aliases):
+        try:
+            resolver.resolve_name(low)
+        except AliasCycleError as e:
+            raise MergeError(EXIT_USAGE, "type alias cycle: %s" % e)
+        except TypeSpecError as e:
+            raise MergeError(EXIT_USAGE, "invalid type alias %r: %s" % (low, e))
+    return aliases
+
+
+class KeptStr(str):
+    """A value kept verbatim (as text) after a failed cast."""
+    __slots__ = ()
+
+
+def canonical_json(obj):
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False)
+
+
+def to_plain(v):
+    """Typed value tree -> JSON-compatible tree (order preserved)."""
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return str(v)
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        return v
+    if isinstance(v, _dt.datetime):
+        return format_value("timestamp", to_utc(v))
+    if isinstance(v, _dt.date):
+        return v.isoformat()
+    if isinstance(v, decimal.Decimal):
+        if not v.is_finite():
+            return None
+        if v == v.to_integral_value() and abs(v) < (1 << 63):
+            return int(v)
+        return float(v)
+    if isinstance(v, dict):
+        return {str(k): to_plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [to_plain(x) for x in v]
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v).decode("utf-8", "replace")
+    return str(v)
+
+
+def normalize_json(v):
+    """Any JSON-like value -> canonical tree (object keys sorted)."""
+    if isinstance(v, dict):
+        return {k: normalize_json(v[k]) for k in sorted(v, key=str)} \
+            if all(isinstance(k, str) for k in v) else \
+            {str(k): normalize_json(x) for k, x in sorted(
+                ((str(k), x) for k, x in v.items()), key=lambda kv: kv[0])}
+    if isinstance(v, (list, tuple)):
+        return [normalize_json(x) for x in v]
+    return to_plain(v)
+
+
+def _reject_constant(s):
+    raise ValueError("invalid JSON constant %s" % s)
+
+
+def parse_json_text(s):
+    return json.loads(s, parse_constant=_reject_constant)
+
+
+def stringify(v):
+    """Original/stringified text of a raw value (for keep-string)."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (dict, list, tuple)):
+        try:
+            return canonical_json(normalize_json(v))
+        except (TypeError, ValueError):
+            return str(v)
+    return to_text(v)
+
+
+def path_child_field(path, name):
+    return "%s.%s" % (path, name)
+
+
+def path_child_index(path, i):
+    return "%s.%d" % (path, i)
+
+
+def path_child_key(path, k):
+    return "%s[%s]" % (path, json.dumps(k, ensure_ascii=False))
+
+
+class NestedCaster(object):
+    """Recursively casts raw values to a declared (possibly nested) type."""
+
+    def __init__(self, on_err):
+        self.on_err = on_err
+        self.src = None
+
+    def fail(self, v, typ, path):
+        if self.on_err == "fail":
+            src = self.src
+            raise MergeError(
+                EXIT_SCHEMA,
+                'ERR 4 cannot cast "%s" to %s in field "%s" (file=%s line=%s)'
+                % (stringify(v), type_name(typ), path,
+                   src.path if src else "?", src.cur_line if src else "?"),
+                raw=True)
+        if self.on_err == "keep-string":
+            return KeptStr(stringify(v))
+        return None
+
+    def cast(self, v, typ, path):
+        if v is None:
+            return None
+        if typ == JSON_T:
+            return normalize_json(v)
+        if isinstance(typ, str):
+            if isinstance(v, (dict, list, tuple)):
+                return self.fail(v, typ, path)
+            try:
+                return cast_value(v, typ)
+            except CastError:
+                return self.fail(v, typ, path)
+        kind = typ[0]
+        if kind == "struct":
+            if not isinstance(v, dict):
+                return self.fail(v, typ, path)
+            return {name: self.cast(v.get(name), ft, path_child_field(path, name))
+                    for name, ft in typ[1]}
+        if kind == "array":
+            if not isinstance(v, (list, tuple)):
+                return self.fail(v, typ, path)
+            et = typ[1]
+            return [self.cast(x, et, path_child_index(path, i))
+                    for i, x in enumerate(v)]
+        if kind == "map":
+            if not isinstance(v, dict):
+                return self.fail(v, typ, path)
+            vt = typ[1]
+            out = {}
+            for k in sorted(v, key=str):
+                ks = k if isinstance(k, str) else to_text(k)
+                out[ks] = self.cast(v[k], vt, path_child_key(path, ks))
+            return {k: out[k] for k in sorted(out)}
+        raise AssertionError(typ)
+
+    def cast_top(self, v, typ, name, from_text):
+        """Cast a top-level column value for a nested/json column."""
+        if v is None:
+            return None
+        if from_text and isinstance(v, str):
+            try:
+                parsed = parse_json_text(v)
+            except ValueError as e:
+                if self.on_err == "fail":
+                    src = self.src
+                    raise MergeError(
+                        EXIT_PARSE,
+                        'ERR 5 invalid JSON "%s" for %s in field "%s" '
+                        "(file=%s line=%s): %s"
+                        % (v, type_name(typ), name, src.path, src.cur_line, e),
+                        raw=True)
+                if self.on_err == "keep-string":
+                    return KeptStr(v)
+                return None
+            if parsed is None:
+                return None
+            res = self.cast(parsed, typ, name)
+            if isinstance(res, KeptStr) and not isinstance(parsed, str):
+                # Top-level failure: keep the original unparsed text.
+                return KeptStr(v)
+            return res
+        return self.cast(v, typ, name)
+
+
+def encode_nested(tree):
+    if isinstance(tree, KeptStr):
+        return str(tree)
+    return canonical_json(to_plain(tree))
+
+
+# -- field paths --------------------------------------------------------------
+
+def split_paths(spec):
+    """Split a comma-separated list of field paths, honoring [..] and quotes."""
+    out = []
+    cur = []
+    depth = 0
+    quote = None
+    i = 0
+    while i < len(spec):
+        ch = spec[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and i + 1 < len(spec):
+                cur.append(spec[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'" and depth > 0:
+            quote = ch
+            cur.append(ch)
+        elif ch == "[":
+            depth += 1
+            cur.append(ch)
+        elif ch == "]":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    out.append("".join(cur).strip())
+    return out
+
+
+class PathSyntaxError(Exception):
+    pass
+
+
+def parse_path(path):
+    """Return list of segments: ("name", s) for dotted parts, ("index", i),
+    ("key", s) for bracketed parts."""
+    segs = []
+    i = 0
+    n = len(path)
+    expect_name = True
+    while i < n:
+        ch = path[i]
+        if ch == "[":
+            j = i + 1
+            while j < n and path[j] == " ":
+                j += 1
+            if j < n and path[j] in "\"'":
+                q = path[j]
+                k = j + 1
+                buf = []
+                while k < n and path[k] != q:
+                    if path[k] == "\\" and k + 1 < n:
+                        buf.append(path[k:k + 2])
+                        k += 2
+                        continue
+                    buf.append(path[k])
+                    k += 1
+                if k >= n:
+                    raise PathSyntaxError("unterminated string in %r" % path)
+                raw = "".join(buf)
+                if q == '"':
+                    try:
+                        key = json.loads('"' + raw + '"')
+                    except ValueError:
+                        raise PathSyntaxError("bad string in %r" % path)
+                else:
+                    key = raw.replace("\\'", "'").replace("\\\\", "\\")
+                k += 1
+                while k < n and path[k] == " ":
+                    k += 1
+                if k >= n or path[k] != "]":
+                    raise PathSyntaxError("expected ] in %r" % path)
+                segs.append(("key", key))
+                i = k + 1
+            else:
+                k = path.find("]", j)
+                if k < 0:
+                    raise PathSyntaxError("expected ] in %r" % path)
+                tok = path[j:k].strip()
+                if not re.match(r"^\d+$", tok):
+                    raise PathSyntaxError("array index must be a non-negative "
+                                          "integer in %r" % path)
+                segs.append(("index", int(tok)))
+                i = k + 1
+            expect_name = False
+            continue
+        if ch == ".":
+            if expect_name:
+                raise PathSyntaxError("empty path segment in %r" % path)
+            i += 1
+            expect_name = True
+            if i >= n:
+                raise PathSyntaxError("empty path segment in %r" % path)
+            continue
+        if not expect_name:
+            raise PathSyntaxError("unexpected %r in %r" % (ch, path))
+        j = i
+        while j < n and path[j] not in ".[":
+            j += 1
+        segs.append(("name", path[i:j]))
+        i = j
+        expect_name = False
+    if not segs or segs[0][0] != "name":
+        raise PathSyntaxError("path must start with a column name: %r" % path)
+    return segs
+
+
+class FieldRef(object):
+    """A resolved key/partition reference into a row."""
+    __slots__ = ("path", "col", "steps", "type")
+
+    def __init__(self, path, col, steps, typ):
+        self.path = path
+        self.col = col
+        self.steps = steps   # tuple of ("f"|"i"|"k", value)
+        self.type = typ
+
+
+def resolve_field_ref(path, names, types):
+    """Resolve a field path against the schema.  Raises MergeError(3)."""
+    name_pos = {n: i for i, n in enumerate(names)}
+    not_primitive = MergeError(
+        EXIT_KEY, 'ERR 3 key column "%s" does not resolve to a primitive' % path,
+        raw=True)
+    if path in name_pos:
+        j = name_pos[path]
+        if not is_primitive(types[j]):
+            raise not_primitive
+        return FieldRef(path, j, (), types[j])
+    try:
+        segs = parse_path(path)
+    except PathSyntaxError as e:
+        raise MergeError(EXIT_KEY, 'ERR 3 key column "%s" is not a valid field '
+                         'path: %s' % (path, e), raw=True)
+    first = segs[0][1]
+    if first not in name_pos:
+        raise MergeError(EXIT_KEY, "key column %r not present in resolved schema"
+                         % path)
+    j = name_pos[first]
+    typ = types[j]
+    steps = []
+    for kind, val in segs[1:]:
+        if isinstance(typ, str):
+            if typ == JSON_T:
+                raise not_primitive
+            raise MergeError(EXIT_KEY, "key column %r not present in resolved "
+                             "schema" % path)
+        tk = typ[0]
+        if tk == "struct":
+            fname = str(val)
+            fields = dict(typ[1])
+            if fname not in fields:
+                raise MergeError(EXIT_KEY, "key column %r not present in resolved "
+                                 "schema" % path)
+            steps.append(("f", fname))
+            typ = fields[fname]
+        elif tk == "array":
+            if kind == "index":
+                idx = val
+            elif kind == "name" and re.match(r"^\d+$", val):
+                idx = int(val)
+            else:
+                raise MergeError(EXIT_KEY, 'ERR 3 key column "%s": array index '
+                                 'must be a non-negative integer' % path, raw=True)
+            steps.append(("i", idx))
+            typ = typ[1]
+        else:  # map
+            steps.append(("k", str(val)))
+            typ = typ[1]
+    if not is_primitive(typ):
+        raise not_primitive
+    return FieldRef(path, j, tuple(steps), typ)
+
+
+def walk_ref(tree, steps):
+    v = tree
+    for kind, val in steps:
+        if v is None or isinstance(v, KeptStr):
+            return None
+        if kind == "i":
+            if not isinstance(v, list) or val >= len(v):
+                return None
+            v = v[val]
+        else:
+            if not isinstance(v, dict):
+                return None
+            v = v.get(val)
+    return v
+
+
+# -- Parquet <-> declared type ---------------------------------------------------
+
+def arrow_compatible(at, typ):
+    import pyarrow as pa
+    if typ == JSON_T:
+        return True
+    if pa.types.is_dictionary(at):
+        at = at.value_type
+    if pa.types.is_struct(at):
+        if not (isinstance(typ, tuple) and typ[0] == "struct"):
+            return False
+        declared = dict(typ[1])
+        for i in range(at.num_fields):
+            f = at.field(i)
+            if f.name in declared and not arrow_compatible(f.type, declared[f.name]):
+                return False
+        return True
+    if pa.types.is_map(at):
+        if not (isinstance(typ, tuple) and typ[0] == "map"):
+            return False
+        kt = at.key_type
+        if not (pa.types.is_string(kt) or pa.types.is_large_string(kt)):
+            return False
+        return arrow_compatible(at.item_type, typ[1])
+    if (pa.types.is_list(at) or pa.types.is_large_list(at)
+            or pa.types.is_fixed_size_list(at)
+            or getattr(pa.types, "is_list_view", lambda _t: False)(at)
+            or getattr(pa.types, "is_large_list_view", lambda _t: False)(at)):
+        if not (isinstance(typ, tuple) and typ[0] == "array"):
+            return False
+        return arrow_compatible(at.value_type, typ[1])
+    if pa.types.is_nested(at):
+        return False
+    # Primitive Parquet column: values are cast per --on-type-error.
+    return True
+
+
+def arrow_to_py(v, at):
+    """Convert a to_pylist() value of arrow type `at` into plain Python."""
+    import pyarrow as pa
+    if v is None:
+        return None
+    if pa.types.is_dictionary(at):
+        at = at.value_type
+    if pa.types.is_struct(at):
+        return {at.field(i).name: arrow_to_py(v.get(at.field(i).name), at.field(i).type)
+                for i in range(at.num_fields)}
+    if pa.types.is_map(at):
+        out = {}
+        for k, x in v:
+            out[k if isinstance(k, str) else to_text(_pq_norm(k))] = \
+                arrow_to_py(x, at.item_type)
+        return out
+    if pa.types.is_nested(at) and hasattr(at, "value_type"):
+        return [arrow_to_py(x, at.value_type) for x in v]
+    return _pq_norm(v)
 
 
 def combine_by_infer(supports, infer):
@@ -994,42 +1737,44 @@ def process(args):
         sources = open_sources(args, tmpdir)
         null_literal = args.csv_null_literal
 
+        aliases = None
+        if args.type_alias_file:
+            aliases = load_aliases(args.type_alias_file)
+
         if args.schema:
-            schema = load_schema(args.schema)
+            schema = load_schema(args.schema, aliases)
         else:
             schema = None
 
-        key_cols = [k.strip() for k in args.key.split(",")]
+        key_cols = split_paths(args.key)
         if not key_cols or any(k == "" for k in key_cols):
             raise MergeError(EXIT_USAGE, "invalid --key specification: %r" % args.key)
 
         if schema is None:
             schema = infer_schema(sources, args)
+        else:
+            st = dict(schema)
+            for src in sources:
+                src.schema_types = st
 
         names = [n for n, _ in schema]
         types = [t for _, t in schema]
-        name_pos = {n: i for i, n in enumerate(names)}
-        for k in key_cols:
-            if k not in name_pos:
-                raise MergeError(EXIT_KEY,
-                                 "key column %r not present in resolved schema" % k)
-        key_pos = [name_pos[k] for k in key_cols]
+        key_refs = [resolve_field_ref(k, names, types) for k in key_cols]
 
         part_cols = []
         if args.partition_by is not None:
-            for c in args.partition_by.split(","):
-                c = c.strip()
+            for c in split_paths(args.partition_by):
                 if c == "":
                     raise MergeError(EXIT_USAGE, "invalid --partition-by specification: %r"
                                      % args.partition_by)
                 if c not in part_cols:
                     part_cols.append(c)
-            for c in part_cols:
-                if c not in name_pos:
-                    raise MergeError(EXIT_KEY, "partition column %r not present in "
-                                     "resolved schema" % c)
-        part_pos = [name_pos[c] for c in part_cols]
+        part_refs = [resolve_field_ref(c, names, types) for c in part_cols]
+        part_pos = part_refs
         part_prefix = [encode_segment(c) + "=" for c in part_cols]
+        nested_cols = [is_nested(t) for t in types]
+        any_nested = any(nested_cols)
+        caster = NestedCaster(args.on_type_error)
 
         mem_bytes = max(1, args.memory_limit_mb) * 1024 * 1024
         chunk_budget = max(256 * 1024, int(mem_bytes * 0.25))
@@ -1043,17 +1788,44 @@ def process(args):
         ncols = len(names)
         null_key = (0,)
 
+        def ref_key(ref, key_vals, trees):
+            if not ref.steps:
+                return key_vals[ref.col]
+            leaf = walk_ref(trees[ref.col], ref.steps)
+            if leaf is None:
+                return null_key
+            if isinstance(leaf, KeptStr):
+                return (2, str(leaf))
+            return (1, key_component(ref.type, leaf))
+
+        def ref_text(ref, out_row, trees):
+            if not ref.steps:
+                return out_row[ref.col]
+            leaf = walk_ref(trees[ref.col], ref.steps)
+            if isinstance(leaf, KeptStr):
+                return str(leaf)
+            return format_value(ref.type, leaf)
+
         for src in sources:
             rowno = 0
+            caster.src = src
+            from_text = src.is_text
             for row in src.iter_rows(names):
                 rowno += 1
                 out_row = [null_literal] * ncols
                 key_vals = [null_key] * ncols
+                trees = [None] * ncols if any_nested else None
                 for j in range(ncols):
                     v = row[j]
                     if v is None:
                         continue
                     typ = types[j]
+                    if nested_cols[j]:
+                        tree = caster.cast_top(v, typ, names[j], from_text)
+                        if tree is not None:
+                            trees[j] = tree
+                            out_row[j] = encode_nested(tree)
+                        continue
                     try:
                         cv = cast_value(v, typ)
                     except CastError:
@@ -1070,14 +1842,15 @@ def process(args):
                         continue
                     out_row[j] = format_value(typ, cv)
                     key_vals[j] = (1, key_component(typ, cv))
-                key = tuple([key_vals[p] for p in key_pos])
+                key = tuple([ref_key(r, key_vals, trees) for r in key_refs])
                 if part_pos:
                     segs = []
-                    for pre, p in zip(part_prefix, part_pos):
-                        if key_vals[p] is null_key:
+                    for pre, r in zip(part_prefix, part_refs):
+                        if ref_key(r, key_vals, trees) is null_key:
                             segs.append(pre + "_null")
                         else:
-                            segs.append(pre + encode_segment(out_row[p]))
+                            segs.append(pre + encode_segment(
+                                ref_text(r, out_row, trees)))
                     key = ("/".join(segs),) + key
                 buf.append(Record(key, seq, out_row))
                 seq += 1
@@ -1325,6 +2098,8 @@ def build_parser():
     p.add_argument("--max-bytes-per-file", type=int, default=None)
     p.add_argument("--desc", action="store_true", help="sort descending")
     p.add_argument("--schema", default=None, help="schema JSON file")
+    p.add_argument("--type-alias-file", default=None,
+                   help="JSON file with additional type aliases")
     p.add_argument("--infer", choices=["strict", "loose"], default="strict")
     p.add_argument("--schema-strategy",
                    choices=["authoritative", "consensus", "union"],
@@ -1375,7 +2150,10 @@ def main(argv=None):
     try:
         process(args)
     except MergeError as e:
-        sys.stderr.write("error: %s\n" % e)
+        if e.raw:
+            sys.stderr.write("%s\n" % e)
+        else:
+            sys.stderr.write("error: %s\n" % e)
         return e.code
     except csv.Error as e:
         sys.stderr.write("error: CSV parse error: %s\n" % e)
