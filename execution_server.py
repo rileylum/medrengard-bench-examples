@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tiny local runner HTTP API: POST /v1/execute, GET /v1/stats/execution."""
 import argparse
+import glob
 import json
 import math
 import os
@@ -109,7 +110,45 @@ def validate(body):
     if not math.isfinite(timeout) or timeout <= 0:
         raise ApiError(400, "INVALID_FIELD", "'timeout' must be a positive number")
 
-    return command, env, files, stdin, float(timeout)
+    track = body.get("track")
+    if track is not None:
+        if not isinstance(track, list):
+            raise ApiError(400, "INVALID_FIELD", "'track' must be an array of glob strings")
+        for pat in track:
+            if not isinstance(pat, str) or not pat.strip() or "\x00" in pat:
+                raise ApiError(400, "INVALID_FIELD", f"invalid track pattern: {pat!r}")
+            if pat.startswith("/") or any(seg == ".." for seg in pat.split("/")):
+                raise ApiError(400, "INVALID_FIELD",
+                               f"track pattern must be relative to the working directory: {pat!r}")
+        if not track:
+            track = None
+
+    return command, env, files, stdin, float(timeout), track
+
+
+def collect_tracked(workdir, patterns):
+    real_root = os.path.realpath(workdir)
+    result = {}
+    for pat in patterns:
+        try:
+            matches = glob.glob(pat, root_dir=workdir, recursive=True)
+        except (OSError, ValueError):
+            continue
+        for rel in matches:
+            full = os.path.join(workdir, rel)
+            real = os.path.realpath(full)
+            if not real.startswith(real_root + os.sep) or not os.path.isfile(real):
+                continue
+            key = os.path.normpath(rel).replace(os.sep, "/")
+            if key in result:
+                continue
+            try:
+                with open(real, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                continue
+            result[key] = data.decode("utf-8", errors="replace")
+    return dict(sorted(result.items()))
 
 
 def kill_group(proc):
@@ -122,7 +161,7 @@ def kill_group(proc):
             pass
 
 
-def execute(command, env, files, stdin, timeout):
+def execute(command, env, files, stdin, timeout, track=None):
     workdir = tempfile.mkdtemp(prefix="exec-")
     try:
         real_root = os.path.realpath(workdir)
@@ -173,14 +212,17 @@ def execute(command, env, files, stdin, timeout):
         kill_group(proc)
 
         exit_code = -1 if timed_out else proc.returncode
-        return {
+        result = {
             "id": str(uuid.uuid4()),
             "stdout": (out or b"").decode("utf-8", errors="replace"),
             "stderr": (err or b"").decode("utf-8", errors="replace"),
             "exit_code": exit_code,
             "duration": round(duration, 3),
             "timed_out": timed_out,
-        }, duration
+        }
+        if track:
+            result["files"] = collect_tracked(workdir, track)
+        return result, duration
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
