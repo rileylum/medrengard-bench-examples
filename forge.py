@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Forge: manage hardware blueprints, allocations and units with JSON output."""
+"""Forge: manage hardware blueprints, allocations, units, modules and tags with JSON output."""
 import json
 import os
+import re
 import sys
 import tempfile
 import uuid as uuidlib
@@ -688,6 +689,249 @@ def cmd_ledger_capabilities(data_dir, args):
     return sorted(caps)
 
 
+MODULE_FILE = "modules.json"
+TAG_FILE = "tags.json"
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _load_list(data_dir, fname):
+    path = os.path.join(data_dir, fname)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    if not content.strip():
+        return []
+    data = json.loads(content)
+    return data if isinstance(data, list) else []
+
+
+def _save_list(data_dir, fname, items):
+    os.makedirs(data_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=data_dir, prefix=".x-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(data_dir, fname))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _read_json_object():
+    raw = sys.stdin.read()
+    try:
+        doc = json.loads(raw, parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as e:
+        raise ForgeError("validation_error", "invalid JSON input: %s" % e)
+    if not isinstance(doc, dict):
+        raise ForgeError("validation_error",
+                         "input must be a JSON object, got %s" % type_name(doc))
+    return doc
+
+
+def _require_str(doc, k, errors):
+    if k not in doc or doc[k] is None:
+        errors.append("%s: is required" % k)
+    elif not isinstance(doc[k], str):
+        errors.append("%s: must be a string, got %s" % (k, type_name(doc[k])))
+    elif doc[k] == "":
+        errors.append("%s: must be a non-empty string" % k)
+
+
+def _now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def module_view(m):
+    return {
+        "uuid": m.get("uuid"),
+        "unit_uuid": m.get("unit_uuid"),
+        "component_type": m.get("component_type"),
+        "firmware_image": m.get("firmware_image"),
+        "created_at": m.get("created_at"),
+    }
+
+
+def cmd_module_create(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "module create takes no arguments")
+    doc = _read_json_object()
+    errors = []
+    _require_str(doc, "unit_uuid", errors)
+    _require_str(doc, "component_type", errors)
+    if errors:
+        raise ForgeError("validation_error", "; ".join(errors))
+    img = doc.get("firmware_image")
+    if img is not None and (not isinstance(img, str) or not UUID_RE.match(img)):
+        raise ForgeError("invalid_image",
+                         "firmware_image: %s is not a valid lowercase UUID" % json.dumps(img))
+    units = load_units(data_dir)
+    unit = None
+    for u in units:
+        if u.get("uuid") == doc["unit_uuid"]:
+            unit = u
+            break
+    if unit is None:
+        raise ForgeError("not_found", "unit '%s' not found" % doc["unit_uuid"])
+    mod = {
+        "uuid": str(uuidlib.uuid4()),
+        "unit_uuid": doc["unit_uuid"],
+        "component_type": doc["component_type"],
+        "firmware_image": img,
+        "created_at": _now(),
+    }
+    mods = _load_list(data_dir, MODULE_FILE)
+    mods.append(mod)
+    _save_list(data_dir, MODULE_FILE, mods)
+    mu = unit.get("module_uuids")
+    mu = list(mu) if isinstance(mu, list) else []
+    mu.append(mod["uuid"])
+    unit["module_uuids"] = sorted(mu)
+    save_units(data_dir, units)
+    return module_view(mod)
+
+
+def cmd_module_list(data_dir, args):
+    filters = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--unit" or a.startswith("--unit="):
+            val, i = _take_opt(args, i, "--unit")
+            filters.append(("unit_uuid", val))
+        elif a == "--filter" or a.startswith("--filter="):
+            val, i = _take_opt(args, i, "--filter")
+            if "=" not in val:
+                raise ForgeError("validation_error",
+                                 "invalid filter '%s': expected key=value" % val)
+            k, v = val.split("=", 1)
+            filters.append((k, v))
+        else:
+            raise ForgeError("validation_error", "unexpected argument '%s'" % a)
+    out = []
+    for m in _load_list(data_dir, MODULE_FILE):
+        view = module_view(m)
+        if all(_unit_field_matches(view, k, v) for k, v in filters):
+            out.append(view)
+    return sorted(out, key=lambda m: (m["unit_uuid"] or "", m["created_at"] or "",
+                                      m["uuid"] or ""))
+
+
+def cmd_module_get(data_dir, args):
+    if len(args) != 1:
+        raise ForgeError("validation_error", "get requires exactly one argument: <uuid>")
+    for m in _load_list(data_dir, MODULE_FILE):
+        if m.get("uuid") == args[0]:
+            return module_view(m)
+    raise ForgeError("not_found", "module '%s' not found" % args[0])
+
+
+def cmd_module_flash(data_dir, args):
+    image = None
+    pos = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--image" or a.startswith("--image="):
+            if image is not None:
+                raise ForgeError("validation_error", "--image given more than once")
+            image, i = _take_opt(args, i, "--image")
+        else:
+            pos.append(a)
+            i += 1
+    if image is None:
+        raise ForgeError("validation_error", "--image is required")
+    if len(pos) != 1:
+        raise ForgeError("validation_error", "flash requires exactly one argument: <uuid>")
+    if not UUID_RE.match(image):
+        raise ForgeError("invalid_image", "image '%s' is not a valid lowercase UUID" % image)
+    mods = _load_list(data_dir, MODULE_FILE)
+    target = None
+    for m in mods:
+        if m.get("uuid") == pos[0]:
+            target = m
+            break
+    if target is None:
+        raise ForgeError("not_found", "module '%s' not found" % pos[0])
+    known = {m.get("firmware_image") for m in mods if m.get("firmware_image") is not None}
+    if image not in known:
+        raise ForgeError("flash_failed", "firmware image '%s' is not a known image" % image)
+    if target.get("firmware_image") != image:
+        target["firmware_image"] = image
+        _save_list(data_dir, MODULE_FILE, mods)
+    return module_view(target)
+
+
+def tag_view(t):
+    return {k: t.get(k) for k in ("uuid", "module_uuid", "key", "value", "created_at")}
+
+
+def cmd_tag_create(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "tag create takes no arguments")
+    doc = _read_json_object()
+    errors = []
+    for k in ("module_uuid", "key", "value"):
+        _require_str(doc, k, errors)
+    if errors:
+        raise ForgeError("validation_error", "; ".join(errors))
+    if not any(m.get("uuid") == doc["module_uuid"]
+               for m in _load_list(data_dir, MODULE_FILE)):
+        raise ForgeError("not_found", "module '%s' not found" % doc["module_uuid"])
+    tags = _load_list(data_dir, TAG_FILE)
+    if any(t.get("module_uuid") == doc["module_uuid"] and t.get("key") == doc["key"]
+           for t in tags):
+        raise ForgeError("conflict", "tag with key '%s' already exists on module '%s'"
+                         % (doc["key"], doc["module_uuid"]))
+    tag = {
+        "uuid": str(uuidlib.uuid4()),
+        "module_uuid": doc["module_uuid"],
+        "key": doc["key"],
+        "value": doc["value"],
+        "created_at": _now(),
+    }
+    tags.append(tag)
+    _save_list(data_dir, TAG_FILE, tags)
+    return tag_view(tag)
+
+
+def cmd_tag_list(data_dir, args):
+    vals = _parse_flags(args, ("--module", "--key"))
+    out = []
+    for t in _load_list(data_dir, TAG_FILE):
+        if "--module" in vals and t.get("module_uuid") != vals["--module"]:
+            continue
+        if "--key" in vals and t.get("key") != vals["--key"]:
+            continue
+        out.append(tag_view(t))
+    return sorted(out, key=lambda t: (t["module_uuid"] or "", t["key"] or "",
+                                      t["uuid"] or ""))
+
+
+def cmd_tag_get(data_dir, args):
+    if len(args) != 1:
+        raise ForgeError("validation_error", "get requires exactly one argument: <uuid>")
+    for t in _load_list(data_dir, TAG_FILE):
+        if t.get("uuid") == args[0]:
+            return tag_view(t)
+    raise ForgeError("not_found", "tag '%s' not found" % args[0])
+
+
+def cmd_tag_delete(data_dir, args):
+    if len(args) != 1:
+        raise ForgeError("validation_error", "delete requires exactly one argument: <uuid>")
+    tags = _load_list(data_dir, TAG_FILE)
+    remaining = [t for t in tags if t.get("uuid") != args[0]]
+    if len(remaining) == len(tags):
+        raise ForgeError("not_found", "tag '%s' not found" % args[0])
+    _save_list(data_dir, TAG_FILE, remaining)
+    return {"deleted": len(tags) - len(remaining)}
+
+
 GROUPS = {
     "blueprint": COMMANDS,
     "allocation": {"create": cmd_alloc_create, "list": cmd_alloc_list, "get": cmd_alloc_get,
@@ -695,7 +939,12 @@ GROUPS = {
     "unit": {"create": cmd_unit_create, "list": cmd_unit_list, "get": cmd_unit_get,
              "activate": cmd_unit_activate, "deactivate": cmd_unit_deactivate},
     "ledger": {"capabilities": cmd_ledger_capabilities},
+    "module": {"create": cmd_module_create, "list": cmd_module_list, "get": cmd_module_get,
+               "flash": cmd_module_flash},
+    "tag": {"create": cmd_tag_create, "list": cmd_tag_list, "get": cmd_tag_get,
+            "delete": cmd_tag_delete},
 }
+UNKNOWN_COMMAND_GROUPS = ("module", "tag")
 
 
 def parse_argv(argv):
@@ -720,13 +969,15 @@ def parse_argv(argv):
         raise ForgeError("validation_error", "--data-dir is required")
     if not rest or rest[0] not in GROUPS:
         raise ForgeError("validation_error",
-                         "usage: forge.py --data-dir <path> {blueprint|allocation|unit|ledger} <command> [args]")
+                         "usage: forge.py --data-dir <path> {blueprint|allocation|unit|ledger|module|tag} <command> [args]")
     group = rest[0]
     if len(rest) < 2:
-        raise ForgeError("validation_error", "missing %s command" % group)
+        raise ForgeError("unknown_command" if group in UNKNOWN_COMMAND_GROUPS
+                         else "validation_error", "missing %s command" % group)
     cmd = rest[1]
     if cmd not in GROUPS[group]:
-        raise ForgeError("validation_error", "unknown command '%s'" % cmd)
+        raise ForgeError("unknown_command" if group in UNKNOWN_COMMAND_GROUPS
+                         else "validation_error", "unknown command '%s'" % cmd)
     return data_dir, GROUPS[group][cmd], rest[2:]
 
 
