@@ -433,7 +433,7 @@ def sort_entries(entries):
 
 def sync_catalog(catalog, source, ts):
     """Apply source metadata to catalog; return dict of added/removed/updated counts."""
-    counts = {"added": 0, "removed": 0, "updated": 0}
+    counts = {"added": 0, "removed": 0, "updated": 0, "changes": []}
     for cat in CATEGORIES:
         entries = catalog[cat]
         by_id = {}
@@ -455,18 +455,20 @@ def sync_catalog(catalog, source, ts):
                 entries.append(entry)
                 by_id[sid] = entry
                 counts["added"] += 1
+                counts["changes"].append(("added", cat, entry, []))
                 continue
-            changed = False
+            changed = []
             for field in SOURCE_TRACKED:
                 if append_history(entry, field, item[field], ts):
-                    changed = True
+                    changed.append(field)
             removed, has = current_value(entry.get("removed"))
             if not has or removed is not False:
                 append_history(entry, "removed", False, ts)
                 if has and removed is True:
-                    changed = True
+                    changed.append("reappeared")
             if changed:
                 counts["updated"] += 1
+                counts["changes"].append(("updated", cat, entry, changed))
         for e in entries:
             if e["id"] in src:
                 continue
@@ -474,6 +476,7 @@ def sync_catalog(catalog, source, ts):
             if not has or removed is not True:
                 append_history(e, "removed", True, ts)
                 counts["removed"] += 1
+                counts["changes"].append(("removed", cat, e, []))
         sort_entries(entries)
     return counts
 
@@ -722,6 +725,30 @@ def run_downloads(name, catalog, limits, fmt):
     return stats
 
 
+# ---------------------------------------------------------------- viewer links
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8840
+
+
+def _q(text):
+    import urllib.parse
+    return urllib.parse.quote(str(text), safe="")
+
+
+def catalog_route(name, category=None, entry_id=None):
+    parts = ["", "catalog", _q(name)]
+    if category is not None:
+        parts.append(_q(category))
+        if entry_id is not None:
+            parts.append(_q(entry_id))
+    return "/".join(parts)
+
+
+def viewer_link(name, category, entry_id, host=DEFAULT_HOST, port=DEFAULT_PORT):
+    return "http://%s:%d%s" % (host, port, catalog_route(name, category, entry_id))
+
+
 # ---------------------------------------------------------------- digest
 
 def _v1_key(k):
@@ -791,6 +818,7 @@ def build_digest(name, catalog, version, now=None):
     lines = []
     total = 0
     for label, entries in groups:
+        link_cat = label.lower()
         buckets = {"removed": [], "added": [], "updated": []}
         for e in entries:
             group, changed = classify_entry(e, version)
@@ -799,6 +827,7 @@ def build_digest(name, catalog, version, now=None):
             text = entry_title(e, version)
             if group == "updated":
                 text += " (%s)" % ", ".join(changed)
+            text += " " + viewer_link(name, link_cat, e.get("id"))
             buckets[group].append(text)
         if not any(buckets.values()):
             continue
@@ -862,6 +891,15 @@ def cmd_sync(args):
     if counts is not None:
         print("Summary: %d added, %d removed, %d updated"
               % (counts["added"], counts["removed"], counts["updated"]))
+        order = {"removed": 0, "added": 1, "updated": 2}
+        changes = sorted(counts["changes"],
+                         key=lambda c: (CATEGORIES.index(c[1]), order[c[0]]))
+        for group, cat, entry, fields in changes:
+            text = entry_title(entry, CURRENT_VERSION)
+            if fields:
+                text += " (%s)" % ", ".join(fields)
+            print("  %s %s: %s %s" % (group.capitalize(), cat[:-1], text,
+                                       viewer_link(name, cat, entry.get("id"))))
     return 0
 
 
@@ -900,12 +938,407 @@ def format_str(text):
     return t
 
 
+# ---------------------------------------------------------------- viewer server
+
+RECENT_COOKIE = "mvault_recent"
+RECENT_MAX = 20
+RECENT_MAX_AGE = 10 * 365 * 24 * 3600
+
+VIEWER_CSS = """
+body { font-family: sans-serif; margin: 2em; color: #222; }
+a { color: #0645ad; }
+table { border-collapse: collapse; margin-top: 1em; }
+th, td { border: 1px solid #ccc; padding: 0.3em 0.6em; text-align: left; }
+tr.downloaded td.state { background: #d4f7d4; color: #145214; font-weight: bold; }
+tr.not-downloaded td.state { background: #f7e1d4; color: #7a3410; }
+tr.removed td { text-decoration: line-through; color: #888; }
+tr.removed td.flag { text-decoration: none; color: #b00; font-weight: bold; }
+tr.highlight td { outline: 2px solid #e0a000; background-color: #fff6d0; }
+nav a { margin-right: 1em; }
+nav a.current { font-weight: bold; text-decoration: none; color: #222; }
+.error { color: #b00; font-weight: bold; }
+"""
+
+
+def html_escape(text):
+    # Attributes are always double-quoted, so apostrophes may stay literal.
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def viewer_valid_categories(version):
+    return ("entries",) if version == 1 else CATEGORIES
+
+
+def viewer_default_category(version):
+    return "entries" if version == 1 else "episodes"
+
+
+def viewer_load(name):
+    """Return (raw_catalog, version) or raise MVaultError. Never modifies disk."""
+    if not name or "\0" in name:
+        raise MVaultError("vault '%s' does not exist" % name)
+    raw, version = read_raw_catalog(name)
+    validate_catalog(name, raw, version)
+    return raw, version
+
+
+def viewer_entry_title(e, version):
+    vals = _sorted_history(e.get("title"), version)
+    if vals and vals[-1] is not None:
+        return str(vals[-1])
+    return str(e.get("id"))
+
+
+def viewer_is_removed(e, version):
+    if version != 3:
+        return False
+    vals = _sorted_history(e.get("removed"), version)
+    return bool(vals) and vals[-1] is True
+
+
+def media_names(name):
+    try:
+        names = os.listdir(os.path.join(name, "media"))
+    except OSError:
+        return []
+    out = []
+    for fname in names:
+        if fname.startswith("."):
+            continue  # in-progress temporary download files
+        if os.path.isfile(os.path.join(name, "media", fname)):
+            out.append(fname)
+    return out
+
+
+def html_page(title, body):
+    return ("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            "<title>%s</title>\n<style>%s</style>\n</head>\n<body>\n%s\n</body>\n</html>\n"
+            % (html_escape(title), VIEWER_CSS, body))
+
+
+def parse_recent_cookie(header):
+    import http.cookies
+    import urllib.parse
+    if not header:
+        return []
+    jar = http.cookies.SimpleCookie()
+    try:
+        jar.load(header)
+    except http.cookies.CookieError:
+        return []
+    morsel = jar.get(RECENT_COOKIE)
+    if morsel is None:
+        return []
+    try:
+        data = json.loads(urllib.parse.unquote(morsel.value))
+    except ValueError:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for n in data:
+        if isinstance(n, str) and n and n not in out:
+            out.append(n)
+    return out[:RECENT_MAX]
+
+
+def make_recent_cookie(names):
+    value = _q(json.dumps(names[:RECENT_MAX], ensure_ascii=False, separators=(",", ":")))
+    return "%s=%s; Path=/; Max-Age=%d; SameSite=Lax" % (RECENT_COOKIE, value, RECENT_MAX_AGE)
+
+
+def make_handler():
+    import http.server
+    import urllib.parse
+
+    class ViewerHandler(http.server.BaseHTTPRequestHandler):
+        server_version = "mvault"
+        sys_version = ""
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+        # ---- helpers
+        def _send(self, status, body=b"", ctype="text/html; charset=utf-8", headers=None,
+                  head=False):
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for k, v in (headers or []):
+                self.send_header(k, v)
+            self.end_headers()
+            if not head and body:
+                self.wfile.write(body)
+
+        def _redirect(self, location, headers=None, head=False):
+            body = html_page("Redirect", "<p>Redirecting to <a href=\"%s\">%s</a></p>"
+                             % (html_escape(location), html_escape(location)))
+            hdrs = [("Location", location)] + list(headers or [])
+            self._send(303 if self.command == "POST" else 302, body, headers=hdrs, head=head)
+
+        def _error(self, status, message, head=False):
+            body = html_page("Error %d" % status, "<h1>Error %d</h1><p>%s</p>"
+                             "<p><a href=\"/\">Back to start</a></p>"
+                             % (status, html_escape(message)))
+            self._send(status, body, head=head)
+
+        def _recent(self):
+            return parse_recent_cookie(self.headers.get("Cookie"))
+
+        def _visit_cookie(self, name):
+            names = [name] + [n for n in self._recent() if n != name]
+            return ("Set-Cookie", make_recent_cookie(names))
+
+        def _safe(self, fn, *args):
+            try:
+                fn(*args)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:  # never expose tracebacks
+                eprint("viewer error: %s: %s" % (exc.__class__.__name__, exc))
+                try:
+                    self._error(500, "Internal server error.")
+                except Exception:
+                    pass
+
+        # ---- verbs
+        def do_GET(self):
+            self._safe(self._get, False)
+
+        def do_HEAD(self):
+            self._safe(self._get, True)
+
+        def do_POST(self):
+            self._safe(self._post)
+
+        def _method_not_allowed(self):
+            body = html_page("Error 405", "<h1>Error 405</h1><p>Method not allowed.</p>")
+            self._send(405, body, headers=[("Allow", "GET, HEAD, POST")])
+
+        do_PUT = do_DELETE = do_PATCH = _method_not_allowed
+
+        # ---- routing
+        def _split(self):
+            parsed = urllib.parse.urlsplit(self.path)
+            raw = [p for p in parsed.path.split("/") if p != ""]
+            segs = [urllib.parse.unquote(p) for p in raw]
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            return segs, query
+
+        def _post(self):
+            segs, _ = self._split()
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            data = self.rfile.read(length) if length > 0 else b""
+            if segs:
+                self._error(404, "Not found.")
+                return
+            form = urllib.parse.parse_qs(data.decode("utf-8", "replace"),
+                                         keep_blank_values=True)
+            value = (form.get("catalog") or [""])[0].strip()
+            if not value:
+                self._redirect("/")
+                return
+            self._redirect(catalog_route(value))
+
+        def _get(self, head):
+            segs, query = self._split()
+            if not segs:
+                self._landing(query, head)
+                return
+            if segs[0] != "catalog":
+                self._error(404, "Not found.", head)
+                return
+            if len(segs) == 1:
+                self._redirect("/", head=head)
+                return
+            name = segs[1]
+            try:
+                raw, version = viewer_load(name)
+            except MVaultError as exc:
+                msg = str(exc)
+                if "does not exist" in msg:
+                    loc = "/?notfound=" + _q(name)
+                else:
+                    loc = "/?invalid=" + _q(name)
+                self._redirect(loc, head=head)
+                return
+            cookie = self._visit_cookie(name)
+            default = viewer_default_category(version)
+            if len(segs) == 2:
+                self._redirect(catalog_route(name, default), [cookie], head)
+                return
+            category = segs[2]
+            if category not in viewer_valid_categories(version) or len(segs) > 4:
+                self._redirect(catalog_route(name, default), [cookie], head)
+                return
+            entry_id = segs[3] if len(segs) == 4 else None
+            status, body = self._listing(name, raw, version, category, entry_id)
+            self._send(status, body, headers=[cookie], head=head)
+
+        # ---- pages
+        def _landing(self, query, head):
+            parts = ["<h1>mvault viewer</h1>"]
+            for key, fmt in (("notfound", "Vault '%s' not found."),
+                             ("invalid", "Vault '%s' could not be opened (invalid catalog).")):
+                for n in query.get(key, []):
+                    parts.append("<p class=\"error vault-not-found\">%s</p>"
+                                 % html_escape(fmt % n))
+            parts.append(
+                "<form method=\"post\" action=\"/\">\n"
+                "<label for=\"catalog\">Vault name:</label>\n"
+                "<input type=\"text\" id=\"catalog\" name=\"catalog\" required autofocus>\n"
+                "<button type=\"submit\">Open</button>\n</form>")
+            items = []
+            for n in self._recent():
+                try:
+                    _, version = viewer_load(n)
+                except MVaultError:
+                    continue
+                href = catalog_route(n, viewer_default_category(version))
+                items.append("<li><a href=\"%s\">%s</a></li>"
+                             % (html_escape(href), html_escape(n)))
+            if items:
+                parts.append("<section id=\"recent\"><h2>Recent vaults</h2>\n<ol>\n%s\n</ol>"
+                             "</section>" % "\n".join(items))
+            self._send(200, html_page("mvault viewer", "\n".join(parts)), head=head)
+
+        def _listing(self, name, raw, version, category, entry_id):
+            entries = raw.get(category) or []
+            files = media_names(name)
+            nav = []
+            for c in viewer_valid_categories(version):
+                cls = " class=\"current\"" if c == category else ""
+                nav.append("<a%s href=\"%s\">%s</a>"
+                           % (cls, html_escape(catalog_route(name, c)), html_escape(c)))
+            rows = []
+            found = entry_id is None
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                eid = str(e.get("id"))
+                downloaded = any(eid in f for f in files) if eid else False
+                removed = viewer_is_removed(e, version)
+                classes = ["entry", "downloaded" if downloaded else "not-downloaded"]
+                if version == 3:
+                    classes.append("removed" if removed else "active")
+                if entry_id is not None and eid == entry_id:
+                    classes.append("highlight")
+                    found = True
+                href = catalog_route(name, category, eid)
+                cells = [
+                    "<td class=\"title\"><a href=\"%s\">%s</a></td>"
+                    % (html_escape(href), html_escape(viewer_entry_title(e, version))),
+                    "<td class=\"id\">%s</td>" % html_escape(eid),
+                    "<td class=\"state\">%s</td>"
+                    % ("&#10003; downloaded" if downloaded else "&#10007; not downloaded"),
+                ]
+                if version == 3:
+                    cells.append("<td class=\"flag\">%s</td>"
+                                 % ("REMOVED" if removed else "active"))
+                rows.append("<tr id=\"entry-%s\" class=\"%s\" data-id=\"%s\" "
+                            "data-downloaded=\"%s\"%s>%s</tr>"
+                            % (html_escape(eid), " ".join(classes), html_escape(eid),
+                               "true" if downloaded else "false",
+                               (" data-removed=\"%s\"" % ("true" if removed else "false"))
+                               if version == 3 else "",
+                               "".join(cells)))
+            head_cells = "<th>Title</th><th>ID</th><th>Downloaded</th>"
+            if version == 3:
+                head_cells += "<th>Status</th>"
+            parts = [
+                "<p><a href=\"/\">&larr; All vaults</a></p>",
+                "<h1>%s &mdash; %s</h1>" % (html_escape(name), html_escape(category)),
+                "<p>Catalog version %d</p>" % version,
+                "<nav>%s</nav>" % "".join(nav),
+            ]
+            if entry_id is not None:
+                if found:
+                    parts.append("<p class=\"selected\">Selected entry: <a href=\"#entry-%s\">"
+                                 "%s</a></p>" % (html_escape(entry_id), html_escape(entry_id)))
+                else:
+                    parts.append("<p class=\"error\">Entry '%s' not found in %s.</p>"
+                                 % (html_escape(entry_id), html_escape(category)))
+            if rows:
+                parts.append("<table>\n<thead><tr>%s</tr></thead>\n<tbody>\n%s\n</tbody>\n"
+                             "</table>" % (head_cells, "\n".join(rows)))
+            else:
+                parts.append("<p class=\"empty\">No entries.</p>")
+            title = "%s / %s" % (name, category)
+            return (200 if found else 404), html_page(title, "\n".join(parts))
+
+    return ViewerHandler
+
+
+def open_browser(url):
+    if os.environ.get("MVAULT_NO_BROWSER"):
+        return
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY")
+                                                  or os.environ.get("WAYLAND_DISPLAY")):
+        return  # headless: avoid launching terminal browsers that grab the console
+    import threading
+    import webbrowser
+
+    def run():
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def cmd_serve(args):
+    import http.server
+    host = args.host if args.host is not None else DEFAULT_HOST
+    port = args.port if args.port is not None else DEFAULT_PORT
+    try:
+        httpd = http.server.ThreadingHTTPServer((host, port), make_handler())
+    except (OSError, OverflowError) as exc:
+        raise MVaultError("cannot start server on %s:%d: %s" % (host, port, exc))
+    httpd.daemon_threads = True
+    url_host = host if host not in ("", "0.0.0.0", "::") else DEFAULT_HOST
+    if ":" in url_host:
+        url_host = "[%s]" % url_host
+    base = "http://%s:%d" % (url_host, port)
+    path = "/"
+    if args.name is not None:
+        try:
+            _, version = viewer_load(args.name)
+            path = catalog_route(args.name, viewer_default_category(version))
+        except MVaultError:
+            path = catalog_route(args.name)
+    print("Serving mvault viewer at %s/ (press Ctrl+C to stop)" % base)
+    sys.stdout.flush()
+    open_browser(base + path)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
+def port_number(text):
+    t = text.strip()
+    if not t.isdigit() or not t.isascii() or not (0 <= int(t) <= 65535):
+        raise argparse.ArgumentTypeError("invalid port: %r" % text)
+    return int(t)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="mvault.py", allow_abbrev=False,
         description="Create local vaults for media-platform metadata and record "
                     "tracked-field history by sync timestamp.")
-    sub = parser.add_subparsers(dest="command", metavar="{init,sync,migrate,digest}",
+    sub = parser.add_subparsers(dest="command", metavar="{init,sync,migrate,digest,serve}",
                                 title="subcommands")
     p_init = sub.add_parser("init", allow_abbrev=False, help="create a new vault with an empty catalog")
     p_init.add_argument("name", help="vault directory name")
@@ -929,6 +1362,12 @@ def build_parser():
     p_dig = sub.add_parser("digest", allow_abbrev=False, help="summarize notable changes in a vault")
     p_dig.add_argument("name", help="vault directory name")
     p_dig.set_defaults(func=cmd_digest)
+    p_srv = sub.add_parser("serve", allow_abbrev=False, help="start the local browser viewer")
+    p_srv.add_argument("name", nargs="?", default=None, help="vault to open in the browser")
+    p_srv.add_argument("--host", default=None, help="bind host (default %s)" % DEFAULT_HOST)
+    p_srv.add_argument("--port", type=port_number, default=None,
+                       help="bind port (default %d)" % DEFAULT_PORT)
+    p_srv.set_defaults(func=cmd_serve)
     return parser
 
 
