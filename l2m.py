@@ -537,7 +537,120 @@ def convert_lists(text):
     return "".join(out)
 
 
-def convert(text):
+ADMONITIONS = {
+    "definition": ("tip", "Definition"),
+    "definitions": ("tip", "Definitions"),
+    "propriete": ("tip", "Propriete"),
+    "proprietes": ("tip", "Proprietes"),
+    "theoreme": ("tip", "Theoreme"),
+    "theorem": ("tip", "Theorem"),
+    "exemple": ("note", "Exemple"),
+    "exemples": ("note", "Exemples"),
+    "remarque": ("note", "Remarque"),
+    "remarques": ("note", "Remarques"),
+    "preuve": ("note", "Preuve"),
+    "methode": ("warning", "Methode"),
+}
+
+_BEGIN_LINE_RE = re.compile(r"\\begin\s*\{([^{}]*)\}")
+_END_LINE_RE = re.compile(r"\\end\s*\{([^{}]*)\}")
+
+
+def _recognized(name):
+    return name in ADMONITIONS or name == "solution"
+
+
+def _find_end(lines, start, name):
+    """Index of the line closing environment `name` opened before `start`, or None."""
+    depth = 1
+    for k in range(start, len(lines)):
+        line = lines[k].strip(" \t")
+        b = _BEGIN_LINE_RE.match(line)
+        if b and b.group(1) == name:
+            depth += 1
+            continue
+        e = _END_LINE_RE.match(line)
+        if e and e.group(1) == name:
+            depth -= 1
+            if depth == 0:
+                return k
+    return None
+
+
+def _trim_blank(lines):
+    while lines and not lines[0].strip(" \t"):
+        lines.pop(0)
+    while lines and not lines[-1].strip(" \t"):
+        lines.pop()
+    return lines
+
+
+def _render_block(name, content, mode):
+    if name == "solution":
+        typ, label = "tip", "Solution:"
+    else:
+        typ, label = ADMONITIONS[name]
+        label += ":"
+    if mode == "docusaurus":
+        return [":::%s %s" % (typ, label), ""] + content + ["", ":::"]
+    if mode == "mkdocs":
+        return ['!!!%s "%s"' % (typ, label[:-1] if name != "solution" else label), ""] + [
+            ("    " + l) if l else "" for l in content
+        ]
+    if name == "solution":
+        return ["**Solution:**", ""] + content
+    return content
+
+
+def _process_envs(lines, mode):
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        b = _BEGIN_LINE_RE.match(line.strip(" \t"))
+        if not b:
+            out.append(line)
+            i += 1
+            continue
+        name = b.group(1)
+        if not _recognized(name):
+            end = _find_end(lines, i + 1, name)
+            if end is None:
+                out.append(line)
+                i += 1
+            else:
+                out.extend(lines[i:end + 1])
+                i = end + 1
+            continue
+        end = _find_end(lines, i + 1, name)
+        if end is None:
+            raise ConvertError("Error: unterminated environment '%s'" % name)
+        stripped = line.strip(" \t")
+        head = stripped[b.end():]
+        if head.startswith("["):
+            k = _opt_arg(head, 0)
+            if k is not None:
+                head = head[k:]
+        inner = []
+        if head.strip(" \t"):
+            inner.append(head.strip(" \t"))
+        inner.extend(lines[i + 1:end])
+        endline = lines[end].strip(" \t")
+        tail = endline[_END_LINE_RE.match(endline).end():].strip(" \t")
+        content = _trim_blank(_process_envs(inner, mode))
+        out.extend(_render_block(name, content, mode))
+        if tail:
+            out.append(tail)
+        i = end + 1
+    return out
+
+
+def convert_admonitions(text, mode):
+    return "\n".join(_process_envs(text.split("\n"), mode))
+
+
+def convert(text, mode=None):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = remove_comments(text)
     text = select_body(text)
@@ -552,6 +665,7 @@ def convert(text):
     text = convert_commands(text)
     text = delete_skips(text)
     text = re.sub(r"\x00M(\d+)\x00", lambda m: store[int(m.group(1))], text)
+    text = convert_admonitions(text, mode)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.strip("\n")
     return text + "\n" if text else ""
@@ -561,7 +675,13 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="l2m.py")
     p.add_argument("input")
     p.add_argument("-o", "--output")
+    p.add_argument("--docusaurus", action="store_true")
+    p.add_argument("--mkdocs", action="store_true")
     args = p.parse_args(argv)
+    if args.docusaurus and args.mkdocs:
+        sys.stderr.write("Error: choose at most one output mode\n")
+        return 1
+    mode = "docusaurus" if args.docusaurus else ("mkdocs" if args.mkdocs else None)
     try:
         with open(args.input, "r", encoding="utf-8") as f:
             src = f.read()
@@ -576,7 +696,7 @@ def main(argv=None):
     else:
         out_path = os.path.splitext(os.path.basename(args.input))[0] + ".md"
     try:
-        result = convert(src)
+        result = convert(src, mode)
     except (ListError, ConvertError) as e:
         sys.stderr.write(str(e) + "\n")
         return 1
