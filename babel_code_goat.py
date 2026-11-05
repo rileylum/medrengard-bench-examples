@@ -1032,6 +1032,103 @@ def _arg_bindings(node, ctx):
     return out
 
 
+# ---- async test support ----------------------------------------------------
+
+_ASYNC_RUNNERS = {
+    "asyncio.run", "asyncio.wait_for", "asyncio.ensure_future", "asyncio.create_task",
+    "asyncio.shield", "asyncio.Task", "asyncio.async", "trio.run", "anyio.run",
+    "asyncio.get_event_loop.run_until_complete", "asyncio.new_event_loop.run_until_complete",
+    "asyncio.get_running_loop.create_task", "asyncio.get_event_loop.create_task",
+    "asyncio.run_coroutine_threadsafe",
+}
+_ASYNC_DECORATORS = {"pytest.mark.asyncio", "pytest.mark.anyio", "pytest.mark.trio"}
+
+
+def _async_qual(func, aliases):
+    """Dotted name of an async runner callee (call chains like ``get_event_loop()`` collapse)."""
+    if isinstance(func, ast.Name):
+        return aliases.get(func.id, func.id)
+    if isinstance(func, ast.Attribute):
+        base = func.value
+        if isinstance(base, ast.Call) and not base.args and not base.keywords:
+            base = base.func
+        q = _async_qual(base, aliases)
+        return None if q is None else q + "." + func.attr
+    return None
+
+
+class _AsyncUnwrap(ast.NodeTransformer):
+    """Rewrite async test code into the equivalent synchronous form.
+
+    ``await f(x)`` -> ``f(x)``, ``asyncio.run(f(x))`` (and similar runners) -> ``f(x)``,
+    ``async def`` -> ``def``.  The generated testers run any awaitable returned by the
+    entrypoint to completion, so the semantics are preserved.
+    """
+
+    def __init__(self, aliases):
+        self.aliases = aliases
+
+    def visit_Await(self, node):
+        return ast.copy_location(self.visit(node.value), node)
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        q = _async_qual(node.func, self.aliases)
+        if q is None:
+            return node
+        last = q.split(".")[-1]
+        is_runner = (q in _ASYNC_RUNNERS or last == "run_until_complete"
+                     or (q.startswith("asyncio.") and last in ("run", "wait_for", "shield",
+                                                                 "ensure_future", "create_task")))
+        if not is_runner or not node.args:
+            return node
+        inner = node.args[0]
+        if isinstance(inner, ast.Call):
+            return inner
+        if q in ("trio.run", "anyio.run") and isinstance(inner, (ast.Name, ast.Attribute)):
+            call = ast.Call(func=inner, args=list(node.args[1:]), keywords=[])
+            return ast.copy_location(call, node)
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        self.generic_visit(node)
+        fn = ast.FunctionDef(name=node.name, args=node.args, body=node.body,
+                             decorator_list=node.decorator_list, returns=node.returns,
+                             type_comment=getattr(node, "type_comment", None))
+        if hasattr(node, "type_params"):
+            fn.type_params = node.type_params
+        return ast.copy_location(fn, node)
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        return node
+
+
+def _strip_async_decorators(tree, aliases):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.decorator_list:
+            keep = []
+            for d in node.decorator_list:
+                target = d.func if isinstance(d, ast.Call) else d
+                q = _async_qual(target, aliases)
+                if q in _ASYNC_DECORATORS:
+                    continue
+                keep.append(d)
+            node.decorator_list = keep
+
+
+def _is_main_guard(test):
+    """``__name__ == "__main__"`` (either order)."""
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)):
+        return False
+    a, b = test.left, test.comparators[0]
+    for x, y in ((a, b), (b, a)):
+        if (isinstance(x, ast.Name) and x.id == "__name__" and isinstance(y, ast.Constant)
+                and y.value == "__main__"):
+            return True
+    return False
+
+
 def _discover_file(path, rel, ep_name):
     """Parse one test file. Returns list of test dicts (with ``id``)."""
     try:
@@ -1044,7 +1141,14 @@ def _discover_file(path, rel, ep_name):
     except (SyntaxError, ValueError) as e:
         raise DiscoveryError(f"syntax error: {e}")
     comments, lines = _comment_lines(source)
-    ctx = _Ctx(ep_name, _collect_aliases(tree))
+    aliases = _collect_aliases(tree)
+    _strip_async_decorators(tree, aliases)
+    tree = ast.fix_missing_locations(_AsyncUnwrap(aliases).visit(tree))
+    ctx = _Ctx(ep_name, aliases)
+    local_funcs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    if ep_name is not None:
+        local_funcs.discard(ep_name)
+    runner_names = {"unittest.main", "pytest.main"}
 
     tests = []
     iters = []  # iteration indices of the enclosing loops
@@ -1108,6 +1212,12 @@ def _discover_file(path, rel, ep_name):
         i = 0
         while i < len(body):
             stmt = body[i]
+            if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                    and ((isinstance(stmt.value.func, ast.Name) and stmt.value.func.id in local_funcs
+                          and stmt.value.func.id not in ctx.env)
+                         or ctx.qual(stmt.value.func) in runner_names)):
+                i += 1  # running a test function / test runner: its body is already discovered
+                continue
             node = _mutation_call(stmt, ctx)
             if node is not None:
                 i = mutation_block(body, i, node)
@@ -1135,7 +1245,7 @@ def _discover_file(path, rel, ep_name):
             elif isinstance(stmt, ast.While):
                 walk_while(stmt)
             elif isinstance(stmt, ast.If):
-                c = _const_cond(stmt.test, ctx)
+                c = True if _is_main_guard(stmt.test) else _const_cond(stmt.test, ctx)
                 if c is _NO_VALUE:
                     raise DiscoveryError(f"line {stmt.lineno}: unsupported if condition")
                 walk(stmt.body if c else stmt.orelse)
@@ -1950,6 +2060,33 @@ def _check_msg(e, chk):
     return (not r) if chk.get("neg") else r
 
 
+def _resolve(r):
+    """Run awaitables (coroutines, futures, tasks) returned by the solution to completion."""
+    if inspect.isawaitable(r):
+        import asyncio
+
+        async def _aw():
+            x = await r
+            while inspect.isawaitable(x):
+                x = await x
+            return x
+
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(_aw())
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except BaseException:
+                pass
+            asyncio.set_event_loop(None)
+            loop.close()
+    if hasattr(r, "result") and type(r).__module__ == "concurrent.futures._base":
+        return r.result()
+    return r
+
+
 def run_test(factory, t):
     kind = t["kind"]
     if kind == "loop":
@@ -1967,7 +2104,7 @@ def run_test(factory, t):
         if fn is not None:
             if kind == "raises":
                 try:
-                    r = fn(*args, **kwargs)
+                    r = _resolve(fn(*args, **kwargs))
                     if t.get("expr") is not None:
                         _ex_ev(t["expr"], r)
                     ok = False
@@ -1980,7 +2117,7 @@ def run_test(factory, t):
                                 break
             else:
                 try:
-                    res = fn(*args, **kwargs)
+                    res = _resolve(fn(*args, **kwargs))
                     if kind == "eq":
                         ok = deep_eq(res, t["expected"], cmp)
                     elif kind == "ne":
@@ -3403,6 +3540,7 @@ async function runTest(factory, t) {
 }
 
 async function main() {
+  process.on("unhandledRejection", function () {});
   const argv = process.argv.slice(2);
   if (argv.length < 1) {
     origErr.call(process.stderr, "usage: tester <solution> [--start N]\n");
@@ -3864,6 +4002,10 @@ using Ret = typename Tr::Ret;
 constexpr size_t ARITY = std::tuple_size_v<Params>;
 template <size_t I> using P = std::tuple_element_t<I, Params>;
 
+template <class T> struct IsFuture : std::false_type {};
+template <class T> struct IsFuture<std::future<T>> : std::true_type {};
+template <class T> struct IsFuture<std::shared_future<T>> : std::true_type {};
+
 template <class Pt, class S> decltype(auto) pass(S& s) {
   if constexpr (IsMutPtr<Pt>::value) return &s;
   else return static_cast<Pt>(s);
@@ -3888,6 +4030,15 @@ template <size_t... I> Outcome do_call(const std::vector<Val>& args, std::index_
     if constexpr (std::is_void_v<Ret>) {
       BCG_CALL(pass<P<I>>(std::get<I>(st))...);
       o.result = mk(Val::NONE);
+    } else if constexpr (IsFuture<std::decay_t<Ret>>::value) {
+      auto fut = BCG_CALL(pass<P<I>>(std::get<I>(st))...);
+      if constexpr (std::is_void_v<decltype(fut.get())>) {
+        fut.get();
+        o.result = mk(Val::NONE);
+      } else {
+        decltype(auto) r = fut.get();
+        o.result = to_val<std::decay_t<decltype(r)>>(r);
+      }
     } else {
       decltype(auto) r = BCG_CALL(pass<P<I>>(std::get<I>(st))...);
       o.result = to_val<std::decay_t<decltype(r)>>(r);
@@ -4257,6 +4408,26 @@ pub mod __bcg_rt {
         if let Some(s) = p.downcast_ref::<String>() { return s.clone(); }
         if let Some(e) = p.downcast_ref::<ErrPanic>() { return e.0.clone(); }
         String::new()
+    }
+
+    /// Minimal executor: drives an `async fn` / `impl Future` result to completion.
+    #[allow(dead_code)]
+    pub fn block_on<F: ::std::future::Future>(f: F) -> F::Output {
+        use ::std::task::{Context, Poll, Wake, Waker};
+        struct Unpark(::std::thread::Thread);
+        impl Wake for Unpark {
+            fn wake(self: ::std::sync::Arc<Self>) { self.0.unpark(); }
+            fn wake_by_ref(self: &::std::sync::Arc<Self>) { self.0.unpark(); }
+        }
+        let waker = Waker::from(::std::sync::Arc::new(Unpark(::std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut f = ::std::boxed::Box::pin(f);
+        loop {
+            match f.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => ::std::thread::park_timeout(::std::time::Duration::from_millis(1)),
+            }
+        }
     }
 
     pub fn main_with(run: fn(&[Val]) -> Val) {
@@ -4671,6 +4842,23 @@ def _native_entry(lang, source, entrypoint):
     info = {"name": nm, "params": [p for p in params if p is not None]}
     path = [x for _k, x in st if x]
     if rust:
+        info["async"] = bool(re.search(r"\basync\s+(unsafe\s+)?(extern\s*(\"[^\"]*\")?\s*)?fn$", pre.rstrip()))
+        if not info["async"]:
+            for m in re.finditer(r"\bfn\s+" + re.escape(nm) + r"\b", code):
+                po = code.find("(", m.end())
+                pc = _match_close(code, po, "(", ")") if po >= 0 else -1
+                if pc < 0:
+                    continue
+                end = len(code)
+                for ch in "{;":
+                    k = code.find(ch, pc)
+                    if 0 <= k < end:
+                        end = k
+                sig = code[pc + 1:end]
+                if re.search(r"->\s*(impl\s+)?(::)?(std\s*::\s*)?(future\s*::\s*)?Future\b", sig) or \
+                        re.search(r"->\s*Pin\s*<\s*Box\s*<\s*dyn\s+(::)?(std\s*::\s*)?(future\s*::\s*)?Future\b", sig):
+                    info["async"] = True
+                break
         info["self"] = bool(params) and params[0] is None
         info["path"] = "::".join(["self"] + path + [nm]) if not info["self"] else None
         if info["self"]:
@@ -4754,6 +4942,8 @@ def _rust_main(info, src):
     else:
         pre = ""
         call = "%s(%s)" % (info["path"], args)
+    if info.get("async"):
+        call = "__bcg_rt::block_on(%s)" % call
     return ("    #[allow(unused)]\n    pub fn __bcg_run(__a: &[crate::__bcg_rt::Val]) -> crate::__bcg_rt::Val {\n"
             "        use crate::__bcg_rt;\n"
             "        if __a.len() != %d { __bcg_rt::bad(&crate::__bcg_rt::Val::None, \"wrong number of arguments\") }\n"
@@ -5020,7 +5210,7 @@ def _native_shim(binary, name, params):
             .replace("__NAME__", repr(name)))
 
 
-def run_native(lang, tester, solution, tests, entrypoint, timeout, tol):
+def run_native(lang, tester, solution, tests, entrypoint, timeout, tol, total_timeout=None):
     """Compile and run; returns dict id->bool, or None when not runnable."""
     try:
         with open(tester, "r", encoding="utf-8") as f:
@@ -5049,8 +5239,12 @@ def run_native(lang, tester, solution, tests, entrypoint, timeout, tol):
         py_tester = os.path.join(work, "tester.py")
         with open(py_tester, "w", encoding="utf-8") as f:
             f.write(render_tester("python", tests, name))
+        deadline_at = None
+        if total_timeout is not None:
+            import time
+            deadline_at = time.monotonic() + total_timeout
         return _run_tester([sys.executable], py_tester, shim, len(tests), timeout,
-                           ["--tol", repr(float(tol))])
+                           ["--tol", repr(float(tol))], deadline_at=deadline_at)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -5140,11 +5334,26 @@ def _node_cmd(lang):
     return cmd
 
 
-def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=()):
-    """Run tester, restarting after crashes/timeouts. Returns dict id->bool."""
+def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=(), indices=None, deadline_at=None):
+    """Run tester, restarting after crashes/timeouts. Returns dict id->bool.
+
+    ``indices``: optional sorted list of test indices to run (others are skipped).
+    ``deadline_at``: optional ``time.monotonic()`` instant after which nothing more runs.
+    """
+    import time
     results = {}
-    start = 0
+    wanted = None if indices is None else sorted(set(indices))
+    pos = 0  # position in ``wanted``
+    start = 0 if wanted is None else (wanted[0] if wanted else n_tests)
     while start < n_tests:
+        if wanted is not None:
+            while pos < len(wanted) and wanted[pos] < start:
+                pos += 1
+            if pos >= len(wanted):
+                break
+            start = wanted[pos]
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            break
         cmd = base_cmd + [tester, solution, "--start", str(start)] + list(extra)
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -5168,10 +5377,13 @@ def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=()):
         load_error = False
         # loading gets a somewhat larger allowance
         limit = timeout + 5.0
-        import time
         deadline = time.monotonic() + limit
+        stop_after = None if wanted is None else wanted[-1]
         while True:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            remaining = deadline - now
+            if deadline_at is not None:
+                remaining = min(remaining, deadline_at - now)
             if remaining <= 0:
                 break
             try:
@@ -5193,12 +5405,19 @@ def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=()):
                 progressed = True
                 deadline = time.monotonic() + timeout
             elif e == "result":
-                results[ev.get("id")] = bool(ev.get("ok"))
                 idx = ev.get("index")
+                if wanted is None or idx in wanted:
+                    results[ev.get("id")] = bool(ev.get("ok"))
                 if isinstance(idx, int):
                     start = max(start, idx + 1)
                 current = None
                 deadline = time.monotonic() + timeout
+                if stop_after is not None and isinstance(idx, int) and idx >= stop_after:
+                    done = True
+                    break
+                if wanted is not None and start < n_tests and start not in wanted:
+                    # skip unselected tests by restarting at the next selected index
+                    break
             elif e == "load_error":
                 load_error = True
             elif e == "done":
@@ -5217,6 +5436,8 @@ def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=()):
             pass
         if done or load_error or not progressed:
             break
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            break
         if current is not None and isinstance(current, int):
             # the in-progress test crashed or timed out: it is failed; move on
             start = max(start, current + 1)
@@ -5229,11 +5450,24 @@ def emit_result(status, passed, failed) -> int:
     return {"pass": 0, "fail": 1}.get(status, 2)
 
 
+def _timeout_secs(args):
+    """Per-test timeout in seconds (``--timeout-ms`` takes precedence over ``--timeout``)."""
+    if args.timeout_ms is not None:
+        return args.timeout_ms / 1000.0
+    return args.timeout if args.timeout and args.timeout > 0 else DEFAULT_TIMEOUT
+
+
 def cmd_test(args) -> int:
+    import time
+    t0 = time.monotonic()
     tests_dir = args.tests_dir
     lang = args.lang
     tol = args.tol
     if tol is None or not math.isfinite(tol) or tol < 0:
+        return emit_result("error", [], [])
+    if args.timeout_ms is not None and args.timeout_ms <= 0:
+        return emit_result("error", [], [])
+    if args.total_timeout_ms is not None and args.total_timeout_ms <= 0:
         return emit_result("error", [], [])
     meta = None
     tester = None
@@ -5244,6 +5478,8 @@ def cmd_test(args) -> int:
     ep_name = None
     if meta and isinstance(meta.get("entrypoint"), str):
         ep_name = meta["entrypoint"].split(".")[-1]
+    if not os.path.isdir(tests_dir):
+        return emit_result("error", [], [])
     try:
         try:
             tests = discover(tests_dir, ep_name)
@@ -5255,38 +5491,51 @@ def cmd_test(args) -> int:
         return emit_result("error", [], [])
     ids = [t["id"] for t in tests]
 
+    selected = None  # indices into tests
+    if args.run is not None:
+        sel = [k for k, i in enumerate(ids) if i == args.run]
+        if not sel:
+            return emit_result("error", [], [])
+        selected = sel
+        sel_ids = [ids[k] for k in sel]
+    else:
+        sel_ids = ids
+
+    if args.list_tests:
+        return emit_result("pass", list(sel_ids), [])
+
     if lang not in LANG_EXT or tester is None or not os.path.isfile(tester):
-        return emit_result("error", [], ids)
+        return emit_result("error", [], sel_ids)
     solution = args.solution_path
     if not os.path.isfile(solution):
-        return emit_result("error", [], ids)
+        return emit_result("error", [], sel_ids)
     solution = os.path.abspath(solution)
+    timeout = _timeout_secs(args)
+    total = None if args.total_timeout_ms is None else args.total_timeout_ms / 1000.0
+    if not sel_ids:
+        return emit_result("pass", [], [])
     if lang in NATIVE_LANGS:
-        if not ids:
-            return emit_result("pass", [], [])
-        timeout = args.timeout if args.timeout and args.timeout > 0 else DEFAULT_TIMEOUT
         ep = meta["entrypoint"] if meta and isinstance(meta.get("entrypoint"), str) else None
         if ep is None:
-            return emit_result("error", [], ids)
-        results = run_native(lang, os.path.abspath(tester), solution, tests, ep, timeout, tol)
+            return emit_result("error", [], sel_ids)
+        run_tests = tests if selected is None else [tests[k] for k in selected]
+        results = run_native(lang, os.path.abspath(tester), solution, run_tests, ep, timeout, tol,
+                             total_timeout=total)
         if results is None:
-            return emit_result("error", [], ids)
-        passed = [i for i in ids if results.get(i) is True]
-        failed = [i for i in ids if results.get(i) is not True]
-        return emit_result("pass" if not failed else "fail", passed, failed)
-    if lang == "python":
-        base = [sys.executable]
+            return emit_result("error", [], sel_ids)
     else:
-        base = _node_cmd(lang)
-        if base is None:
-            return emit_result("error", [], ids)
-    if not ids:
-        return emit_result("pass", [], [])
-    timeout = args.timeout if args.timeout and args.timeout > 0 else DEFAULT_TIMEOUT
-    extra = ["--tol", repr(float(tol))]
-    results = _run_tester(base, os.path.abspath(tester), solution, len(ids), timeout, extra)
-    passed = [i for i in ids if results.get(i) is True]
-    failed = [i for i in ids if results.get(i) is not True]
+        if lang == "python":
+            base = [sys.executable]
+        else:
+            base = _node_cmd(lang)
+            if base is None:
+                return emit_result("error", [], sel_ids)
+        extra = ["--tol", repr(float(tol))]
+        deadline_at = None if total is None else t0 + total
+        results = _run_tester(base, os.path.abspath(tester), solution, len(ids), timeout, extra,
+                              indices=selected, deadline_at=deadline_at)
+    passed = [i for i in sel_ids if results.get(i) is True]
+    failed = [i for i in sel_ids if results.get(i) is not True]
     return emit_result("pass" if not failed else "fail", passed, failed)
 
 
@@ -5309,10 +5558,14 @@ def main(argv=None) -> int:
     g.add_argument("--lang")
     t = sub.add_parser("test")
     t.add_argument("solution_path")
-    t.add_argument("tests_dir")
+    t.add_argument("tests_dir", nargs="?")
     t.add_argument("--lang")
     t.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     t.add_argument("--tol", type=float, default=DEFAULT_TOL)
+    t.add_argument("--list-tests", action="store_true", dest="list_tests")
+    t.add_argument("--run", dest="run", default=None)
+    t.add_argument("--timeout-ms", type=int, dest="timeout_ms", default=None)
+    t.add_argument("--total-timeout-ms", type=int, dest="total_timeout_ms", default=None)
     is_test = bool(argv) and argv[0] == "test"
     try:
         args, _unknown = parser.parse_known_args(argv)
@@ -5324,6 +5577,10 @@ def main(argv=None) -> int:
     if args.command == "generate":
         return cmd_generate(args)
     if args.command == "test":
+        if args.tests_dir is None:
+            if not args.list_tests:
+                return emit_result("error", [], [])
+            args.tests_dir = args.solution_path  # `test --list-tests <tests_dir>`
         return cmd_test(args)
     sys.stderr.write("usage: babel_code_goat.py {generate,test} ...\n")
     return 2

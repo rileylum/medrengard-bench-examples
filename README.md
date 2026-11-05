@@ -4,7 +4,19 @@
 python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 python babel_code_goat.py generate <tests_dir> --entrypoint <name> --lang python|javascript|typescript|cpp|rust
 python babel_code_goat.py test <solution> <tests_dir> --lang python|javascript|typescript|cpp|rust [--timeout SECONDS] [--tol FLOAT]
+    [--list-tests] [--run <test_id>] [--timeout-ms INT] [--total-timeout-ms INT]
 ```
+
+`test` flags: `--list-tests` only discovers (status `pass`, all IDs in `passed`); `--run <id>` runs just that test
+(unknown ID -> `error`); `--timeout-ms` is the per-test limit (overrides `--timeout`); `--total-timeout-ms` bounds the
+whole run (for C++/Rust it starts after compilation). Timed-out and never-executed tests are reported in `failed`.
+
+Async: test files may use `async def` tests (incl. `@pytest.mark.asyncio`), `await f(x)`, `asyncio.run(f(x))`,
+`loop.run_until_complete(f(x))`, `asyncio.wait_for(f(x), ...)`, `trio.run`/`anyio.run`; calls to the file's own test
+functions (e.g. `asyncio.run(main())`) and `if __name__ == "__main__":` guards are allowed. Every tester runs the
+entrypoint's result to completion: Python awaitables (fresh event loop), JS/TS Promises/thenables, C++
+`std::future`/`std::shared_future` (`.get()`, exceptions propagate), Rust `async fn` / `-> impl Future` (built-in
+`block_on` executor).
 
 JavaScript/TypeScript testers require Node.js (TypeScript uses Node's built-in type stripping, Node >= 22.6).
 
