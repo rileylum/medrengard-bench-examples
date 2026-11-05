@@ -5,7 +5,16 @@ python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 python babel_code_goat.py generate <tests_dir> --entrypoint <name> --lang python|javascript|typescript|cpp|rust
 python babel_code_goat.py test <solution> <tests_dir> --lang python|javascript|typescript|cpp|rust [--timeout SECONDS] [--tol FLOAT]
     [--list-tests] [--run <test_id>] [--timeout-ms INT] [--total-timeout-ms INT]
+python babel_code_goat.py profile <tests_dir> <solution> --lang <lang> [-n TRIALS] [--warmup K] [--memory]
+    [--tol FLOAT] [--list-tests] [--run <test_id>] [--timeout-ms INT] [--total-timeout-ms INT]
 ```
+
+`profile` (run `generate` first; a missing tester is an `error`) runs the selected tests `-n` times (default 1),
+discarding the first `--warmup` runs (`0 <= k < n`, else `error`). It prints the `test` JSON plus
+`runtime_ns: {mean, std}` (wall time of each trial's run, population std; C++/Rust compile once, untimed), and with
+`--memory` also `memory_kb: {mean, std}` (peak RSS of the tester process per trial). A test is `passed` only if it
+passed in every measured trial. Timed-out trials count in the statistics and their tests appear in `failed`.
+`--total-timeout-ms` applies per trial. Exit codes match `test` (0 pass, 1 fail, 2 error).
 
 `test` flags: `--list-tests` only discovers (status `pass`, all IDs in `passed`); `--run <id>` runs just that test
 (unknown ID -> `error`); `--timeout-ms` is the per-test limit (overrides `--timeout`); `--total-timeout-ms` bounds the

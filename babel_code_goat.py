@@ -5212,6 +5212,13 @@ def _native_shim(binary, name, params):
 
 def run_native(lang, tester, solution, tests, entrypoint, timeout, tol, total_timeout=None):
     """Compile and run; returns dict id->bool, or None when not runnable."""
+    out = run_native_trials(lang, tester, solution, tests, entrypoint, timeout, tol, total_timeout, 1)
+    return None if out is None else out[0][0]
+
+
+def run_native_trials(lang, tester, solution, tests, entrypoint, timeout, tol, total_timeout, trials,
+                      memory=False):
+    """Compile once and run ``trials`` times; returns [(results, runtime_ns, maxrss_kb)] or None."""
     try:
         with open(tester, "r", encoding="utf-8") as f:
             tester_text = f.read()
@@ -5239,12 +5246,18 @@ def run_native(lang, tester, solution, tests, entrypoint, timeout, tol, total_ti
         py_tester = os.path.join(work, "tester.py")
         with open(py_tester, "w", encoding="utf-8") as f:
             f.write(render_tester("python", tests, name))
-        deadline_at = None
-        if total_timeout is not None:
-            import time
-            deadline_at = time.monotonic() + total_timeout
-        return _run_tester([sys.executable], py_tester, shim, len(tests), timeout,
-                           ["--tol", repr(float(tol))], deadline_at=deadline_at)
+        import time
+        runs = []
+        for _ in range(trials):
+            t_start = time.monotonic()
+            deadline_at = None if total_timeout is None else t_start + total_timeout
+            stats = {"maxrss": 0} if memory else None
+            t_ns = time.perf_counter_ns()
+            res = _run_tester([sys.executable], py_tester, shim, len(tests), timeout,
+                              ["--tol", repr(float(tol))], deadline_at=deadline_at, stats=stats)
+            elapsed = time.perf_counter_ns() - t_ns
+            runs.append((res, elapsed, stats["maxrss"] if stats else 0))
+        return runs
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -5334,7 +5347,36 @@ def _node_cmd(lang):
     return cmd
 
 
-def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=(), indices=None, deadline_at=None):
+def _reap(proc, stats):
+    """Wait for ``proc``; when ``stats`` is given, record its peak RSS (KB, incl. reaped children)."""
+    if stats is None:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        return
+    try:
+        _pid, status, ru = os.wait4(proc.pid, 0)
+        proc.returncode = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else -1
+        rss = int(ru.ru_maxrss)
+        if sys.platform == "darwin":
+            rss //= 1024
+        stats["maxrss"] = max(stats.get("maxrss", 0), rss)
+    except ChildProcessError:
+        pass
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=(), indices=None, deadline_at=None,
+                stats=None):
     """Run tester, restarting after crashes/timeouts. Returns dict id->bool.
 
     ``indices``: optional sorted list of test indices to run (others are skipped).
@@ -5426,14 +5468,12 @@ def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=(), indices=
             os.killpg(proc.pid, signal.SIGKILL)
         except (OSError, ProcessLookupError):
             pass
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
+        if stats is None:  # Popen.kill() polls (and may reap) the child, losing its rusage
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        _reap(proc, stats)
         if done or load_error or not progressed:
             break
         if deadline_at is not None and time.monotonic() >= deadline_at:
@@ -5457,7 +5497,59 @@ def _timeout_secs(args):
     return args.timeout if args.timeout and args.timeout > 0 else DEFAULT_TIMEOUT
 
 
+def _stats(xs):
+    if not xs:
+        return {"mean": 0.0, "std": 0.0}
+    m = sum(xs) / len(xs)
+    var = sum((x - m) ** 2 for x in xs) / len(xs)
+    return {"mean": float(m), "std": float(math.sqrt(var))}
+
+
+class _Emitter:
+    """Builds the JSON report for ``test`` (plain) or ``profile`` (with statistics)."""
+
+    def __init__(self, profile=False, memory=False):
+        self.profile = profile
+        self.memory = memory
+        self.runtimes = []
+        self.mems = []
+
+    def __call__(self, status, passed, failed) -> int:
+        if not self.profile:
+            return emit_result(status, passed, failed)
+        out = {"status": status, "passed": passed, "failed": failed,
+               "runtime_ns": _stats(self.runtimes)}
+        if self.memory:
+            out["memory_kb"] = _stats(self.mems)
+        out["trials"] = len(self.runtimes)
+        sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        return {"pass": 0, "fail": 1}.get(status, 2)
+
+
 def cmd_test(args) -> int:
+    return _execute(args, _Emitter())
+
+
+def cmd_profile(args) -> int:
+    memory = bool(args.memory)
+    emit = _Emitter(profile=True, memory=memory)
+    n, warmup = args.n, args.warmup
+    if n is None or n < 1:
+        return emit("error", [], [])
+    if warmup is None:
+        warmup = 0
+    if warmup < 0 or warmup >= n:
+        return emit("error", [], [])
+    lang = args.lang
+    if lang not in LANG_EXT or args.tests_dir is None:
+        return emit("error", [], [])
+    if not os.path.isfile(os.path.join(args.tests_dir, "tester." + LANG_EXT[lang])):
+        return emit("error", [], [])
+    return _execute(args, emit, trials=n, warmup=warmup, memory=memory)
+
+
+def _execute(args, emit_result, trials=1, warmup=0, memory=False) -> int:
     import time
     t0 = time.monotonic()
     tests_dir = args.tests_dir
@@ -5507,21 +5599,22 @@ def cmd_test(args) -> int:
     if lang not in LANG_EXT or tester is None or not os.path.isfile(tester):
         return emit_result("error", [], sel_ids)
     solution = args.solution_path
-    if not os.path.isfile(solution):
+    if not solution or not os.path.isfile(solution):
         return emit_result("error", [], sel_ids)
     solution = os.path.abspath(solution)
     timeout = _timeout_secs(args)
     total = None if args.total_timeout_ms is None else args.total_timeout_ms / 1000.0
     if not sel_ids:
         return emit_result("pass", [], [])
+    runs = []  # (results, runtime_ns, maxrss_kb)
     if lang in NATIVE_LANGS:
         ep = meta["entrypoint"] if meta and isinstance(meta.get("entrypoint"), str) else None
         if ep is None:
             return emit_result("error", [], sel_ids)
         run_tests = tests if selected is None else [tests[k] for k in selected]
-        results = run_native(lang, os.path.abspath(tester), solution, run_tests, ep, timeout, tol,
-                             total_timeout=total)
-        if results is None:
+        runs = run_native_trials(lang, os.path.abspath(tester), solution, run_tests, ep, timeout, tol,
+                                 total, trials, memory=memory)
+        if runs is None:
             return emit_result("error", [], sel_ids)
     else:
         if lang == "python":
@@ -5531,11 +5624,21 @@ def cmd_test(args) -> int:
             if base is None:
                 return emit_result("error", [], sel_ids)
         extra = ["--tol", repr(float(tol))]
-        deadline_at = None if total is None else t0 + total
-        results = _run_tester(base, os.path.abspath(tester), solution, len(ids), timeout, extra,
-                              indices=selected, deadline_at=deadline_at)
-    passed = [i for i in sel_ids if results.get(i) is True]
-    failed = [i for i in sel_ids if results.get(i) is not True]
+        for k in range(trials):
+            start = t0 if k == 0 else time.monotonic()
+            deadline_at = None if total is None else start + total
+            stats = {"maxrss": 0} if memory else None
+            t_ns = time.perf_counter_ns()
+            res = _run_tester(base, os.path.abspath(tester), solution, len(ids), timeout, extra,
+                              indices=selected, deadline_at=deadline_at, stats=stats)
+            elapsed = time.perf_counter_ns() - t_ns
+            runs.append((res, elapsed, stats["maxrss"] if stats else 0))
+    measured = runs[warmup:]
+    if hasattr(emit_result, "runtimes"):
+        emit_result.runtimes = [r[1] for r in measured]
+        emit_result.mems = [r[2] for r in measured]
+    passed = [i for i in sel_ids if all(r[0].get(i) is True for r in measured)]
+    failed = [i for i in sel_ids if not all(r[0].get(i) is True for r in measured)]
     return emit_result("pass" if not failed else "fail", passed, failed)
 
 
@@ -5566,12 +5669,29 @@ def main(argv=None) -> int:
     t.add_argument("--run", dest="run", default=None)
     t.add_argument("--timeout-ms", type=int, dest="timeout_ms", default=None)
     t.add_argument("--total-timeout-ms", type=int, dest="total_timeout_ms", default=None)
+    pr = sub.add_parser("profile")
+    pr.add_argument("tests_dir", nargs="?")
+    pr.add_argument("solution_path", nargs="?")
+    pr.add_argument("--lang")
+    pr.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    pr.add_argument("--tol", type=float, default=DEFAULT_TOL)
+    pr.add_argument("--list-tests", action="store_true", dest="list_tests")
+    pr.add_argument("--run", dest="run", default=None)
+    pr.add_argument("--timeout-ms", type=int, dest="timeout_ms", default=None)
+    pr.add_argument("--total-timeout-ms", type=int, dest="total_timeout_ms", default=None)
+    pr.add_argument("-n", "--trials", type=int, dest="n", default=1)
+    pr.add_argument("--warmup", type=int, dest="warmup", default=0)
+    pr.add_argument("--memory", action="store_true", dest="memory")
     is_test = bool(argv) and argv[0] == "test"
+    is_profile = bool(argv) and argv[0] == "profile"
     try:
         args, _unknown = parser.parse_known_args(argv)
     except _UsageError as e:
         if is_test:
             return emit_result("error", [], [])
+        if is_profile:
+            mem = "--memory" in argv
+            return _Emitter(profile=True, memory=mem)("error", [], [])
         sys.stderr.write(f"error: {e}\n")
         return 2
     if args.command == "generate":
@@ -5582,7 +5702,14 @@ def main(argv=None) -> int:
                 return emit_result("error", [], [])
             args.tests_dir = args.solution_path  # `test --list-tests <tests_dir>`
         return cmd_test(args)
-    sys.stderr.write("usage: babel_code_goat.py {generate,test} ...\n")
+    if args.command == "profile":
+        a, b = args.tests_dir, args.solution_path
+        if a is not None and b is not None and not os.path.isdir(a) and os.path.isdir(b):
+            args.tests_dir, args.solution_path = b, a  # accept `profile <solution> <tests_dir>` too
+        elif a is not None and b is None and not os.path.isdir(a):
+            return _Emitter(profile=True, memory=args.memory)("error", [], [])
+        return cmd_profile(args)
+    sys.stderr.write("usage: babel_code_goat.py {generate,test,profile} ...\n")
     return 2
 
 
