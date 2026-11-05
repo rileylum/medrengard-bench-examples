@@ -27,11 +27,19 @@ Commands:
                        Report warnings (unused inputs, constant outputs).
   dot <file> -o <dot_file> [--format ...] [--cone out1,out2,...]
                        Export the circuit as a Graphviz DOT graph.
+  cone <file> -o <out_file> --outputs y,z [--format ...] [--out-format circ|json]
+                       Extract the subcircuit needed for the given outputs.
+  truth-table <file> --max-input-bits N [--format ...] [--radix bin|hex|dec]
+       [-o <path>] [--out-format csv|json]
+                       Print the exhaustive truth table (2val only).
+  equiv <a> <b> --max-input-bits N [--format ...] [--trials T] [--outputs y,z]
+                       Check functional equivalence (exhaustive or randomized).
 
 Global flags:
   --help               Show this help and exit.
   --version            Show version and exit.
   --json               Emit exactly one JSON object on stdout.
+  --seed <n>           Seed for randomized behavior (non-negative integer).
 
 Exit codes:
   0 success, 1 CLI usage error, 2 parse error, 3 validation error,
@@ -1583,8 +1591,484 @@ def cmd_dot(args, opts):
     return {"dot_path": out_path}, "wrote %s" % out_path
 
 
+# ---------------------------------------------------------------------------
+# Part 7: cone, truth-table, equiv
+# ---------------------------------------------------------------------------
+
+UnknownOutputFormatError = _mk("UnknownOutputFormatError", 1)
+UnsupportedFeatureError = _mk("UnsupportedFeatureError", 1)
+InputLimitExceeded = _mk("InputLimitExceeded", 1)
+PortMismatchError = _mk("PortMismatchError", 3)
+
+ASSOC_OPS = {"AND", "OR", "XOR"}
+
+
+def width_of(c, name):
+    msb, lsb = c.ranges[name]
+    return msb - lsb + 1
+
+
+def format_expr(e):
+    """Canonical text of an expression (with associative flattening)."""
+    if isinstance(e, Const):
+        if e.width == 1:
+            return str(e.value)
+        return "0b" + format(e.value, "0%db" % e.width)
+    if isinstance(e, Ident):
+        return e.name
+    if isinstance(e, Index):
+        return "%s[%d]" % (e.name, e.idx)
+    if isinstance(e, Slice):
+        return "%s[%d:%d]" % (e.name, e.hi, e.lo)
+    if isinstance(e, Concat):
+        return "{" + ", ".join(format_expr(p) for p in e.parts) + "}"
+    if e.op in ASSOC_OPS:
+        flat = []
+        stack = list(reversed(e.args))
+        while stack:
+            a = stack.pop()
+            if isinstance(a, Call) and a.op == e.op:
+                stack.extend(reversed(a.args))
+            else:
+                flat.append(format_expr(a))
+        flat.sort()
+        return "%s(%s)" % (e.op, ", ".join(flat))
+    return "%s(%s)" % (e.op, ", ".join(format_expr(a) for a in e.args))
+
+
+def canonical_assign_order(c, names):
+    """Dependency order over `names` (assigned signals); ties by LHS name."""
+    import heapq
+    names = set(names)
+    deps = {}
+    users = {n: [] for n in names}
+    for n in names:
+        ds = {d for d in dep_names(c.assigns[n]) if d in names and d != n}
+        deps[n] = len(ds)
+        for d in ds:
+            users[d].append(n)
+    heap = [n for n in names if deps[n] == 0]
+    heapq.heapify(heap)
+    order = []
+    while heap:
+        n = heapq.heappop(heap)
+        order.append(n)
+        for u in users[n]:
+            deps[u] -= 1
+            if deps[u] == 0:
+                heapq.heappush(heap, u)
+    return order
+
+
+def decl_text(c, name):
+    return sig_label(c, name)
+
+
+def write_circ_text(c, inputs, outputs, wires, order):
+    lines = []
+    if inputs:
+        lines.append("input " + " ".join(decl_text(c, n) for n in sorted(inputs)))
+    lines.append("output " + " ".join(decl_text(c, n) for n in sorted(outputs)))
+    if wires:
+        lines.append("wire " + " ".join(decl_text(c, n) for n in sorted(wires)))
+    lines.append("")
+    for n in order:
+        lines.append("%s = %s" % (n, format_expr(c.assigns[n])))
+    return "\n".join(lines) + "\n"
+
+
+def write_json_text(c, inputs, outputs, wires, order):
+    def ports(ns):
+        return [{"name": n, "msb": c.ranges[n][0], "lsb": c.ranges[n][1]}
+                for n in sorted(ns)]
+    doc = {
+        "format_version": 1,
+        "inputs": ports(inputs),
+        "outputs": ports(outputs),
+        "wires": ports(wires),
+        "assignments": [{"lhs": n, "rhs": format_expr(c.assigns[n])}
+                        for n in order],
+    }
+    return json.dumps(doc, indent=2) + "\n"
+
+
+def parse_name_list(opts, flag):
+    names = []
+    for raw in opts.get(flag, []):
+        for p in raw.split(","):
+            p = p.strip()
+            if p and p not in names:
+                names.append(p)
+    return names
+
+
+def write_file(path, text):
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+    except OSError as e:
+        raise CliUsageError("cannot write %s: %s" % (path, e))
+
+
+def cmd_cone(args, opts):
+    if len(args) != 1:
+        raise CliUsageError("cone requires exactly one file argument")
+    fmt = get_format_opt(opts)
+    if not opts.get("-o") or not opts["-o"][-1]:
+        raise CliUsageError("cone requires -o <out_file>")
+    out_path = opts["-o"][-1]
+    if opts.get("--out-format"):
+        raw = opts["--out-format"][-1]
+        out_fmt = raw.strip().lower()
+        if out_fmt == "bench":
+            raise UnsupportedFeatureError(
+                "BENCH output is not supported by cone (use circ or json)")
+        if out_fmt not in ("circ", "json"):
+            raise CliUsageError("invalid --out-format %r (expected circ or json)"
+                                % raw)
+    else:
+        ext = os.path.splitext(out_path)[1].lower()
+        if ext == ".circ":
+            out_fmt = "circ"
+        elif ext == ".json":
+            out_fmt = "json"
+        else:
+            raise UnknownOutputFormatError(
+                "cannot infer output format from extension %r of %s "
+                "(use --out-format circ|json)" % (ext, out_path))
+    if not opts.get("--outputs"):
+        raise CliUsageError("cone requires --outputs name1,name2,...")
+    wanted = parse_name_list(opts, "--outputs")
+    if not wanted:
+        raise CliUsageError("--outputs requires at least one output name")
+    c, _fmt = load_circuit(args[0], fmt)
+    outs = set(c.outputs)
+    for n in wanted:
+        if n not in outs:
+            raise UndefinedNameError("unknown output: %s" % n)
+    for n in wanted:
+        if n in c.kinds and c.kinds[n] == "input":
+            raise UnsupportedFeatureError(
+                "output %r is also an input; cannot be represented" % n)
+    keep = backward_cone(c, wanted)
+    inputs = [n for n in c.inputs if n in keep]
+    assigned = [n for n in keep if n in c.assigns]
+    wset = set(wanted)
+    wires = [n for n in assigned if n not in wset]
+    order = canonical_assign_order(c, assigned)
+    if out_fmt == "circ":
+        text = write_circ_text(c, inputs, wanted, wires, order)
+    else:
+        text = write_json_text(c, inputs, wanted, wires, order)
+    write_file(out_path, text)
+    return {"out_path": out_path}, "wrote %s" % out_path
+
+
+# --- fast evaluation -------------------------------------------------------
+
+def _py_expr(e, c, var):
+    if isinstance(e, Const):
+        return str(e.value)
+    if isinstance(e, Ident):
+        return var[e.name]
+    if isinstance(e, Index):
+        sh = e.idx - c.ranges[e.name][1]
+        return "((%s >> %d) & 1)" % (var[e.name], sh)
+    if isinstance(e, Slice):
+        sh = e.lo - c.ranges[e.name][1]
+        return "((%s >> %d) & %d)" % (var[e.name], sh, mask(e.w))
+    if isinstance(e, Concat):
+        parts = []
+        shift = e.w
+        for p in e.parts:
+            shift -= p.w
+            s = _py_expr(p, c, var)
+            parts.append("(%s << %d)" % (s, shift) if shift else s)
+        return "(" + " | ".join(parts) + ")"
+    a = [_py_expr(x, c, var) for x in e.args]
+    op = e.op
+    m = mask(e.w)
+    if op == "BUF":
+        return a[0]
+    if op == "NOT":
+        return "(%s ^ %d)" % (a[0], m)
+    if op in ("AND", "NAND", "OR", "NOR", "XOR", "XNOR"):
+        sym = {"AND": "&", "NAND": "&", "OR": "|", "NOR": "|",
+               "XOR": "^", "XNOR": "^"}[op]
+        s = "(" + (" %s " % sym).join(a) + ")"
+        if op in ("NAND", "NOR", "XNOR"):
+            s = "(%s ^ %d)" % (s, m)
+        return s
+    if op in ("MUX", "ITE"):
+        return "(%s if %s else %s)" % (a[1], a[0], a[2])
+    if op == "REDUCE_AND":
+        return "(1 if %s == %d else 0)" % (a[0], mask(e.args[0].w))
+    if op == "REDUCE_OR":
+        return "(1 if %s else 0)" % a[0]
+    if op == "REDUCE_XOR":
+        return "(bin(%s).count('1') & 1)" % a[0]
+    if op == "EQ":
+        return "(1 if %s == %s else 0)" % (a[0], a[1])
+    raise CircoptError("unknown operator %s" % op)
+
+
+def make_evaluator(c, in_names, out_names):
+    """Return f(values_tuple_for_in_names) -> tuple of output values."""
+    keep = backward_cone(c, out_names)
+    order = [n for n in topo_order(c) if n in keep]
+    try:
+        var = {}
+        for i, n in enumerate(in_names):
+            var[n] = "i%d" % i
+        for i, n in enumerate(order):
+            var[n] = "v%d" % i
+        lines = ["def _f(_vals):"]
+        if in_names:
+            lines.append("    %s, = _vals" % ", ".join(var[n] for n in in_names))
+        for n in order:
+            lines.append("    %s = %s" % (var[n], _py_expr(c.assigns[n], c, var)))
+        lines.append("    return (%s,)" % ", ".join(var[n] for n in out_names)
+                     if out_names else "    return ()")
+        ns = {}
+        exec(compile("\n".join(lines), "<circuit>", "exec"), ns)
+        return ns["_f"]
+    except (RecursionError, SyntaxError, MemoryError, ValueError):
+        def _slow(vals):
+            env = dict(zip(in_names, vals))
+            for n in order:
+                env[n] = eval_expr(c.assigns[n], env, c)
+            return tuple(env[n] for n in out_names)
+        return _slow
+
+
+def input_layout(c):
+    """Sorted inputs with widths and their shifts in the enumeration counter."""
+    names = sorted(c.inputs)
+    widths = [width_of(c, n) for n in names]
+    total = sum(widths)
+    shifts = []
+    s = total
+    for w in widths:
+        s -= w
+        shifts.append(s)
+    return names, widths, shifts, total
+
+
+def split_combo(combo, widths, shifts):
+    return tuple((combo >> s) & mask(w) for w, s in zip(widths, shifts))
+
+
+def get_radix(opts):
+    radix = "bin"
+    if opts.get("--radix"):
+        radix = opts["--radix"][-1].strip().lower()
+        if radix not in ("bin", "hex", "dec"):
+            raise CliUsageError("invalid --radix %r (expected bin, hex or dec)"
+                                % opts["--radix"][-1])
+    return radix
+
+
+def required_int(opts, flag, cmd):
+    if not opts.get(flag):
+        raise CliUsageError("%s requires %s N" % (cmd, flag))
+    return _int_opt(opts, flag, None)
+
+
+def cmd_truth_table(args, opts):
+    if len(args) != 1:
+        raise CliUsageError("truth-table requires exactly one file argument")
+    fmt = get_format_opt(opts)
+    if opts.get("--mode"):
+        mode = opts["--mode"][-1].strip().lower()
+        if mode == "3val":
+            raise UnsupportedFeatureError("truth-table supports only --mode 2val")
+        if mode != "2val":
+            raise CliUsageError("invalid --mode %r (expected 2val or 3val)"
+                                % opts["--mode"][-1])
+    radix = get_radix(opts)
+    limit = required_int(opts, "--max-input-bits", "truth-table")
+    out_fmt = None
+    if opts.get("--out-format"):
+        raw = opts["--out-format"][-1]
+        out_fmt = raw.strip().lower()
+        if out_fmt not in ("csv", "json"):
+            raise CliUsageError("invalid --out-format %r (expected csv or json)"
+                                % raw)
+    out_path = None
+    if opts.get("-o"):
+        out_path = opts["-o"][-1]
+        if not out_path:
+            raise CliUsageError("-o requires a non-empty path")
+    c, _fmt = load_circuit(args[0], fmt)
+    names, widths, shifts, total = input_layout(c)
+    if total > limit:
+        raise InputLimitExceeded(
+            "circuit has %d input bits, exceeding --max-input-bits %d"
+            % (total, limit))
+    outs = sorted(set(c.outputs))
+    owidths = [width_of(c, n) for n in outs]
+    f = make_evaluator(c, names, outs)
+    rows = []
+    for combo in range(1 << total):
+        ivals = split_combo(combo, widths, shifts)
+        ovals = f(ivals)
+        rows.append(([format_value(v, w, radix) for v, w in zip(ivals, widths)],
+                     [format_value(v, w, radix) for v, w in zip(ovals, owidths)]))
+
+    def as_json():
+        return {
+            "radix": radix,
+            "inputs": sig_list(c, names),
+            "outputs": sig_list(c, outs),
+            "rows": [{"inputs": dict(zip(names, iv)), "outputs": dict(zip(outs, ov))}
+                     for iv, ov in rows],
+        }
+
+    def as_csv():
+        lines = [",".join(names + outs)]
+        for iv, ov in rows:
+            lines.append(",".join(iv + ov))
+        return "\n".join(lines) + "\n"
+
+    json_mode = bool(opts.get("__json__"))
+    result = None
+    if out_path is not None:
+        if (out_fmt or "csv") == "json":
+            doc = {"ok": True, "command": "truth-table"}
+            result = as_json()
+            doc.update(result)
+            write_file(out_path, json.dumps(doc, separators=(",", ":")) + "\n")
+        else:
+            write_file(out_path, as_csv())
+        text = ""
+    elif out_fmt == "json" and not json_mode:
+        doc = {"ok": True, "command": "truth-table"}
+        doc.update(as_json())
+        text = json.dumps(doc, separators=(",", ":"))
+    else:
+        text = "" if json_mode else as_csv()[:-1]
+    if json_mode and result is None:
+        result = as_json()
+    return result or {}, text
+
+
+def cmd_equiv(args, opts):
+    import random
+    if len(args) != 2:
+        raise CliUsageError("equiv requires exactly two file arguments")
+    fmt = get_format_opt(opts)
+    limit = required_int(opts, "--max-input-bits", "equiv")
+    trials = _int_opt(opts, "--trials", 10000)
+    if trials < 1:
+        raise CliUsageError("--trials must be a positive integer")
+    seed = _int_opt(opts, "--seed", 0)
+    restrict = None
+    if opts.get("--outputs"):
+        restrict = parse_name_list(opts, "--outputs")
+        if not restrict:
+            raise CliUsageError("--outputs requires at least one output name")
+    ca, _ = load_circuit(args[0], fmt)
+    cb, _ = load_circuit(args[1], fmt)
+
+    def ports(c, names):
+        return {n: c.ranges[n] for n in names}
+
+    pa, pb = ports(ca, ca.inputs), ports(cb, cb.inputs)
+    if pa != pb:
+        diffs = []
+        for n in sorted(set(pa) | set(pb)):
+            if n not in pb:
+                diffs.append("input %r only in %s" % (n, args[0]))
+            elif n not in pa:
+                diffs.append("input %r only in %s" % (n, args[1]))
+            elif pa[n] != pb[n]:
+                diffs.append("input %r range [%d:%d] vs [%d:%d]"
+                             % (n, pa[n][0], pa[n][1], pb[n][0], pb[n][1]))
+        raise PortMismatchError("input ports differ: " + "; ".join(diffs))
+    oa, ob = ports(ca, ca.outputs), ports(cb, cb.outputs)
+    if restrict is None:
+        if oa != ob:
+            diffs = []
+            for n in sorted(set(oa) | set(ob)):
+                if n not in ob:
+                    diffs.append("output %r only in %s" % (n, args[0]))
+                elif n not in oa:
+                    diffs.append("output %r only in %s" % (n, args[1]))
+                elif oa[n] != ob[n]:
+                    diffs.append("output %r range [%d:%d] vs [%d:%d]"
+                                 % (n, oa[n][0], oa[n][1], ob[n][0], ob[n][1]))
+            raise PortMismatchError("output ports differ: " + "; ".join(diffs))
+        compared = sorted(oa)
+    else:
+        for n in restrict:
+            if n not in oa and n not in ob:
+                raise UndefinedNameError("unknown output: %s" % n)
+            if n not in oa:
+                raise PortMismatchError("output %r not present in %s" % (n, args[0]))
+            if n not in ob:
+                raise PortMismatchError("output %r not present in %s" % (n, args[1]))
+            if oa[n] != ob[n]:
+                raise PortMismatchError(
+                    "output %r range [%d:%d] vs [%d:%d]"
+                    % (n, oa[n][0], oa[n][1], ob[n][0], ob[n][1]))
+        compared = sorted(restrict)
+
+    names, widths, shifts, total = input_layout(ca)
+    fa = make_evaluator(ca, names, compared)
+    fb = make_evaluator(cb, names, compared)
+    owidths = [width_of(ca, n) for n in compared]
+
+    if total <= limit:
+        method = "exhaustive"
+        gen = (split_combo(k, widths, shifts) for k in range(1 << total))
+    else:
+        method = "randomized"
+        rng = random.Random(seed)
+
+        def _gen():
+            for _ in range(trials):
+                yield tuple(rng.getrandbits(w) for w in widths)
+        gen = _gen()
+
+    count = 0
+    cex = None
+    for ivals in gen:
+        count += 1
+        ra = fa(ivals)
+        rb = fb(ivals)
+        if ra != rb:
+            cex = (ivals, ra, rb)
+            break
+    result = {"equivalent": cex is None, "method": method, "comparisons": count}
+    if cex is None:
+        text = "equivalent (%s, %d comparisons)" % (method, count)
+        return result, text
+    ivals, ra, rb = cex
+
+    def vals(c, ns, vs, ws):
+        return [{"name": n, "msb": c.ranges[n][0], "lsb": c.ranges[n][1],
+                 "value": format_value(v, w, "bin")}
+                for n, v, w in zip(ns, vs, ws)]
+
+    result["counterexample"] = {
+        "inputs": vals(ca, names, ivals, widths),
+        "outputs_compared": compared,
+        "a_outputs": vals(ca, compared, ra, owidths),
+        "b_outputs": vals(cb, compared, rb, owidths),
+    }
+    lines = ["not equivalent (%s, %d comparisons)" % (method, count),
+             "counterexample:"]
+    for d in result["counterexample"]["inputs"]:
+        lines.append("  %s=%s" % (d["name"], d["value"]))
+    for da, db in zip(result["counterexample"]["a_outputs"],
+                      result["counterexample"]["b_outputs"]):
+        lines.append("  %s: a=%s b=%s" % (da["name"], da["value"], db["value"]))
+    return result, "\n".join(lines), 10
+
+
 COMMANDS = {"check": cmd_check, "eval": cmd_eval, "stats": cmd_stats,
-            "lint": cmd_lint, "dot": cmd_dot}
+            "lint": cmd_lint, "dot": cmd_dot, "cone": cmd_cone,
+            "truth-table": cmd_truth_table, "equiv": cmd_equiv}
 # command -> {flag: takes_value}
 COMMAND_FLAGS = {
     "check": {"--format": True},
@@ -1593,7 +2077,14 @@ COMMAND_FLAGS = {
     "stats": {"--format": True},
     "lint": {"--format": True, "--max-input-bits": True},
     "dot": {"--format": True, "-o": True, "--cone": True},
+    "cone": {"--format": True, "-o": True, "--outputs": True, "--out-format": True},
+    "truth-table": {"--format": True, "--max-input-bits": True, "--radix": True,
+                    "-o": True, "--out-format": True, "--mode": True},
+    "equiv": {"--format": True, "--max-input-bits": True, "--trials": True,
+              "--outputs": True},
 }
+for _flags in COMMAND_FLAGS.values():
+    _flags["--seed"] = True
 ALL_VALUE_FLAGS = {f for d in COMMAND_FLAGS.values() for f, v in d.items() if v}
 ALL_CMD_FLAGS = {f for d in COMMAND_FLAGS.values() for f in d}
 
@@ -1682,10 +2173,13 @@ def main(argv):
                     raise CliUsageError("flag %s is not valid for %s" % (f, command))
             if missing_value is not None:
                 raise CliUsageError("flag %s requires a value" % missing_value)
-            if command == "check":
-                result, text = cmd_check(positional[1:], opts)
-            else:
-                result, text = COMMANDS[command](positional[1:], opts)
+            if opts.get("--seed"):
+                _int_opt(opts, "--seed", 0)
+            if json_mode:
+                opts["__json__"] = [True]
+            ret = COMMANDS[command](positional[1:], opts)
+            result, text = ret[0], ret[1]
+            exit_code = ret[2] if len(ret) > 2 else 0
         except CircoptError:
             raise
         except RecursionError:
@@ -1725,7 +2219,7 @@ def main(argv):
     else:
         if text:
             sys.stdout.write(text + "\n")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
