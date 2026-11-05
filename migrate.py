@@ -828,10 +828,271 @@ def apply_merge_data(cfg, rule):
     return deep_merge(cfg, cfg.data, data)
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint 2 helpers: generic path access (mappings and arrays)
+# ---------------------------------------------------------------------------
+
+def is_sequence(obj):
+    return isinstance(obj, (list, tuple))
+
+
+def _child(node, part):
+    """Return (found, value) for path component `part` of `node`."""
+    if is_mapping(node):
+        if part in node:
+            return True, node[part]
+        return False, None
+    if is_sequence(node):
+        try:
+            idx = int(part)
+        except (TypeError, ValueError):
+            return False, None
+        if str(idx) != str(part).strip() or idx < 0 or idx >= len(node):
+            return False, None
+        return True, node[idx]
+    return False, None
+
+
+def resolve_path(data, parts):
+    """Return (found, parent, key, value) for the given path parts."""
+    if not parts:
+        return False, None, None, None
+    node = data
+    for p in parts[:-1]:
+        found, node = _child(node, p)
+        if not found:
+            return False, None, None, None
+    last = parts[-1]
+    found, value = _child(node, last)
+    if not found:
+        return False, None, None, None
+    key = int(last) if is_sequence(node) else last
+    return True, node, key, value
+
+
+def get_path_value(data, path):
+    found, _, _, value = resolve_path(data, split_path(path))
+    return found, value
+
+
+def _set_child(cfg, parent, key, value):
+    parent[key] = cfg.convert(value)
+
+
+def stringify(value):
+    value = to_plain(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+_TEMPLATE_RE = re.compile(r"\$\{([^}]*)\}")
+
+
+def render_template(template, variables):
+    def repl(m):
+        name = m.group(1)
+        if name in variables:
+            return stringify(variables[name])
+        return m.group(0)
+    return _TEMPLATE_RE.sub(repl, template)
+
+
+def substitute_value(value, variables):
+    if isinstance(value, str):
+        return render_template(value, variables)
+    if isinstance(value, dict):
+        return {k: substitute_value(v, variables) for k, v in value.items()}
+    if isinstance(value, list):
+        return [substitute_value(v, variables) for v in value]
+    return value
+
+
+def _values_differ(cfg, current, value):
+    if strict_equal(current, value):
+        return False
+    if cfg.fmt == "ini" and not is_mapping(value) and not is_mapping(current):
+        if IniDoc._format_value(value) == current:
+            return False
+    return True
+
+
+def match_pattern(data, pattern_parts):
+    """Yield (parent, key, captures) for every path matching the pattern."""
+    results = []
+
+    def walk(node, idx, captures):
+        if idx == len(pattern_parts):
+            return
+        comp = pattern_parts[idx]
+        if is_mapping(node):
+            children = [(str(k), k) for k in list(node.keys())]
+        elif is_sequence(node):
+            children = [(str(i), i) for i in range(len(node))]
+        else:
+            return
+        for name, key in children:
+            new_caps = captures
+            if comp == "*":
+                pass
+            elif comp.startswith("$") and len(comp) > 1:
+                var = comp[1:]
+                if var.startswith("{") and var.endswith("}"):
+                    var = var[1:-1]
+                if var in captures:
+                    if captures[var] != name:
+                        continue
+                else:
+                    new_caps = dict(captures)
+                    new_caps[var] = name
+            elif comp != name:
+                continue
+            if idx == len(pattern_parts) - 1:
+                results.append((node, key, new_caps))
+            else:
+                walk(node[key], idx + 1, new_caps)
+
+    walk(data, 0, {})
+    return results
+
+
+def apply_pattern_replace(cfg, rule):
+    pattern = rule.get("key_pattern")
+    if pattern is None or "value" not in rule:
+        return False
+    parts = split_path(pattern)
+    if not parts:
+        return False
+    matches = match_pattern(cfg.data, parts)
+    changed = False
+    for parent, key, caps in matches:
+        value = substitute_value(rule["value"], caps)
+        if not _values_differ(cfg, parent[key], value):
+            continue
+        if not cfg.value_supported(value):
+            continue
+        _set_child(cfg, parent, key, value)
+        changed = True
+    return changed
+
+
+def apply_template_string(cfg, rule):
+    key = rule.get("key")
+    template = rule.get("template")
+    variables = rule.get("variables") or {}
+    if key is None or not isinstance(template, str) or not isinstance(variables, dict):
+        return False
+    found, parent, k, current = resolve_path(cfg.data, split_path(key))
+    if not found:
+        return False
+    if not isinstance(to_plain(current), str):
+        return False
+    values = {}
+    for name, path in variables.items():
+        ok, val = get_path_value(cfg.data, path)
+        if not ok:
+            return False
+        values[name] = val
+    result = render_template(template, values)
+    if to_plain(current) == result:
+        return False
+    _set_child(cfg, parent, k, result)
+    return True
+
+
+def _condition_holds(current, condition):
+    if "current_value_equals" in condition:
+        if not strict_equal(current, condition["current_value_equals"]):
+            return False
+    if "current_value_not_equals" in condition:
+        if strict_equal(current, condition["current_value_not_equals"]):
+            return False
+    if "current_value_matches" in condition:
+        if re.search(condition["current_value_matches"], stringify(current)) is None:
+            return False
+    return True
+
+
+def apply_conditional_replace(cfg, rule):
+    key = rule.get("key")
+    condition = rule.get("condition")
+    if key is None or "value" not in rule or not isinstance(condition, dict):
+        return False
+    found, parent, k, current = resolve_path(cfg.data, split_path(key))
+    if not found:
+        return False
+    if not _condition_holds(current, condition):
+        return False
+    value = rule["value"]
+    if not _values_differ(cfg, current, value):
+        return False
+    if not cfg.value_supported(value):
+        return False
+    _set_child(cfg, parent, k, value)
+    return True
+
+
+CONDITION_TYPES = ("current_value_equals", "current_value_not_equals",
+                   "current_value_matches")
+
+
+def validate_rule(name, rule):
+    """Return an error message if the rule is invalid, else None."""
+    if not isinstance(rule, dict):
+        return None
+    rtype = rule.get("type")
+    if rtype == "pattern_replace":
+        if "key_pattern" not in rule:
+            return "missing required field 'key_pattern'"
+        if not isinstance(rule["key_pattern"], (str, list)):
+            return "field 'key_pattern' must be a string"
+    elif rtype == "template_string":
+        if "template" not in rule:
+            return "missing required field 'template'"
+        if not isinstance(rule["template"], str):
+            return "field 'template' must be a string"
+        if "variables" not in rule:
+            return "missing required field 'variables'"
+        variables = rule["variables"]
+        if not isinstance(variables, dict):
+            return "field 'variables' must be an object mapping names to key paths"
+        for vname, path in variables.items():
+            if not isinstance(path, str):
+                return "variable '%s' must be a string key path" % vname
+    elif rtype == "conditional_replace":
+        if "condition" not in rule:
+            return "missing required field 'condition'"
+        condition = rule["condition"]
+        if not isinstance(condition, dict):
+            return "field 'condition' must be an object"
+        if not any(c in condition for c in CONDITION_TYPES):
+            return "condition must contain at least one of %s" % ", ".join(CONDITION_TYPES)
+        if "current_value_matches" in condition:
+            pat = condition["current_value_matches"]
+            if not isinstance(pat, str):
+                return "condition 'current_value_matches' must be a regex string"
+            try:
+                re.compile(pat)
+            except re.error as exc:
+                return "invalid regex in 'current_value_matches': %s" % exc
+    return None
+
+
 RULE_HANDLERS = {
     "replace_value": apply_replace_value,
     "rename_key": apply_rename_key,
     "merge_data": apply_merge_data,
+    "pattern_replace": apply_pattern_replace,
+    "template_string": apply_template_string,
+    "conditional_replace": apply_conditional_replace,
 }
 
 
@@ -876,6 +1137,11 @@ def main(argv):
         error("invalid rules file: %s" % rules_path)
     if not isinstance(rules, dict):
         error("invalid rules file: %s" % rules_path)
+
+    for name in sorted(rules.keys()):
+        msg = validate_rule(name, rules[name])
+        if msg is not None:
+            error("invalid rule '%s': %s" % (name, msg))
 
     if not os.path.isdir(target):
         error("target directory not found: %s" % target)
