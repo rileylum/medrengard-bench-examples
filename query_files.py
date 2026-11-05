@@ -33,6 +33,29 @@ class WindowError(QueryError):
         super().__init__('%s: %s: %s' % (self.group, etype, msg))
 
 
+class CTEError(WindowError):
+    """Errors related to common table expressions (exit code 4)."""
+    group = 'CTE_ERROR'
+    code = 4
+
+
+class SubqueryError(WindowError):
+    """Errors related to subqueries (exit code 5)."""
+    group = 'SUBQUERY_ERROR'
+    code = 5
+
+
+INVALID_CTE = 'INVALID_CTE_SYNTAX'
+DEPTH_EXCEEDED = 'RECURSIVE_DEPTH_EXCEEDED'
+CTE_NOT_FOUND = 'CTE_NOT_FOUND'
+CYCLIC = 'CYCLIC_REFERENCE'
+SCALAR_ROWS = 'SCALAR_SUBQUERY_MULTIPLE_ROWS'
+INVALID_REF = 'INVALID_SUBQUERY_REFERENCE'
+CORRELATED_ERR = 'CORRELATED_SUBQUERY_ERROR'
+MAX_RECURSION = 1000
+MAX_RECURSIVE_ROWS = 1000000
+
+
 # --------------------------------------------------------------------------
 # Values / typing helpers
 # --------------------------------------------------------------------------
@@ -191,11 +214,11 @@ def tokenize(sql):
             i = j
             continue
         two = sql[i:i + 2]
-        if two in ('!=', '<>', '<=', '>=', '=='):
+        if two in ('!=', '<>', '<=', '>=', '==', '||'):
             toks.append(Tok('OP', {'<>': '!=', '==': '='}.get(two, two), i, i + 2))
             i += 2
             continue
-        if c in '=<>(),.*;+-':
+        if c in '=<>(),.*;+-/%':
             toks.append(Tok('OP', c, i, i + 1))
             i += 1
             continue
@@ -212,7 +235,16 @@ RESERVED = {
     'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'HAVING', 'ORDER', 'LIMIT',
     'OFFSET', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'ON', 'AS',
     'AND', 'OR', 'NOT', 'LIKE', 'IS', 'NULL', 'ASC', 'DESC', 'DISTINCT',
-    'CROSS', 'IN', 'UNION', 'ILIKE',
+    'CROSS', 'IN', 'UNION', 'ILIKE', 'WITH', 'EXISTS', 'CASE', 'WHEN', 'THEN',
+    'ELSE', 'END', 'BETWEEN', 'INTERSECT', 'EXCEPT',
+}
+SCALAR_FUNCS = {
+    'COALESCE': (1, None), 'IFNULL': (2, 2), 'NULLIF': (2, 2), 'ABS': (1, 1),
+    'ROUND': (1, 2), 'FLOOR': (1, 1), 'CEIL': (1, 1), 'CEILING': (1, 1),
+    'UPPER': (1, 1), 'LOWER': (1, 1), 'LENGTH': (1, 1), 'TRIM': (1, 1),
+    'LTRIM': (1, 1), 'RTRIM': (1, 1), 'SUBSTR': (2, 3), 'SUBSTRING': (2, 3),
+    'CONCAT': (1, None), 'REPLACE': (3, 3), 'GREATEST': (1, None),
+    'LEAST': (1, None), 'MOD': (2, 2),
 }
 AGGREGATES = {'COUNT', 'SUM', 'AVG', 'MIN', 'MAX'}
 RANKING = {'ROW_NUMBER', 'RANK', 'DENSE_RANK'}
@@ -280,16 +312,110 @@ class Parser:
 
     # grammar
     def parse(self):
-        q = self.parse_select()
+        q = self.parse_query()
         while self.accept_op(';'):
             pass
         if self.peek().kind != 'EOF':
             raise QueryError('Unexpected input near %s' % self.where())
         return q
 
+    def starts_query(self, k=0):
+        return self.is_kw('SELECT', k) or self.is_kw('WITH', k)
+
+    def parse_query(self):
+        if self.is_kw('WITH'):
+            w = self.parse_with()
+            if not (self.starts_query() or self.is_op('(')):
+                raise CTEError(INVALID_CTE, 'Expected SELECT after WITH clause near %s'
+                               % self.where())
+            body = self.parse_compound()
+            return {'kind': 'with', 'with': w, 'body': body}
+        return self.parse_compound()
+
+    def parse_with(self):
+        self.expect_kw('WITH')
+        recursive = bool(self.accept_kw('RECURSIVE'))
+        ctes = []
+        while True:
+            try:
+                name = self.ident()
+            except QueryError:
+                raise CTEError(INVALID_CTE, 'Expected CTE name near %s' % self.where())
+            cols = None
+            if self.accept_op('('):
+                cols = []
+                while True:
+                    try:
+                        cols.append(self.ident())
+                    except QueryError:
+                        raise CTEError(INVALID_CTE, 'Invalid column list for CTE %s' % name)
+                    if not self.accept_op(','):
+                        break
+                if not self.accept_op(')'):
+                    raise CTEError(INVALID_CTE, "Expected ')' after column list of CTE %s"
+                                   % name)
+                if len(set(c.lower() for c in cols)) != len(cols):
+                    raise CTEError(INVALID_CTE, 'Duplicate column name in column list of '
+                                   'CTE %s' % name)
+            if not self.accept_kw('AS'):
+                raise CTEError(INVALID_CTE, 'Expected AS after CTE name %s near %s'
+                               % (name, self.where()))
+            if self.is_kw('NOT') and self.is_kw('MATERIALIZED', 1):
+                self.pos += 2
+            else:
+                self.accept_kw('MATERIALIZED')
+            if not self.accept_op('('):
+                raise CTEError(INVALID_CTE, "Expected '(' after AS for CTE %s" % name)
+            if not (self.starts_query() or self.is_op('(')):
+                raise CTEError(INVALID_CTE, 'CTE %s must contain a SELECT statement' % name)
+            try:
+                q = self.parse_query()
+            except WindowError:
+                raise
+            except QueryError as e:
+                raise CTEError(INVALID_CTE, 'Invalid definition of CTE %s: %s' % (name, e))
+            if not self.accept_op(')'):
+                raise CTEError(INVALID_CTE, "Expected ')' to close CTE %s near %s"
+                               % (name, self.where()))
+            ctes.append({'name': name, 'cols': cols, 'query': q})
+            if not self.accept_op(','):
+                break
+        return {'recursive': recursive, 'ctes': ctes}
+
+    def parse_compound(self):
+        left = self.parse_set_term()
+        while True:
+            op = self.accept_kw('UNION', 'INTERSECT', 'EXCEPT')
+            if not op:
+                break
+            all_ = bool(self.accept_kw('ALL'))
+            if not all_:
+                self.accept_kw('DISTINCT')
+            right = self.parse_set_term()
+            left = {'kind': 'setop', 'op': op, 'all': all_, 'left': left, 'right': right,
+                    'order_by': [], 'limit': None, 'offset': None}
+        if left['kind'] == 'setop':
+            r = left['right']
+            if r['kind'] == 'select' and not r.get('paren'):
+                left['order_by'], r['order_by'] = r['order_by'], []
+                left['limit'], r['limit'] = r['limit'], None
+                left['offset'], r['offset'] = r['offset'], None
+            self.parse_order_limit(left)
+        return left
+
+    def parse_set_term(self):
+        if self.is_op('(') and (self.starts_query(1) or self.is_op('(', 1)):
+            self.next()
+            q = self.parse_query()
+            self.expect_op(')')
+            q = dict(q)
+            q['paren'] = True
+            return q
+        return self.parse_select()
+
     def parse_select(self):
         self.expect_kw('SELECT')
-        q = {'distinct': False, 'items': [], 'from': None, 'joins': [],
+        q = {'kind': 'select', 'distinct': False, 'items': [], 'sources': [],
              'where': None, 'group_by': [], 'having': None, 'order_by': [],
              'limit': None, 'offset': None}
         if self.accept_kw('DISTINCT'):
@@ -300,29 +426,32 @@ class Parser:
             q['items'].append(self.parse_select_item())
             if not self.accept_op(','):
                 break
-        self.expect_kw('FROM')
-        q['from'] = self.parse_table_ref()
-        while True:
-            jt = None
-            if self.accept_kw('INNER'):
-                jt = 'INNER'
-            elif self.is_kw('LEFT') or self.is_kw('RIGHT') or self.is_kw('FULL'):
-                jt = self.next().value.upper()
-                self.accept_kw('OUTER')
-            elif self.is_kw('CROSS'):
-                self.next()
-                jt = 'CROSS'
-            elif self.is_kw('JOIN'):
-                jt = 'INNER'
-            if jt is None:
-                break
-            self.expect_kw('JOIN')
-            tref = self.parse_table_ref()
-            on = None
-            if jt != 'CROSS':
-                self.expect_kw('ON')
-                on = self.parse_expr()
-            q['joins'].append((jt, tref, on))
+        if self.accept_kw('FROM'):
+            q['sources'].append((None, self.parse_table_ref(), None))
+            while True:
+                jt = None
+                if self.accept_op(','):
+                    q['sources'].append(('CROSS', self.parse_table_ref(), None))
+                    continue
+                if self.accept_kw('INNER'):
+                    jt = 'INNER'
+                elif self.is_kw('LEFT') or self.is_kw('RIGHT') or self.is_kw('FULL'):
+                    jt = self.next().value.upper()
+                    self.accept_kw('OUTER')
+                elif self.is_kw('CROSS'):
+                    self.next()
+                    jt = 'CROSS'
+                elif self.is_kw('JOIN'):
+                    jt = 'INNER'
+                if jt is None:
+                    break
+                self.expect_kw('JOIN')
+                tref = self.parse_table_ref()
+                on = None
+                if jt != 'CROSS':
+                    self.expect_kw('ON')
+                    on = self.parse_expr()
+                q['sources'].append((jt, tref, on))
         if self.accept_kw('WHERE'):
             q['where'] = self.parse_expr()
         if self.accept_kw('GROUP'):
@@ -333,8 +462,13 @@ class Parser:
                     break
         if self.accept_kw('HAVING'):
             q['having'] = self.parse_expr()
+        self.parse_order_limit(q)
+        return q
+
+    def parse_order_limit(self, q):
         if self.accept_kw('ORDER'):
             self.expect_kw('BY')
+            q['order_by'] = []
             while True:
                 e = self.parse_expr()
                 desc = False
@@ -356,7 +490,6 @@ class Parser:
             elif q['offset'] is None and self.accept_kw('OFFSET'):
                 q['offset'] = self.parse_nonneg_int('OFFSET')
                 self.accept_kw('ROWS') or self.accept_kw('ROW')
-        return q
 
     def parse_nonneg_int(self, what):
         t = self.next()
@@ -394,17 +527,40 @@ class Parser:
         return {'star': False, 'expr': e, 'alias': alias,
                 'text': self.sql[start:end]}
 
-    def parse_table_ref(self):
-        parts = [self.ident()]
-        while self.accept_op('.'):
-            parts.append(self.ident())
+    def parse_alias(self):
         alias = None
+        cols = None
         if self.accept_kw('AS'):
             alias = self.ident()
         elif self.peek().kind == 'QIDENT' or (
                 self.peek().kind == 'IDENT' and self.peek().value.upper() not in RESERVED):
             alias = self.ident()
-        return {'name': '.'.join(parts), 'alias': alias}
+        if alias is not None and self.is_op('(') and \
+                self.peek(1).kind in ('IDENT', 'QIDENT'):
+            self.next()
+            cols = [self.ident()]
+            while self.accept_op(','):
+                cols.append(self.ident())
+            self.expect_op(')')
+        return alias, cols
+
+    def parse_table_ref(self):
+        if self.is_op('('):
+            if self.starts_query(1) or self.is_op('(', 1):
+                self.next()
+                q = self.parse_query()
+                self.expect_op(')')
+                alias, cols = self.parse_alias()
+                if alias is None:
+                    raise SubqueryError(INVALID_REF, 'A subquery in FROM (derived table) '
+                                        'must have an alias')
+                return {'subquery': q, 'alias': alias, 'cols': cols}
+            raise QueryError('Unexpected token near %s' % self.where())
+        parts = [self.ident()]
+        while self.accept_op('.'):
+            parts.append(self.ident())
+        alias, cols = self.parse_alias()
+        return {'name': '.'.join(parts), 'alias': alias, 'cols': cols}
 
     # expressions
     def parse_expr(self):
@@ -427,46 +583,133 @@ class Parser:
             return ('not', self.parse_not())
         return self.parse_cmp()
 
+    def parse_subquery_parens(self):
+        self.expect_op('(')
+        q = self.parse_query()
+        self.expect_op(')')
+        return q
+
     def parse_cmp(self):
-        left = self.parse_primary()
+        left = self.parse_additive()
         t = self.peek()
         if t.kind == 'OP' and t.value in ('=', '!=', '<', '<=', '>', '>='):
             self.next()
-            return ('cmp', t.value, left, self.parse_primary())
+            if (self.is_kw('ANY') or self.is_kw('ALL') or self.is_kw('SOME')) and \
+                    self.is_op('(', 1) and self.starts_query(2):
+                kind = 'ALL' if self.next().value.upper() == 'ALL' else 'ANY'
+                return ('quant', t.value, left, self.parse_subquery_parens(), kind)
+            return ('cmp', t.value, left, self.parse_additive())
         neg = False
         if self.is_kw('NOT') and (self.is_kw('LIKE', 1) or self.is_kw('ILIKE', 1)
-                                  or self.is_kw('IN', 1)):
+                                  or self.is_kw('IN', 1) or self.is_kw('BETWEEN', 1)):
             self.next()
             neg = True
         kw = self.accept_kw('LIKE', 'ILIKE')
         if kw:
-            return ('like', left, self.parse_primary(), neg, kw == 'ILIKE')
+            return ('like', left, self.parse_additive(), neg, kw == 'ILIKE')
         if self.accept_kw('IN'):
+            if self.is_op('(') and self.starts_query(1):
+                return ('in_sub', left, self.parse_subquery_parens(), neg)
             self.expect_op('(')
-            items = [self.parse_primary()]
+            items = [self.parse_expr()]
             while self.accept_op(','):
-                items.append(self.parse_primary())
+                items.append(self.parse_expr())
             self.expect_op(')')
             return ('in', left, items, neg)
+        if self.accept_kw('BETWEEN'):
+            lo = self.parse_additive()
+            self.expect_kw('AND')
+            hi = self.parse_additive()
+            node = ('op', 'BETWEEN', (left, lo, hi))
+            return ('not', node) if neg else node
         if self.accept_kw('IS'):
             n = bool(self.accept_kw('NOT'))
+            if self.accept_kw('DISTINCT'):
+                self.expect_kw('FROM')
+                right = self.parse_additive()
+                return ('op', 'NOTDISTINCT' if n else 'DISTINCTFROM', (left, right))
+            w = self.accept_kw('TRUE', 'FALSE')
+            if w:
+                return ('op', 'IS' + w + ('_NOT' if n else ''), (left,))
             self.expect_kw('NULL')
             return ('isnull', left, n)
         return left
 
+    def parse_additive(self):
+        left = self.parse_mul()
+        while True:
+            t = self.peek()
+            if t.kind == 'OP' and t.value in ('+', '-', '||'):
+                self.next()
+                left = ('op', t.value, (left, self.parse_mul()))
+            else:
+                return left
+
+    def parse_mul(self):
+        left = self.parse_unary()
+        while True:
+            t = self.peek()
+            if t.kind == 'OP' and t.value in ('*', '/', '%'):
+                self.next()
+                left = ('op', t.value, (left, self.parse_unary()))
+            else:
+                return left
+
+    def parse_unary(self):
+        t = self.peek()
+        if t.kind == 'OP' and t.value in ('-', '+'):
+            self.next()
+            n = self.peek()
+            if n.kind == 'NUMBER':
+                self.next()
+                return ('lit', -n.value if t.value == '-' else n.value)
+            e = self.parse_unary()
+            return ('op', 'neg', (e,)) if t.value == '-' else e
+        return self.parse_primary()
+
+    def parse_case(self):
+        operand = None
+        if not self.is_kw('WHEN'):
+            operand = self.parse_expr()
+        args = [operand]
+        if not self.is_kw('WHEN'):
+            raise QueryError('Expected WHEN in CASE expression near %s' % self.where())
+        while self.accept_kw('WHEN'):
+            args.append(self.parse_expr())
+            self.expect_kw('THEN')
+            args.append(self.parse_expr())
+        els = None
+        if self.accept_kw('ELSE'):
+            els = self.parse_expr()
+        args.append(els)
+        self.expect_kw('END')
+        return ('op', 'CASE', tuple(args))
+
+    def parse_type_name(self):
+        t = self.next()
+        if t.kind not in ('IDENT', 'QIDENT'):
+            raise QueryError('Expected type name in CAST')
+        name = t.value.upper()
+        if name == 'DOUBLE':
+            self.accept_kw('PRECISION')
+        if name in ('CHARACTER', 'CHAR') and self.accept_kw('VARYING'):
+            name = 'VARCHAR'
+        if self.accept_op('('):
+            while not self.accept_op(')'):
+                if self.peek().kind == 'EOF':
+                    raise QueryError('Unterminated type in CAST')
+                self.next()
+        return name
+
     def parse_primary(self):
         t = self.peek()
         if t.kind == 'OP' and t.value == '(':
+            if self.starts_query(1):
+                return ('subquery', self.parse_subquery_parens())
             self.next()
             e = self.parse_expr()
             self.expect_op(')')
             return e
-        if t.kind == 'OP' and t.value in ('-', '+'):
-            self.next()
-            n = self.next()
-            if n.kind != 'NUMBER':
-                raise QueryError('Expected number after sign')
-            return ('lit', -n.value if t.value == '-' else n.value)
         if t.kind == 'NUMBER':
             self.next()
             return ('lit', t.value)
@@ -480,6 +723,22 @@ class Parser:
                 and not self.is_op('.', 1):
             self.next()
             return ('lit', t.value.upper() == 'TRUE')
+        if t.kind == 'IDENT' and t.value.upper() == 'CASE':
+            self.next()
+            return self.parse_case()
+        if t.kind == 'IDENT' and t.value.upper() == 'EXISTS' and self.is_op('(', 1):
+            self.next()
+            if not self.starts_query(1):
+                raise SubqueryError(INVALID_REF, 'EXISTS requires a subquery')
+            return ('exists', self.parse_subquery_parens())
+        if t.kind == 'IDENT' and t.value.upper() == 'CAST' and self.is_op('(', 1):
+            self.next()
+            self.next()
+            e = self.parse_expr()
+            self.expect_kw('AS')
+            ty = self.parse_type_name()
+            self.expect_op(')')
+            return ('op', 'CAST:' + ty, (e,))
         if t.kind == 'IDENT' and self.is_op('(', 1):
             name = t.value.upper()
             if name in RANKING:
@@ -490,11 +749,24 @@ class Parser:
                 if not self.accept_kw('OVER'):
                     raise WindowError(INVALID_SPEC, '%s() requires an OVER clause' % name)
                 spec = self.parse_window_spec()
-                return ('win', name, None, False) + spec
+                return ('win', name, None, False) + spec + (None,)
             if name not in AGGREGATES:
                 if self.followed_by_over(self.pos + 1):
                     raise WindowError(INVALID_SPEC,
                                       'Unsupported window function: %s' % t.value)
+                if name in SCALAR_FUNCS:
+                    self.next()
+                    self.next()
+                    args = []
+                    if not self.accept_op(')'):
+                        args.append(self.parse_expr())
+                        while self.accept_op(','):
+                            args.append(self.parse_expr())
+                        self.expect_op(')')
+                    lo, hi = SCALAR_FUNCS[name]
+                    if len(args) < lo or (hi is not None and len(args) > hi):
+                        raise QueryError('Wrong number of arguments to %s' % name)
+                    return ('op', 'F:' + name, tuple(args))
                 raise QueryError('Unsupported function: %s' % t.value)
             self.next()
             self.next()
@@ -507,10 +779,17 @@ class Parser:
             else:
                 arg = self.parse_expr()
             self.expect_op(')')
+            filt = None
+            if self.is_kw('FILTER') and self.is_op('(', 1):
+                self.next()
+                self.next()
+                self.expect_kw('WHERE')
+                filt = self.parse_expr()
+                self.expect_op(')')
             if self.accept_kw('OVER'):
                 spec = self.parse_window_spec()
-                return ('win', name, arg, distinct) + spec
-            return ('agg', name, arg, distinct)
+                return ('win', name, arg, distinct) + spec + (filt,)
+            return ('agg', name, arg, distinct, filt)
         if t.kind in ('IDENT', 'QIDENT'):
             parts = [self.ident()]
             while self.is_op('.') and self.peek(1).kind in ('IDENT', 'QIDENT'):
@@ -746,6 +1025,9 @@ def read_text(path, comp):
     return data.decode('utf-8-sig')
 
 
+NULL_TOKENS = ('NULL', 'null')
+
+
 def load_delimited(path, comp, delim):
     text = read_text(path, comp)
     reader = csv.reader(io.StringIO(text, newline=''), delimiter=delim)
@@ -768,7 +1050,7 @@ def load_delimited(path, comp, delim):
             row = row + [''] * (width - len(row))
         elif len(row) > width:
             row = row[:width]
-        raw.append([None if c == '' else c for c in row])
+        raw.append([None if c == '' or c in NULL_TOKENS else c for c in row])
     return header, raw
 
 
@@ -1000,6 +1282,13 @@ class Catalog:
             return cands[0]
         raise QueryError('Table not found: %s' % name)
 
+    def has(self, name):
+        try:
+            self.resolve_name(name)
+            return True
+        except QueryError:
+            return False
+
     def load(self, name):
         name = self.resolve_name(name)
         if name in self.cache:
@@ -1045,16 +1334,21 @@ class Catalog:
 # --------------------------------------------------------------------------
 
 class Scope:
-    def __init__(self):
-        self.tables = []   # dicts: name, alias, columns, offset
+    def __init__(self, parent=None, kind='main', ctx=None):
+        self.tables = []   # dicts: name, alias, columns, offset, derived
         self.width = 0
+        self.parent = parent
+        self.kind = kind
+        self.ctx = ctx
+        self.outer_refs = set()   # (depth, index) references to enclosing scopes
+        self.ast = None
 
-    def add(self, name, alias, columns):
+    def add(self, name, alias, columns, derived=False):
         for t in self.tables:
             if (alias or name).lower() == (t['alias'] or t['name']).lower():
                 raise QueryError('Duplicate table name/alias: %s' % (alias or name))
         self.tables.append({'name': name, 'alias': alias, 'columns': columns,
-                            'offset': self.width})
+                            'offset': self.width, 'derived': derived})
         self.width += len(columns)
 
     def match_table(self, qual):
@@ -1080,20 +1374,25 @@ class Scope:
             return low.index(col.lower())
         return None
 
-    def resolve(self, parts):
-        """Return (index, column_name) or None."""
+    def resolve(self, parts, strict=True):
+        """Return (index, column_name) or None.
+
+        Unknown qualifiers return None (strict) - callers decide the error."""
         col = parts[-1]
         if len(parts) > 1:
             qual = '.'.join(parts[:-1])
             ts = self.match_table(qual)
             if not ts:
-                raise QueryError('Unknown table or alias: %s' % qual)
+                return None
             hits = []
             for t in ts:
                 i = self.find_col(t, col)
                 if i is not None:
                     hits.append((t['offset'] + i, t['columns'][i]))
             if not hits:
+                if any(t['derived'] for t in ts):
+                    raise SubqueryError(INVALID_REF, 'Column %s is not provided by '
+                                        'subquery %s' % (col, qual))
                 raise QueryError('Unknown column: %s' % '.'.join(parts))
             if len(hits) > 1:
                 raise QueryError('Ambiguous column: %s' % '.'.join(parts))
@@ -1106,6 +1405,91 @@ class Scope:
         if len(hits) > 1:
             raise QueryError('Ambiguous column: %s' % col)
         return hits[0] if hits else None
+
+    def in_subquery(self):
+        return self.parent is not None or self.kind == 'sub'
+
+
+def nested_aliases(q):
+    """Lower-cased table names/aliases used inside nested subqueries of q."""
+    acc = set()
+
+    def walk(o, top):
+        if isinstance(o, dict):
+            if o.get('kind') == 'select':
+                for _, tref, on in o['sources']:
+                    if not top:
+                        acc.add((tref.get('alias') or tref.get('name') or '').lower())
+                        if tref.get('name'):
+                            acc.add(tref['name'].lower())
+                    if 'subquery' in tref:
+                        walk(tref['subquery'], False)
+                    if on is not None:
+                        walk(on, False)
+                for k, v in o.items():
+                    if k != 'sources':
+                        walk(v, False)
+                return
+            for v in o.values():
+                walk(v, False)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                walk(v, top)
+    walk(q, True)
+    return acc
+
+
+def bind_column(parts, scope, aliases, use_alias):
+    r = scope.resolve(parts)
+    if r is not None:
+        return ('idx', r[0])
+    if use_alias and aliases and len(parts) == 1:
+        a = lookup_alias(aliases, parts[0])
+        if a is not None:
+            return a
+    s = scope.parent
+    d = 1
+    while s is not None:
+        try:
+            r = s.resolve(parts)
+        except QueryError as e:
+            raise SubqueryError(CORRELATED_ERR, 'Invalid outer reference %s in correlated '
+                                'subquery: %s' % ('.'.join(parts), getattr(e, 'msg', e)))
+        if r is not None:
+            scope.outer_refs.add((d, r[0]))
+            return ('outer', d, r[0])
+        s = s.parent
+        d += 1
+    name = '.'.join(parts)
+    if scope.in_subquery():
+        if len(parts) > 1:
+            raise SubqueryError(CORRELATED_ERR, 'Unknown table or alias %s referenced in '
+                                'subquery (column %s)' % ('.'.join(parts[:-1]), name))
+        raise SubqueryError(CORRELATED_ERR, 'Unknown column %s referenced in subquery'
+                            % name)
+    if len(parts) > 1:
+        qual = '.'.join(parts[:-1]).lower()
+        if scope.kind == 'derived':
+            raise SubqueryError(INVALID_REF, 'Derived table cannot reference %s' % name)
+        if scope.ast is not None and qual in nested_aliases(scope.ast):
+            raise SubqueryError(INVALID_REF, 'Table %s is only visible inside its '
+                                'subquery (column %s)' % ('.'.join(parts[:-1]), name))
+        raise QueryError('Unknown table or alias: %s' % '.'.join(parts[:-1]))
+    if any(t['derived'] for t in scope.tables):
+        raise SubqueryError(INVALID_REF, 'Unknown column %s (not provided by derived '
+                            'table)' % name)
+    raise QueryError('Unknown column: %s' % name)
+
+
+def bind_subquery(q, scope, single_column):
+    plan = make_plan(q, scope.ctx, scope, 'sub')
+    if single_column and len(plan.names) != 1:
+        raise SubqueryError(INVALID_REF, 'Subquery must return exactly one column, got %d'
+                            % len(plan.names))
+    for d, i in plan.refs:
+        if d >= 2:
+            scope.outer_refs.add((d - 1, i))
+    return plan, tuple(sorted(plan.refs))
 
 
 def bind(expr, scope, aliases=None, alias_first=False, allow_agg=True, in_agg=False,
@@ -1122,14 +1506,7 @@ def bind(expr, scope, aliases=None, alias_first=False, allow_agg=True, in_agg=Fa
             a = lookup_alias(aliases, parts[0])
             if a is not None:
                 return a
-        r = scope.resolve(parts)
-        if r is None:
-            if aliases and len(parts) == 1 and not in_agg and not in_win:
-                a = lookup_alias(aliases, parts[0])
-                if a is not None:
-                    return a
-            raise QueryError('Unknown column: %s' % '.'.join(parts))
-        return ('idx', r[0])
+        return bind_column(parts, scope, aliases, not in_agg and not in_win)
     if k == 'agg':
         if not allow_agg:
             raise QueryError('Aggregate functions are not allowed here')
@@ -1138,7 +1515,10 @@ def bind(expr, scope, aliases=None, alias_first=False, allow_agg=True, in_agg=Fa
         arg = expr[2]
         if arg != '*':
             arg = bind(arg, scope, None, False, allow_agg, True, allow_win, in_win)
-        return ('agg', expr[1], arg, expr[3])
+        filt = expr[4]
+        if filt is not None:
+            filt = bind(filt, scope, None, False, allow_agg, True, allow_win, in_win)
+        return ('agg', expr[1], arg, expr[3], filt)
     if k == 'win':
         if in_agg:
             raise WindowError(NESTED_ERROR, 'Window functions cannot be nested inside '
@@ -1149,7 +1529,7 @@ def bind(expr, scope, aliases=None, alias_first=False, allow_agg=True, in_agg=Fa
         if not allow_win:
             raise WindowError(INVALID_SPEC, 'Window functions are only allowed in the '
                               'SELECT list and ORDER BY')
-        _, name, arg, distinct, part, order, frame = expr
+        _, name, arg, distinct, part, order, frame, filt = expr
 
         def bw(e, spec):
             try:
@@ -1162,13 +1542,15 @@ def bind(expr, scope, aliases=None, alias_first=False, allow_agg=True, in_agg=Fa
                 raise WindowError(INVALID_SPEC, 'Invalid window specification: %s' % ex)
         if arg is not None and arg != '*':
             arg = bw(arg, False)
+        if filt is not None:
+            filt = bind(filt, scope, None, False, False, True, True, True)
         bpart = tuple(bw(e, True) for e in part)
         border = tuple((bw(e, True), d, nf) for e, d, nf in order)
         if frame is not None and frame[0] == 'RANGE' and len(border) != 1 and \
                 (frame[1][0] in ('P', 'F') or frame[2][0] in ('P', 'F')):
             raise WindowError(FRAME_ERROR, 'RANGE with offset requires exactly one '
                               'ORDER BY expression')
-        return ('win', name, arg, distinct, bpart, border, frame)
+        return ('win', name, arg, distinct, bpart, border, frame, filt)
     if k == 'cmp':
         return ('cmp', expr[1], b(expr[2]), b(expr[3]))
     if k == 'like':
@@ -1181,7 +1563,23 @@ def bind(expr, scope, aliases=None, alias_first=False, allow_agg=True, in_agg=Fa
         return (k, b(expr[1]), b(expr[2]))
     if k == 'not':
         return ('not', b(expr[1]))
-    if k == 'idx':
+    if k == 'op':
+        return ('op', expr[1], tuple(None if a is None else b(a) for a in expr[2]))
+    if k == 'subquery':
+        plan, refs = bind_subquery(expr[1], scope, True)
+        return ('subq', plan, refs, {})
+    if k == 'exists':
+        plan, refs = bind_subquery(expr[1], scope, False)
+        return ('exists_b', plan, refs, {})
+    if k == 'in_sub':
+        left = b(expr[1])
+        plan, refs = bind_subquery(expr[2], scope, True)
+        return ('insub', left, plan, refs, {}, expr[3])
+    if k == 'quant':
+        left = b(expr[2])
+        plan, refs = bind_subquery(expr[3], scope, True)
+        return ('quant_b', expr[1], left, plan, refs, {}, expr[4])
+    if k in ('idx', 'outer', 'subq', 'exists_b', 'insub', 'quant_b'):
         return expr
     raise QueryError('Unsupported expression')
 
@@ -1193,7 +1591,31 @@ def win_children(expr):
         out.append(expr[2])
     out.extend(expr[4])
     out.extend(e for e, _, _ in expr[5])
+    if expr[7] is not None:
+        out.append(expr[7])
     return out
+
+
+def expr_children(expr):
+    """Direct sub-expressions evaluated in the current row context."""
+    k = expr[0]
+    if k == 'cmp':
+        return [expr[2], expr[3]]
+    if k == 'like':
+        return [expr[1], expr[2]]
+    if k == 'in':
+        return [expr[1]] + list(expr[2])
+    if k in ('isnull', 'not'):
+        return [expr[1]]
+    if k in ('and', 'or'):
+        return [expr[1], expr[2]]
+    if k == 'op':
+        return [a for a in expr[2] if a is not None]
+    if k == 'insub':
+        return [expr[1]]
+    if k == 'quant_b':
+        return [expr[2]]
+    return []
 
 
 def find_windows(expr, acc):
@@ -1202,23 +1624,8 @@ def find_windows(expr, acc):
         if all(x is not expr for x in acc):
             acc.append(expr)
         return acc
-    if k in ('lit', 'idx', 'col', 'agg'):
-        return acc
-    if k == 'cmp':
-        find_windows(expr[2], acc)
-        find_windows(expr[3], acc)
-    elif k == 'like':
-        find_windows(expr[1], acc)
-        find_windows(expr[2], acc)
-    elif k == 'in':
-        find_windows(expr[1], acc)
-        for x in expr[2]:
-            find_windows(x, acc)
-    elif k in ('isnull', 'not'):
-        find_windows(expr[1], acc)
-    elif k in ('and', 'or'):
-        find_windows(expr[1], acc)
-        find_windows(expr[2], acc)
+    for c in expr_children(expr):
+        find_windows(c, acc)
     return acc
 
 
@@ -1235,21 +1642,9 @@ def has_agg(expr):
     k = expr[0]
     if k == 'agg':
         return True
-    if k in ('lit', 'idx', 'col'):
-        return False
     if k == 'win':
         return any(has_agg(x) for x in win_children(expr))
-    if k == 'cmp':
-        return has_agg(expr[2]) or has_agg(expr[3])
-    if k == 'like':
-        return has_agg(expr[1]) or has_agg(expr[2])
-    if k == 'in':
-        return has_agg(expr[1]) or any(has_agg(x) for x in expr[2])
-    if k in ('isnull', 'not'):
-        return has_agg(expr[1])
-    if k in ('and', 'or'):
-        return has_agg(expr[1]) or has_agg(expr[2])
-    return False
+    return any(has_agg(c) for c in expr_children(expr))
 
 
 def check_grouped(expr, group_idx, group_exprs, what):
@@ -1257,7 +1652,7 @@ def check_grouped(expr, group_idx, group_exprs, what):
     if expr in group_exprs:
         return
     k = expr[0]
-    if k in ('lit', 'agg'):
+    if k in ('lit', 'agg', 'outer'):
         return
     if k == 'win':
         for x in win_children(expr):
@@ -1268,21 +1663,8 @@ def check_grouped(expr, group_idx, group_exprs, what):
             raise QueryError('Column in %s must appear in GROUP BY or be used in '
                              'an aggregate function' % what)
         return
-    if k == 'cmp':
-        check_grouped(expr[2], group_idx, group_exprs, what)
-        check_grouped(expr[3], group_idx, group_exprs, what)
-    elif k == 'like':
-        check_grouped(expr[1], group_idx, group_exprs, what)
-        check_grouped(expr[2], group_idx, group_exprs, what)
-    elif k == 'in':
-        check_grouped(expr[1], group_idx, group_exprs, what)
-        for x in expr[2]:
-            check_grouped(x, group_idx, group_exprs, what)
-    elif k in ('isnull', 'not'):
-        check_grouped(expr[1], group_idx, group_exprs, what)
-    elif k in ('and', 'or'):
-        check_grouped(expr[1], group_idx, group_exprs, what)
-        check_grouped(expr[2], group_idx, group_exprs, what)
+    for c in expr_children(expr):
+        check_grouped(c, group_idx, group_exprs, what)
 
 
 # --------------------------------------------------------------------------
@@ -1399,7 +1781,290 @@ def evaluate(expr, row, group, wv=None):
     if k == 'isnull':
         v = evaluate(expr[1], row, group, wv)
         return (v is not None) if expr[2] else (v is None)
+    if k == 'outer':
+        r = OUTER_ROWS[-expr[1]] if len(OUTER_ROWS) >= expr[1] else None
+        return None if r is None else r[expr[2]]
+    if k == 'op':
+        return eval_op(expr, row, group, wv)
+    if k == 'subq':
+        plan = expr[1]
+        rows = subquery_rows(plan, expr[2], expr[3], row)
+        if len(rows) > 1:
+            raise SubqueryError(SCALAR_ROWS, 'Scalar subquery returned %d rows (expected '
+                                'at most one)' % len(rows))
+        v = rows[0][0] if rows else None
+        if expr[2] and isinstance(v, int) and not isinstance(v, bool) and \
+                getattr(plan, 'single_avg', False):
+            v = Decimal(v).quantize(Decimal('0.1'))
+        return v
+    if k == 'exists_b':
+        return len(subquery_rows(expr[1], expr[2], expr[3], row)) > 0
+    if k == 'insub':
+        v = evaluate(expr[1], row, group, wv)
+        rows = subquery_rows(expr[2], expr[3], expr[4], row)
+        neg = expr[5]
+        if not rows:
+            return neg
+        if v is None:
+            return None
+        saw_null = False
+        for r in rows:
+            xv = r[0]
+            if xv is None:
+                saw_null = True
+            elif cmp_values(v, xv) == 0:
+                return not neg
+        if saw_null:
+            return None
+        return neg
+    if k == 'quant_b':
+        _, op, left, plan, refs, memo, kind = expr
+        v = evaluate(left, row, group, wv)
+        rows = subquery_rows(plan, refs, memo, row)
+        if not rows:
+            return kind == 'ALL'
+        saw_null = False
+        for r in rows:
+            c = sql_compare(op, v, r[0])
+            if c is None:
+                saw_null = True
+            elif kind == 'ANY' and c:
+                return True
+            elif kind == 'ALL' and not c:
+                return False
+        if saw_null:
+            return None
+        return kind == 'ALL'
     raise QueryError('Cannot evaluate expression')
+
+
+OUTER_ROWS = []
+
+
+def subquery_rows(plan, refs, memo, row):
+    key = []
+    for d, i in refs:
+        if d == 1:
+            r = row
+        else:
+            r = OUTER_ROWS[-(d - 1)] if len(OUTER_ROWS) >= d - 1 else None
+        v = None if r is None else r[i]
+        key.append(hash_key(v) if not isinstance(v, bool) else ('b', v))
+    key = tuple(key)
+    if key in memo:
+        return memo[key]
+    OUTER_ROWS.append(row)
+    try:
+        rows = plan.run()
+    finally:
+        OUTER_ROWS.pop()
+    memo[key] = rows
+    return rows
+
+
+def num_arg(v, what):
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    n = v if is_num(v) else to_number(v)
+    if n is None:
+        raise QueryError('%s requires numeric values, got %r' % (what, v))
+    return n
+
+
+def normalize_num(d):
+    if isinstance(d, Decimal):
+        return round_sig(d, 28) if d.adjusted() > 28 else d
+    return d
+
+
+def arith(op, a, b):
+    if a is None or b is None:
+        return None
+    x = num_arg(a, "operator '%s'" % op)
+    y = num_arg(b, "operator '%s'" % op)
+    if op == '+':
+        return x + y
+    if op == '-':
+        return x - y
+    if op == '*':
+        return x * y
+    if y == 0:
+        raise QueryError('Division by zero')
+    if op == '/':
+        if isinstance(x, int) and isinstance(y, int) and x % y == 0:
+            return x // y
+        with localcontext() as ctx:
+            ctx.prec = 40
+            q = Decimal(x) / Decimal(y)
+        return round_sig(q, 15)
+    # modulo, sign follows the dividend
+    if isinstance(x, int) and isinstance(y, int):
+        r = abs(x) % abs(y)
+        return -r if x < 0 else r
+    return Decimal(x) % Decimal(y)
+
+
+def to_text(v):
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    return fmt_value(v)
+
+
+def do_cast(ty, v):
+    if v is None:
+        return None
+    if ty in ('INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT'):
+        if isinstance(v, bool):
+            return int(v)
+        n = num_arg(v, 'CAST')
+        return int(n)
+    if ty in ('DECIMAL', 'NUMERIC', 'FLOAT', 'REAL', 'DOUBLE', 'NUMBER'):
+        n = num_arg(v, 'CAST')
+        if ty in ('FLOAT', 'REAL', 'DOUBLE') and isinstance(n, int):
+            return Decimal(n).quantize(Decimal('0.1'))
+        return n
+    if ty in ('TEXT', 'VARCHAR', 'CHAR', 'STRING', 'CHARACTER'):
+        return to_text(v)
+    if ty in ('BOOLEAN', 'BOOL'):
+        if isinstance(v, bool):
+            return v
+        if is_num(v):
+            return v != 0
+        s = str(v).strip().lower()
+        if s in ('true', 't', '1', 'yes'):
+            return True
+        if s in ('false', 'f', '0', 'no'):
+            return False
+        raise QueryError('Cannot cast %r to BOOLEAN' % v)
+    raise QueryError('Unsupported CAST type: %s' % ty)
+
+
+def eval_op(expr, row, group, wv):
+    _, name, args = expr
+
+    def ev(e):
+        return None if e is None else evaluate(e, row, group, wv)
+    if name in ('+', '-', '*', '/', '%'):
+        return arith(name, ev(args[0]), ev(args[1]))
+    if name == 'neg':
+        v = ev(args[0])
+        if v is None:
+            return None
+        return -num_arg(v, 'unary minus')
+    if name == '||':
+        a, b = ev(args[0]), ev(args[1])
+        if a is None or b is None:
+            return None
+        return to_text(a) + to_text(b)
+    if name == 'CASE':
+        operand = args[0]
+        ov = ev(operand) if operand is not None else None
+        i = 1
+        while i + 1 < len(args):
+            if operand is not None:
+                hit = sql_compare('=', ov, ev(args[i])) is True
+            else:
+                c = ev(args[i])
+                hit = c is not None and truthy(c)
+            if hit:
+                return ev(args[i + 1])
+            i += 2
+        return ev(args[-1])
+    if name == 'BETWEEN':
+        v, lo, hi = ev(args[0]), ev(args[1]), ev(args[2])
+        a = sql_compare('>=', v, lo)
+        b = sql_compare('<=', v, hi)
+        if a is False or b is False:
+            return False
+        if a is None or b is None:
+            return None
+        return True
+    if name in ('DISTINCTFROM', 'NOTDISTINCT'):
+        a, b = ev(args[0]), ev(args[1])
+        if a is None or b is None:
+            same = a is None and b is None
+        else:
+            same = cmp_values(a, b) == 0
+        return same if name == 'NOTDISTINCT' else not same
+    if name.startswith('IS') and name[2:6] in ('TRUE', 'FALS'):
+        v = ev(args[0])
+        want = name.startswith('ISTRUE')
+        res = v is not None and truthy(v) == want
+        return (not res) if name.endswith('_NOT') else res
+    if name.startswith('CAST:'):
+        return do_cast(name[5:], ev(args[0]))
+    fn = name[2:]
+    vals = [ev(a) for a in args]
+    if fn in ('COALESCE', 'IFNULL'):
+        for v in vals:
+            if v is not None:
+                return v
+        return None
+    if fn == 'NULLIF':
+        if vals[0] is not None and vals[1] is not None and cmp_values(vals[0], vals[1]) == 0:
+            return None
+        return vals[0]
+    if fn in ('GREATEST', 'LEAST'):
+        best = None
+        for v in vals:
+            if v is None:
+                continue
+            if best is None or (cmp_values(v, best) > 0) == (fn == 'GREATEST') and \
+                    cmp_values(v, best) != 0:
+                best = v
+        return best
+    if fn == 'CONCAT':
+        return ''.join(to_text(v) for v in vals if v is not None)
+    if any(v is None for v in vals):
+        return None
+    if fn == 'ABS':
+        return abs(num_arg(vals[0], fn))
+    if fn == 'MOD':
+        return arith('%', vals[0], vals[1])
+    if fn == 'ROUND':
+        n = num_arg(vals[0], fn)
+        places = int(num_arg(vals[1], fn)) if len(vals) > 1 else 0
+        if isinstance(n, int) and places >= 0:
+            return n
+        q = Decimal(n).quantize(Decimal(1).scaleb(-places), rounding='ROUND_HALF_UP')
+        if places <= 0:
+            return int(q)
+        return q
+    if fn in ('FLOOR', 'CEIL', 'CEILING'):
+        n = num_arg(vals[0], fn)
+        if isinstance(n, int):
+            return n
+        return int(n.to_integral_value(rounding='ROUND_FLOOR' if fn == 'FLOOR'
+                                       else 'ROUND_CEILING'))
+    if fn == 'UPPER':
+        return to_text(vals[0]).upper()
+    if fn == 'LOWER':
+        return to_text(vals[0]).lower()
+    if fn == 'LENGTH':
+        return len(to_text(vals[0]))
+    if fn == 'TRIM':
+        return to_text(vals[0]).strip()
+    if fn == 'LTRIM':
+        return to_text(vals[0]).lstrip()
+    if fn == 'RTRIM':
+        return to_text(vals[0]).rstrip()
+    if fn in ('SUBSTR', 'SUBSTRING'):
+        s = to_text(vals[0])
+        start = int(num_arg(vals[1], fn))
+        if len(vals) > 2:
+            ln = int(num_arg(vals[2], fn))
+            end = start + ln
+        else:
+            end = None
+        i0 = max(start - 1, 0)
+        if end is None:
+            return s[i0:]
+        return s[i0:max(end - 1, 0)]
+    if fn == 'REPLACE':
+        return to_text(vals[0]).replace(to_text(vals[1]), to_text(vals[2]))
+    raise QueryError('Unsupported function: %s' % fn)
 
 
 def truthy(v):
@@ -1413,7 +2078,9 @@ def truthy(v):
 
 
 def eval_agg(expr, group):
-    _, name, arg, distinct = expr
+    _, name, arg, distinct, filt = expr
+    if filt is not None:
+        group = [r for r in group if evaluate(filt, r, None) is True]
     if arg == '*':
         return len(group)
     vals = [evaluate(arg, r, None) for r in group]
@@ -1650,7 +2317,7 @@ def compute_windows(win_nodes, contexts):
     values = [dict() for _ in range(n)]
     order = list(range(n))
     for node in win_nodes:
-        _, name, arg, distinct, part, ordby, frame = node
+        _, name, arg, distinct, part, ordby, frame, filt = node
         pkeys = [tuple(evaluate(e, r, g) for e in part) for r, g in contexts]
         okeys = [tuple(evaluate(e, r, g) for e, _, _ in ordby) for r, g in contexts]
         pc = order_cmp([(False, None)] * len(part))
@@ -1662,6 +2329,12 @@ def compute_windows(win_nodes, contexts):
             argvals = None
         else:
             argvals = [evaluate(arg, r, g) for r, g in contexts]
+        if filt is not None:
+            mask = [evaluate(filt, r, g) is True for r, g in contexts]
+            if argvals is None:
+                argvals = [1 if m_ else None for m_ in mask]
+            else:
+                argvals = [v if m_ else None for v, m_ in zip(argvals, mask)]
         i = 0
         while i < n:
             j = i + 1
@@ -1771,142 +2444,590 @@ def order_cmp(specs):
     return cmp
 
 
-def execute(q, catalog):
-    scope = Scope()
-    name, (header, rows) = catalog.load(q['from']['name'])
-    scope.add(name, q['from']['alias'], header)
-    for jtype, tref, on in q['joins']:
-        jname, (jheader, jrows) = catalog.load(tref['name'])
-        left_width = scope.width
-        scope.add(jname, tref['alias'], jheader)
-        bon = bind(on, scope, allow_agg=False) if on is not None else None
-        rows = do_join(rows, left_width, jrows, len(jheader), jtype, bon)
+def row_key(r):
+    return tuple(('b', v) if isinstance(v, bool) else hash_key(v) for v in r)
 
-    # SELECT list
-    out_names = []
-    out_exprs = []
-    aliases = {}
-    for item in q['items']:
-        if item['star']:
-            tabs = scope.tables if item['qual'] is None else scope.match_table(item['qual'])
-            if not tabs:
-                raise QueryError('Unknown table or alias: %s' % item['qual'])
-            for t in tabs:
-                for i, c in enumerate(t['columns']):
-                    out_names.append(c)
-                    out_exprs.append(('idx', t['offset'] + i))
-            continue
-        e = bind(item['expr'], scope, allow_win=True)
-        out_exprs.append(e)
-        if item['alias'] is not None:
-            out_names.append(item['alias'])
-            aliases.setdefault(item['alias'], e)
-        elif item['expr'][0] == 'col':
-            r = scope.resolve(item['expr'][1])
-            out_names.append(r[1] if r else item['expr'][1][-1])
-        else:
-            out_names.append(item['text'])
-    where = bind(q['where'], scope, allow_agg=False) if q['where'] is not None else None
-    group_exprs = []
-    for g in q['group_by']:
-        if g[0] == 'lit' and isinstance(g[1], int) and not isinstance(g[1], bool):
-            if not 1 <= g[1] <= len(out_exprs):
-                raise QueryError('GROUP BY position %d out of range' % g[1])
-            ge = out_exprs[g[1] - 1]
-        else:
-            ge = bind(g, scope, aliases, allow_agg=False)
-        if has_agg(ge):
-            raise QueryError('Aggregate functions are not allowed in GROUP BY')
-        group_exprs.append(ge)
-    having = bind(q['having'], scope, aliases) if q['having'] is not None else None
 
-    order_exprs = []
-    for e, desc, nf in q['order_by']:
-        if e[0] == 'lit' and isinstance(e[1], int) and not isinstance(e[1], bool):
-            if not 1 <= e[1] <= len(out_exprs):
-                raise QueryError('ORDER BY position %d out of range' % e[1])
-            be = out_exprs[e[1] - 1]
-        else:
-            be = bind(e, scope, aliases, alias_first=True, allow_win=True)
-        order_exprs.append((be, desc, nf))
+def dedupe_rows(rows):
+    seen = set()
+    out = []
+    for r in rows:
+        k = row_key(r)
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
 
-    grouped = bool(group_exprs) or having is not None or \
-        any(has_agg(e) for e in out_exprs) or any(has_agg(e) for e, _, _ in order_exprs)
 
-    if where is not None:
-        rows = [r for r in rows if evaluate(where, r, None) is True]
+def table_refs(q):
+    """Lower-cased table names referenced in FROM clauses anywhere inside q
+    (names defined by nested WITH clauses are excluded)."""
+    acc = set()
 
-    contexts = []
-    if grouped:
-        group_idx = {e[1] for e in group_exprs if e[0] == 'idx'}
-        for e in out_exprs:
-            check_grouped(e, group_idx, group_exprs, 'SELECT')
-        if having is not None:
-            check_grouped(having, group_idx, group_exprs, 'HAVING')
-        for e, _, _ in order_exprs:
-            check_grouped(e, group_idx, group_exprs, 'ORDER BY')
-        if group_exprs:
-            groups = {}
-            keys_raw = {}
-            for r in rows:
-                kv = tuple(evaluate(g, r, None) for g in group_exprs)
-                hk = tuple(hash_key(v) for v in kv)
-                if hk not in groups:
-                    groups[hk] = []
-                    keys_raw[hk] = kv
-                groups[hk].append(r)
-            items = list(groups.items())
-            if not order_exprs:
-                spec = [(False, None)] * len(group_exprs)
-                c = order_cmp(spec)
-                items.sort(key=functools.cmp_to_key(
-                    lambda a, b: c(keys_raw[a[0]], keys_raw[b[0]])))
-            for hk, grows in items:
-                contexts.append((grows[0], grows))
-        else:
-            contexts.append((rows[0] if rows else None, rows))
-        if having is not None:
-            contexts = [c for c in contexts if evaluate(having, c[0], c[1]) is True]
-    else:
-        contexts = [(r, None) for r in rows]
+    def walk(o):
+        if isinstance(o, dict):
+            kind = o.get('kind')
+            if kind == 'with':
+                names = {c['name'].lower() for c in o['with']['ctes']}
+                sub = set()
+                for c in o['with']['ctes']:
+                    sub |= table_refs(c['query'])
+                sub |= table_refs(o['body'])
+                acc.update(sub - names)
+                return
+            if kind == 'select':
+                for _, tref, _ in o['sources']:
+                    if 'name' in tref:
+                        acc.add(tref['name'].lower())
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                walk(v)
+    walk(q)
+    return acc
 
-    win_nodes = []
-    for e in out_exprs:
-        find_windows(e, win_nodes)
-    for e, _, _ in order_exprs:
-        find_windows(e, win_nodes)
-    if win_nodes:
-        corder, wvals = compute_windows(win_nodes, contexts)
-        seq = [(contexts[i], wvals[i]) for i in corder]
-    else:
-        seq = [(c, None) for c in contexts]
 
-    results = []
-    for (row, grp), wv in seq:
-        vals = tuple(evaluate(e, row, grp, wv) for e in out_exprs)
-        okeys = tuple(evaluate(e, row, grp, wv) for e, _, _ in order_exprs)
-        results.append((vals, okeys))
+class Ctx:
+    """Name resolution context for tables: CTE definitions + catalog."""
 
-    if q['distinct']:
+    def __init__(self, catalog, parent=None, with_active=False):
+        self.catalog = catalog
+        self.parent = parent
+        self.ctes = {}
+        self.with_active = with_active or (parent.with_active if parent else False)
+
+    def find_cte(self, name):
+        c = self
+        low = name.lower()
+        while c is not None:
+            d = c.ctes.get(low)
+            if d is not None:
+                return d
+            c = c.parent
+        return None
+
+    def lookup(self, name):
+        d = self.find_cte(name)
+        if d is not None:
+            header, rows = d.materialize()
+            return d.name, header, rows
+        if not self.catalog.has(name):
+            if self.with_active:
+                raise CTEError(CTE_NOT_FOUND, 'CTE or table not found: %s' % name)
+            raise QueryError('Table not found: %s' % name)
+        n, (h, r) = self.catalog.load(name)
+        return n, h, r
+
+
+class FixedTable:
+    def __init__(self, name, names, rows):
+        self.name, self.names, self.rows = name, names, rows
+
+    def materialize(self):
+        return self.names, self.rows
+
+
+class CTEDef:
+    def __init__(self, name, cols, query, ctx, recursive):
+        self.name = name
+        self.cols = cols
+        self.query = query
+        self.ctx = ctx
+        self.recursive = recursive
+        self.result = None
+        self.busy = False
+
+    def apply_cols(self, names):
+        if self.cols is None:
+            return list(names)
+        if len(self.cols) != len(names):
+            raise CTEError(INVALID_CTE, 'CTE %s has %d columns but its column list '
+                           'specifies %d' % (self.name, len(names), len(self.cols)))
+        return list(self.cols)
+
+    def materialize(self):
+        if self.result is not None:
+            return self.result
+        if self.busy:
+            raise CTEError(CYCLIC, 'CTE %s references itself' % self.name)
+        self.busy = True
+        try:
+            if self.recursive:
+                names, rows = self.run_recursive()
+            else:
+                plan = make_plan(self.query, self.ctx, None, 'cte')
+                rows = plan.run()
+                names = self.apply_cols(plan.names)
+        finally:
+            self.busy = False
+        self.result = (names, rows)
+        return self.result
+
+    def run_recursive(self):
+        low = self.name.lower()
+
+        def flat(x):
+            if x['kind'] == 'setop' and x['op'] == 'UNION' and not x.get('paren'):
+                if x['order_by'] or x['limit'] is not None or x['offset'] is not None:
+                    raise CTEError(INVALID_CTE, 'ORDER BY / LIMIT are not allowed in '
+                                   'recursive CTE %s' % self.name)
+                return flat(x['left']) + [(x['right'], x['all'])]
+            return [(x, True)]
+        parts = flat(self.query)
+        is_rec = [low in table_refs(b) for b, _ in parts]
+        if len(parts) < 2:
+            raise CTEError(INVALID_CTE, 'Recursive CTE %s must have the form '
+                           '<anchor> UNION [ALL] <recursive member>' % self.name)
+        if is_rec[0]:
+            raise CTEError(INVALID_CTE, 'The anchor member of recursive CTE %s must not '
+                           'reference itself' % self.name)
+        first_rec = is_rec.index(True)
+        if not all(is_rec[first_rec:]):
+            raise CTEError(INVALID_CTE, 'Non-recursive members of CTE %s must precede the '
+                           'recursive members' % self.name)
+        distinct = any(not a for _, a in parts[1:])
+        anchors = [b for b, _ in parts[:first_rec]]
+        recs = [b for b, _ in parts[first_rec:]]
+        names = None
+        result = []
+        for a in anchors:
+            p = make_plan(a, self.ctx, None, 'cte')
+            if names is None:
+                names = self.apply_cols(p.names)
+            elif len(p.names) != len(names):
+                raise CTEError(INVALID_CTE, 'All members of recursive CTE %s must return '
+                               'the same number of columns' % self.name)
+            result.extend(p.run())
         seen = set()
-        uniq = []
-        for vals, okeys in results:
-            hk = tuple(hash_key(v) for v in vals)
-            if hk not in seen:
-                seen.add(hk)
-                uniq.append((vals, okeys))
-        results = uniq
+        if distinct:
+            result = dedupe_rows(result)
+            seen = {row_key(r) for r in result}
+        work = list(result)
+        depth = 0
+        while work:
+            wctx = Ctx(self.ctx.catalog, self.ctx, True)
+            wctx.ctes[low] = FixedTable(self.name, names, work)
+            new = []
+            for b in recs:
+                p = make_plan(b, wctx, None, 'cte')
+                if len(p.names) != len(names):
+                    raise CTEError(INVALID_CTE, 'All members of recursive CTE %s must '
+                                   'return the same number of columns' % self.name)
+                new.extend(p.run())
+            if distinct:
+                fresh = []
+                for r in new:
+                    k = row_key(r)
+                    if k not in seen:
+                        seen.add(k)
+                        fresh.append(r)
+                new = fresh
+            if not new:
+                break
+            depth += 1
+            if depth > MAX_RECURSION:
+                raise CTEError(DEPTH_EXCEEDED, 'Recursive CTE %s exceeded the maximum '
+                               'recursion depth of %d' % (self.name, MAX_RECURSION))
+            result.extend(new)
+            if len(result) > MAX_RECURSIVE_ROWS:
+                raise CTEError(DEPTH_EXCEEDED, 'Recursive CTE %s produced more than %d rows'
+                               % (self.name, MAX_RECURSIVE_ROWS))
+            work = new
+        return names, result
 
-    if order_exprs:
-        c = order_cmp([(d, nf) for _, d, nf in order_exprs])
+
+def find_cycle(edges, allow_self):
+    """Return a list of node indices forming a cycle, or None."""
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in edges}
+    stack = []
+
+    def dfs(n):
+        color[n] = GREY
+        stack.append(n)
+        for m in sorted(edges[n]):
+            if m == n and allow_self:
+                continue
+            if color[m] == GREY:
+                return stack[stack.index(m):] + [m]
+            if color[m] == WHITE:
+                r = dfs(m)
+                if r:
+                    return r
+        stack.pop()
+        color[n] = BLACK
+        return None
+    for n in sorted(edges):
+        if color[n] == WHITE:
+            r = dfs(n)
+            if r:
+                return r
+    return None
+
+
+def make_with_plan(q, ctx, parent, kind):
+    w = q['with']
+    ctes = w['ctes']
+    rec = w['recursive']
+    names = [c['name'].lower() for c in ctes]
+    seen = set()
+    for c in ctes:
+        if c['name'].lower() in seen:
+            raise CTEError(INVALID_CTE, 'CTE name %s specified more than once' % c['name'])
+        seen.add(c['name'].lower())
+    pos = {n: i for i, n in enumerate(names)}
+    refs = [table_refs(c['query']) & seen for c in ctes]
+    edges = {i: set() for i in range(len(ctes))}
+    for i, r in enumerate(refs):
+        for n in r:
+            j = pos[n]
+            if not rec and j >= i and (ctx.find_cte(n) is not None or ctx.catalog.has(n)):
+                continue   # refers to an existing table / outer CTE of the same name
+            edges[i].add(j)
+    cyc = find_cycle(edges, rec)
+    if cyc:
+        raise CTEError(CYCLIC, 'Cyclic reference between CTEs: %s'
+                       % ' -> '.join(ctes[i]['name'] for i in cyc))
+    if not rec:
+        for i in edges:
+            for j in edges[i]:
+                if j > i:
+                    raise CTEError(CTE_NOT_FOUND, 'CTE %s is referenced by %s before it is '
+                                   'defined' % (ctes[j]['name'], ctes[i]['name']))
+    if rec:
+        shared = Ctx(ctx.catalog, ctx, True)
+        for i, c in enumerate(ctes):
+            shared.ctes[names[i]] = CTEDef(c['name'], c['cols'], c['query'], shared,
+                                           i in edges[i])
+        body_ctx = shared
+    else:
+        cur = Ctx(ctx.catalog, ctx, True)
+        for i, c in enumerate(ctes):
+            d = CTEDef(c['name'], c['cols'], c['query'], cur, False)
+            cur = Ctx(ctx.catalog, cur, True)
+            cur.ctes[names[i]] = d
+        body_ctx = cur
+    return make_plan(q['body'], body_ctx, parent, kind)
+
+
+def make_plan(q, ctx, parent, kind):
+    k = q['kind']
+    if k == 'with':
+        return make_with_plan(q, ctx, parent, kind)
+    if k == 'setop':
+        return SetopPlan(q, ctx, parent, kind)
+    return SelectPlan(q, ctx, parent, kind)
+
+
+def finish_rows(results, order_specs, offset, limit):
+    if order_specs:
+        c = order_cmp(order_specs)
         results.sort(key=functools.cmp_to_key(lambda a, b: c(a[1], b[1])))
-
     out_rows = [v for v, _ in results]
-    if q['offset']:
-        out_rows = out_rows[q['offset']:]
-    if q['limit'] is not None:
-        out_rows = out_rows[:q['limit']]
-    return out_names, out_rows
+    if offset:
+        out_rows = out_rows[offset:]
+    if limit is not None:
+        out_rows = out_rows[:limit]
+    return out_rows
+
+
+class SetopPlan:
+    def __init__(self, q, ctx, parent, kind):
+        self.q = q
+        self.left = make_plan(q['left'], ctx, parent, kind)
+        self.right = make_plan(q['right'], ctx, parent, kind)
+        if len(self.left.names) != len(self.right.names):
+            raise QueryError('Each %s query must have the same number of columns'
+                             % q['op'])
+        self.names = list(self.left.names)
+        self.refs = self.left.refs | self.right.refs
+        scope = Scope(None, 'main', ctx)
+        scope.add('', None, self.names)
+        self.order = []
+        for e, desc, nf in q['order_by']:
+            if e[0] == 'lit' and isinstance(e[1], int) and not isinstance(e[1], bool):
+                if not 1 <= e[1] <= len(self.names):
+                    raise QueryError('ORDER BY position %d out of range' % e[1])
+                be = ('idx', e[1] - 1)
+            else:
+                be = bind(e, scope, allow_agg=False)
+            self.order.append((be, desc, nf))
+
+    def run(self):
+        a = self.left.run()
+        b = self.right.run()
+        op, all_ = self.q['op'], self.q['all']
+        if op == 'UNION':
+            rows = a + b if all_ else dedupe_rows(a + b)
+        else:
+            counts = {}
+            for r in b:
+                k = row_key(r)
+                counts[k] = counts.get(k, 0) + 1
+            rows = []
+            seen = set()
+            for r in a:
+                k = row_key(r)
+                inb = counts.get(k, 0) > 0
+                if all_:
+                    if op == 'INTERSECT' and inb:
+                        counts[k] -= 1
+                        rows.append(r)
+                    elif op == 'EXCEPT':
+                        if inb:
+                            counts[k] -= 1
+                        else:
+                            rows.append(r)
+                else:
+                    if k in seen:
+                        continue
+                    if (op == 'INTERSECT') == inb:
+                        seen.add(k)
+                        rows.append(r)
+        results = [(r, tuple(evaluate(e, r, None) for e, _, _ in self.order)) for r in rows]
+        return finish_rows(results, [(d, nf) for _, d, nf in self.order],
+                           self.q['offset'], self.q['limit'])
+
+
+class SelectPlan:
+    def __init__(self, q, ctx, parent, kind):
+        self.q = q
+        scope = Scope(parent, kind, ctx)
+        scope.ast = q
+        self.scope = scope
+        self.sources = []
+        self.from_static = True
+        self.cached = None
+        for jtype, tref, on in q['sources']:
+            left_width = scope.width
+            if 'subquery' in tref:
+                sub = make_plan(tref['subquery'], ctx, parent, 'derived')
+                cols = list(sub.names)
+                if tref['cols']:
+                    if len(tref['cols']) != len(cols):
+                        raise SubqueryError(INVALID_REF, 'Derived table %s has %d columns '
+                                            'but %d column aliases were given'
+                                            % (tref['alias'], len(cols), len(tref['cols'])))
+                    cols = list(tref['cols'])
+                scope.add(tref['alias'], tref['alias'], cols, derived=True)
+                if sub.refs:
+                    scope.outer_refs |= sub.refs
+                    self.from_static = False
+                    src = ('plan', sub)
+                else:
+                    src = ('rows', sub.run())
+            else:
+                name, cols, rows = ctx.lookup(tref['name'])
+                if tref.get('cols'):
+                    if len(tref['cols']) != len(cols):
+                        raise QueryError('Table %s has %d columns but %d column aliases '
+                                         'were given' % (name, len(cols), len(tref['cols'])))
+                    cols = list(tref['cols'])
+                scope.add(name, tref['alias'], cols)
+                src = ('rows', rows)
+            bon = None
+            if on is not None:
+                before = set(scope.outer_refs)
+                bon = bind(on, scope, allow_agg=False)
+                if scope.outer_refs != before or contains_subquery(bon):
+                    self.from_static = False
+            self.sources.append((jtype, src, len(cols), bon, left_width))
+
+        # SELECT list
+        out_names = []
+        out_exprs = []
+        aliases = {}
+        for item in q['items']:
+            if item['star']:
+                tabs = scope.tables if item['qual'] is None else scope.match_table(item['qual'])
+                if not tabs:
+                    raise QueryError('Unknown table or alias: %s' % item['qual'])
+                for t in tabs:
+                    for i, c in enumerate(t['columns']):
+                        out_names.append(c)
+                        out_exprs.append(('idx', t['offset'] + i))
+                continue
+            e = bind(item['expr'], scope, allow_win=True)
+            out_exprs.append(e)
+            if item['alias'] is not None:
+                out_names.append(item['alias'])
+                aliases.setdefault(item['alias'], e)
+            elif item['expr'][0] == 'col':
+                r = scope.resolve(item['expr'][1]) if e[0] == 'idx' else None
+                out_names.append(r[1] if r else item['expr'][1][-1])
+            else:
+                out_names.append(item['text'])
+        where = bind(q['where'], scope, allow_agg=False) if q['where'] is not None else None
+        group_exprs = []
+        for g in q['group_by']:
+            if g[0] == 'lit' and isinstance(g[1], int) and not isinstance(g[1], bool):
+                if not 1 <= g[1] <= len(out_exprs):
+                    raise QueryError('GROUP BY position %d out of range' % g[1])
+                ge = out_exprs[g[1] - 1]
+            else:
+                ge = bind(g, scope, aliases, allow_agg=False)
+            if has_agg(ge):
+                raise QueryError('Aggregate functions are not allowed in GROUP BY')
+            group_exprs.append(ge)
+        having = bind(q['having'], scope, aliases) if q['having'] is not None else None
+
+        order_exprs = []
+        for e, desc, nf in q['order_by']:
+            if e[0] == 'lit' and isinstance(e[1], int) and not isinstance(e[1], bool):
+                if not 1 <= e[1] <= len(out_exprs):
+                    raise QueryError('ORDER BY position %d out of range' % e[1])
+                be = out_exprs[e[1] - 1]
+            else:
+                be = bind(e, scope, aliases, alias_first=True, allow_win=True)
+            order_exprs.append((be, desc, nf))
+
+        grouped = bool(group_exprs) or having is not None or \
+            any(has_agg(e) for e in out_exprs) or any(has_agg(e) for e, _, _ in order_exprs)
+        if grouped:
+            group_idx = {e[1] for e in group_exprs if e[0] == 'idx'}
+            for e in out_exprs:
+                check_grouped(e, group_idx, group_exprs, 'SELECT')
+            if having is not None:
+                check_grouped(having, group_idx, group_exprs, 'HAVING')
+            for e, _, _ in order_exprs:
+                check_grouped(e, group_idx, group_exprs, 'ORDER BY')
+        win_nodes = []
+        for e in out_exprs:
+            find_windows(e, win_nodes)
+        for e, _, _ in order_exprs:
+            find_windows(e, win_nodes)
+
+        self.names = out_names
+        self.out_exprs = out_exprs
+        self.where = where
+        self.group_exprs = group_exprs
+        self.having = having
+        self.order_exprs = order_exprs
+        self.grouped = grouped
+        self.win_nodes = win_nodes
+        self.refs = scope.outer_refs
+        self.single_avg = len(out_exprs) == 1 and out_exprs[0][0] == 'agg' and \
+            out_exprs[0][1] == 'AVG'
+        # correlated equality predicates (inner_col = outer_ref) -> hash lookup
+        self.index_keys = []
+        self.index = None
+        if where is not None and self.from_static:
+            for c in conjuncts(where):
+                if c[0] == 'cmp' and c[1] == '=':
+                    a, b = c[2], c[3]
+                    if a[0] == 'outer' and b[0] == 'idx':
+                        a, b = b, a
+                    if a[0] == 'idx' and b[0] == 'outer':
+                        self.index_keys.append((a[1], b))
+
+    def base_rows(self):
+        if self.cached is not None:
+            return self.cached
+        if not self.sources:
+            rows = [()]
+        else:
+            rows = None
+            for jtype, src, width, bon, left_width in self.sources:
+                srows = src[1] if src[0] == 'rows' else src[1].run()
+                if rows is None:
+                    rows = list(srows)
+                else:
+                    rows = do_join(rows, left_width, srows, width, jtype, bon)
+        if self.from_static:
+            self.cached = rows
+        return rows
+
+    def run(self):
+        rows = self.base_rows()
+        if self.index_keys:
+            if self.index is None:
+                self.index = {}
+                for r in rows:
+                    k = tuple(r[i] for i, _ in self.index_keys)
+                    if any(v is None for v in k):
+                        continue
+                    self.index.setdefault(tuple(hash_key(v) for v in k), []).append(r)
+            k = tuple(evaluate(o, None, None) for _, o in self.index_keys)
+            if any(v is None for v in k):
+                rows = []
+            else:
+                rows = self.index.get(tuple(hash_key(v) for v in k), [])
+        where = self.where
+        group_exprs = self.group_exprs
+        having = self.having
+        out_exprs = self.out_exprs
+        order_exprs = self.order_exprs
+        if where is not None:
+            rows = [r for r in rows if evaluate(where, r, None) is True]
+
+        contexts = []
+        if self.grouped:
+            if group_exprs:
+                groups = {}
+                keys_raw = {}
+                for r in rows:
+                    kv = tuple(evaluate(g, r, None) for g in group_exprs)
+                    hk = tuple(hash_key(v) for v in kv)
+                    if hk not in groups:
+                        groups[hk] = []
+                        keys_raw[hk] = kv
+                    groups[hk].append(r)
+                items = list(groups.items())
+                if not order_exprs:
+                    spec = [(False, None)] * len(group_exprs)
+                    c = order_cmp(spec)
+                    items.sort(key=functools.cmp_to_key(
+                        lambda a, b: c(keys_raw[a[0]], keys_raw[b[0]])))
+                for hk, grows in items:
+                    contexts.append((grows[0], grows))
+            else:
+                contexts.append((rows[0] if rows else None, rows))
+            if having is not None:
+                contexts = [c for c in contexts if evaluate(having, c[0], c[1]) is True]
+        else:
+            contexts = [(r, None) for r in rows]
+
+        if self.win_nodes:
+            corder, wvals = compute_windows(self.win_nodes, contexts)
+            seq = [(contexts[i], wvals[i]) for i in corder]
+        else:
+            seq = [(c, None) for c in contexts]
+
+        results = []
+        for (row, grp), wv in seq:
+            vals = tuple(evaluate(e, row, grp, wv) for e in out_exprs)
+            okeys = tuple(evaluate(e, row, grp, wv) for e, _, _ in order_exprs)
+            results.append((vals, okeys))
+
+        if self.q['distinct']:
+            seen = set()
+            uniq = []
+            for vals, okeys in results:
+                hk = row_key(vals)
+                if hk not in seen:
+                    seen.add(hk)
+                    uniq.append((vals, okeys))
+            results = uniq
+        return finish_rows(results, [(d, nf) for _, d, nf in order_exprs],
+                           self.q['offset'], self.q['limit'])
+
+
+def conjuncts(expr):
+    if expr[0] == 'and':
+        return conjuncts(expr[1]) + conjuncts(expr[2])
+    return [expr]
+
+
+def contains_subquery(expr):
+    if expr[0] in ('subq', 'exists_b', 'insub', 'quant_b'):
+        return True
+    if expr[0] == 'agg':
+        return any(contains_subquery(x) for x in (expr[2], expr[4])
+                   if x is not None and x != '*')
+    if expr[0] == 'win':
+        return any(contains_subquery(x) for x in win_children(expr))
+    return any(contains_subquery(c) for c in expr_children(expr))
 
 
 # --------------------------------------------------------------------------
@@ -1954,7 +3075,9 @@ def run(data, sql_arg, out=None, sharded=None):
     if not sql:
         raise QueryError('Empty SQL query')
     q = Parser(sql).parse()
-    return execute(q, Catalog(data, sharded))
+    ctx = Ctx(Catalog(data, sharded))
+    plan = make_plan(q, ctx, None, 'main')
+    return plan.names, plan.run()
 
 
 def main(argv=None):
@@ -1973,7 +3096,11 @@ def main(argv=None):
             write_csv(args.out, names, rows)
     except WindowError as e:
         print('Error: %s' % e, file=sys.stderr)
-        return WindowError.code
+        return e.code
+    except RecursionError:
+        print('Error: CTE_ERROR: RECURSIVE_DEPTH_EXCEEDED: query nesting too deep',
+              file=sys.stderr)
+        return CTEError.code
     except QueryError as e:
         print('Error: %s' % e, file=sys.stderr)
         return 1
