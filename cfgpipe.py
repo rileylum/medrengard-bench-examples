@@ -5,11 +5,13 @@ import math
 import os
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-SOURCES = ("default", "env", "file", "primary-store", "arg")
+SOURCES = ("default", "env", "file", "primary-store", "secondary-store", "arg")
 STORE_TIMEOUT = 10
 TYPES = ("string", "integer", "float", "boolean")
 CUSTOM_TYPES = ("port",)
@@ -99,14 +101,16 @@ def load_schema(path):
         raise CfgError("schema root must be a non-empty JSON object")
     params = []
     _walk_group(schema, (), params)
-    seen = {}
-    for path, decl in params:
-        if "primary-store" in decl:
-            key = decl["primary-store"]
-            if key in seen:
-                raise CfgError("parameters %r and %r share primary-store key %r"
-                               % (dotted(seen[key]), dotted(path), key))
-            seen[key] = path
+    for store_src in ("primary-store", "secondary-store"):
+        seen = {}
+        for path, decl in params:
+            if store_src in decl:
+                key = decl[store_src]
+                if key in seen:
+                    raise CfgError("parameters %r and %r share %s key %r"
+                                   % (dotted(seen[key]), dotted(path),
+                                      store_src, key))
+                seen[key] = path
     return schema, params
 
 
@@ -192,48 +196,181 @@ def read_file_source(path):
     return content
 
 
+def _http(method, url, body=None, timeout=STORE_TIMEOUT):
+    """Perform an HTTP request; return (status, decoded JSON or None).
+
+    Raises OSError-like exceptions on connector failure."""
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            raw = exc.read()
+        except Exception:
+            raw = b""
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        parsed = None
+    return status, parsed
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 class PrimaryStore:
     def __init__(self, base_url):
         self.base_url = base_url.rstrip("/")
 
-    def get(self, key):
-        """Return value string, or None if the key is missing."""
+    def get_versioned(self, key):
+        """Return (value, version) or (None, None) if the key is missing."""
         url = "%s/v1/primary/kv?key=%s" % (
             self.base_url, urllib.parse.quote(key, safe=""))
         try:
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=STORE_TIMEOUT) as resp:
-                status = resp.status
-                body = resp.read()
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            try:
-                body = exc.read()
-            except Exception:
-                body = b""
+            status, data = _http("GET", url)
         except Exception as exc:
             raise CfgError("primary-store: request for key %r failed: %s"
                            % (key, exc))
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            data = None
         if status == 200:
+            if isinstance(data, dict) and data.get("found") is False:
+                return None, None
             if (not isinstance(data, dict) or data.get("found") is not True
                     or not isinstance(data.get("value"), str)
-                    or ("version" in data and (
-                        not isinstance(data["version"], int)
-                        or isinstance(data["version"], bool)))):
+                    or ("version" in data and data["version"] is not None
+                        and not _is_int(data["version"]))):
                 raise CfgError("primary-store: malformed response for key %r"
                                % key)
-            return data["value"]
+            return data["value"], data.get("version")
         if status == 404:
             if isinstance(data, dict) and data.get("found") is False:
-                return None
+                return None, None
             raise CfgError("primary-store: malformed 404 response for key %r"
                            % key)
         raise CfgError("primary-store: unexpected HTTP status %d for key %r"
                        % (status, key))
+
+    def get(self, key):
+        return self.get_versioned(key)[0]
+
+    def watch(self, cursor, keys, timeout=None):
+        """Return (next_cursor, events)."""
+        query = [("cursor", str(cursor))] + [("key", k) for k in keys]
+        url = "%s/v1/primary/watch?%s" % (
+            self.base_url, urllib.parse.urlencode(query, quote_via=urllib.parse.quote, safe=""))
+        try:
+            status, data = _http("GET", url, timeout=timeout)
+        except Exception as exc:
+            raise CfgError("primary-store: watch request failed: %s" % exc)
+        if status != 200:
+            raise CfgError("primary-store: watch returned unexpected HTTP "
+                           "status %d" % status)
+        if (not isinstance(data, dict) or not _is_int(data.get("cursor"))
+                or not isinstance(data.get("events"), list)):
+            raise CfgError("primary-store: malformed watch response")
+        events = []
+        for ev in data["events"]:
+            if (not isinstance(ev, dict) or not isinstance(ev.get("key"), str)
+                    or not (isinstance(ev.get("value"), str)
+                            or ev.get("value") is None)
+                    or "value" not in ev
+                    or not _is_int(ev.get("version"))):
+                raise CfgError("primary-store: malformed watch event %r" % (ev,))
+            events.append((ev["key"], ev["value"], ev["version"]))
+        return data["cursor"], events
+
+
+class SecondaryStore:
+    def __init__(self, base_url):
+        self.base_url = base_url.rstrip("/")
+
+    def get(self, key):
+        url = "%s/v1/secondary/kv?key=%s" % (
+            self.base_url, urllib.parse.quote(key, safe=""))
+        try:
+            status, data = _http("GET", url)
+        except Exception as exc:
+            raise CfgError("secondary-store: request for key %r failed: %s"
+                           % (key, exc))
+        if status in (200, 404) and isinstance(data, dict):
+            if data.get("found") is False:
+                return None
+            if (status == 200 and data.get("found") is True
+                    and isinstance(data.get("value"), str)):
+                return data["value"]
+            raise CfgError("secondary-store: malformed response for key %r"
+                           % key)
+        if status in (200, 404):
+            raise CfgError("secondary-store: malformed response for key %r"
+                           % key)
+        raise CfgError("secondary-store: unexpected HTTP status %d for key %r"
+                       % (status, key))
+
+    def batch_read(self, keys):
+        """Return list of (key, status, value) or raise CfgError."""
+        url = "%s/v1/secondary/batch-read" % self.base_url
+        try:
+            status, data = _http("POST", url, body={"keys": list(keys)})
+        except Exception as exc:
+            raise CfgError("secondary-store: batch-read failed: %s" % exc)
+        if status != 200:
+            raise CfgError("secondary-store: batch-read returned HTTP %d"
+                           % status)
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise CfgError("secondary-store: malformed batch-read response")
+        items = data["items"]
+        if len(items) != len(keys):
+            raise CfgError("secondary-store: batch-read item count mismatch")
+        out = []
+        for key, item in zip(keys, items):
+            if not isinstance(item, dict) or item.get("key") != key:
+                raise CfgError("secondary-store: malformed batch-read item")
+            st = item.get("status")
+            if st == "ok":
+                if not isinstance(item.get("value"), str):
+                    raise CfgError("secondary-store: malformed batch-read item")
+                out.append((key, "ok", item["value"]))
+            elif st in ("missing", "error"):
+                out.append((key, st, None))
+            else:
+                raise CfgError("secondary-store: malformed batch-read item")
+        return out
+
+
+class Param:
+    """Per-parameter resolution state: parsed value per source layer."""
+
+    def __init__(self, path, decl):
+        self.path = path
+        self.name = dotted(path)
+        self.decl = decl
+        self.type = decl["type"]
+        self.layers = {}
+        self.primary_version = None
+
+    def effective(self):
+        value = None
+        for src in SOURCES:
+            if self.layers.get(src) is not None:
+                value = self.layers[src]
+        return value
+
+
+def render(typ, value):
+    """String representation of a resolved value for change events."""
+    if value is None:
+        return ""
+    if typ == "float":
+        return "%.6f" % float(value)
+    return value
 
 
 def lookup(src, key, args, store):
@@ -243,42 +380,59 @@ def lookup(src, key, args, store):
         return os.environ.get(key)
     if src == "file":
         return read_file_source(key)
-    if src == "primary-store":
+    if src in ("primary-store", "secondary-store"):
         return store.get(key)
     if src == "arg":
         return args.get(key)
     return None
 
 
-def resolve(schema, params, args, store=None):
-    out = _skeleton(schema)
+def seed(params, args, stores):
+    states = []
     unresolved = []
     for path, decl in params:
-        name = dotted(path)
-        typ = decl["type"]
-        value = None
-        # Sources are listed lowest to highest priority; later ones override.
+        st = Param(path, decl)
         for src in SOURCES:
             if src not in decl:
                 continue
-            raw = lookup(src, decl[src], args, store)
+            key = decl[src]
+            version = None
+            if src == "primary-store":
+                raw, version = stores["primary-store"].get_versioned(key)
+            elif src == "secondary-store":
+                raw = stores["secondary-store"].get(key)
+            else:
+                raw = lookup(src, key, args, None)
             if raw is None:
                 continue
             try:
-                value = parse_value(typ, raw)
+                st.layers[src] = parse_value(st.type, raw)
             except ParseFailure as exc:
                 raise CfgError("parameter %r: failed to parse source %r as %s: %s"
-                               % (name, src, typ, exc))
-        if value is None:
-            unresolved.append(name)
-        else:
-            node = out
-            for part in path[:-1]:
-                node = node[part]
-            node[path[-1]] = value
+                               % (st.name, src, st.type, exc))
+            if src == "primary-store":
+                st.primary_version = version
+        if st.effective() is None:
+            unresolved.append(st.name)
+        states.append(st)
     if unresolved:
         raise CfgError("unresolved parameters: %s" % ", ".join(unresolved))
+    return states
+
+
+def build_output(schema, states):
+    out = _skeleton(schema)
+    for st in states:
+        node = out
+        for part in st.path[:-1]:
+            node = node[part]
+        node[st.path[-1]] = st.effective()
     return out
+
+
+def resolve(schema, params, args, store=None, secondary=None):
+    stores = {"primary-store": store, "secondary-store": secondary}
+    return build_output(schema, seed(params, args, stores))
 
 
 def _skeleton(group):
@@ -289,14 +443,179 @@ def _skeleton(group):
     return out
 
 
-USAGE = "usage: cfgpipe.py [--primary-store <base-url>] <schema-file> [arg-candidates...]\n"
+def dumps(obj):
+    return json.dumps(obj, separators=(",", ":"))
+
+
+_DUR_RE = re.compile(r"([0-9]*\.?[0-9]+)(ns|us|µs|ms|s|m|h)")
+_DUR_UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0,
+              "m": 60.0, "h": 3600.0}
+
+
+def parse_duration(text):
+    """Parse a Go-style duration ("2s", "500ms", "1m30s"); bare numbers are
+    seconds. Returns seconds as float."""
+    s = text.strip()
+    if s == "":
+        raise CfgError("invalid duration %r" % text)
+    sign = 1.0
+    if s[0] in "+-":
+        if s[0] == "-":
+            sign = -1.0
+        s = s[1:]
+    if re.fullmatch(r"[0-9]*\.?[0-9]+", s):
+        return sign * float(s)
+    pos = 0
+    total = 0.0
+    while pos < len(s):
+        m = _DUR_RE.match(s, pos)
+        if not m:
+            raise CfgError("invalid duration %r" % text)
+        total += float(m.group(1)) * _DUR_UNITS[m.group(2)]
+        pos = m.end()
+    if pos == 0:
+        raise CfgError("invalid duration %r" % text)
+    return sign * total
+
+
+class Watcher:
+    def __init__(self, states, stores, poll_interval):
+        self.states = states
+        self.stores = stores
+        self.poll_interval = poll_interval
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.fatal = None
+        self.by_primary = {}
+        self.by_secondary = {}
+        for st in states:
+            if "primary-store" in st.decl and stores["primary-store"]:
+                self.by_primary[st.decl["primary-store"]] = st
+            if "secondary-store" in st.decl and stores["secondary-store"]:
+                self.by_secondary[st.decl["secondary-store"]] = st
+
+    def monitorable(self):
+        return bool(self.by_primary) or bool(self.by_secondary)
+
+    def emit(self, st, previous, current):
+        line = dumps({"path": st.name, "type": st.type,
+                      "previous": previous, "current": current})
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    def set_layer(self, st, src, value, force_event=False):
+        """Update a layer; emit an event on visible change. Caller holds lock."""
+        before = st.effective()
+        st.layers[src] = value
+        after = st.effective()
+        if before != after:
+            self.emit(st, render(st.type, before), render(st.type, after))
+        elif force_event:
+            self.emit(st, "", render(st.type, after))
+
+    def primary_loop(self):
+        store = self.stores["primary-store"]
+        keys = list(self.by_primary)
+        cursor = 0
+        try:
+            while not self.done.is_set():
+                cursor, events = store.watch(cursor, keys)
+                with self.lock:
+                    for key, value, version in events:
+                        st = self.by_primary.get(key)
+                        if st is None:
+                            continue
+                        if (st.primary_version is not None
+                                and version <= st.primary_version):
+                            continue
+                        if value is None:
+                            parsed = None
+                        else:
+                            try:
+                                parsed = parse_value(st.type, value)
+                            except ParseFailure:
+                                continue
+                        st.primary_version = version
+                        self.set_layer(st, "primary-store", parsed)
+        except CfgError as exc:
+            self.fail(exc)
+        except Exception as exc:  # unexpected
+            self.fail(CfgError("primary-store monitoring failed: %s" % exc))
+
+    def secondary_loop(self):
+        store = self.stores["secondary-store"]
+        keys = list(self.by_secondary)
+        baseline = {}
+        while not self.done.is_set():
+            try:
+                items = store.batch_read(keys)
+            except CfgError as exc:
+                sys.stderr.write("warning: %s\n" % exc)
+                sys.stderr.flush()
+                items = []
+            with self.lock:
+                for key, status, value in items:
+                    st = self.by_secondary[key]
+                    if status == "error":
+                        continue
+                    if status == "missing":
+                        parsed = None
+                    else:
+                        try:
+                            parsed = parse_value(st.type, value)
+                        except ParseFailure:
+                            continue
+                    first = key not in baseline
+                    baseline[key] = parsed
+                    self.set_layer(st, "secondary-store", parsed,
+                                   force_event=first)
+            if self.done.wait(self.poll_interval):
+                break
+
+    def fail(self, exc):
+        with self.lock:
+            if self.fatal is None:
+                self.fatal = exc
+        self.done.set()
+
+    def run(self):
+        threads = []
+        if self.by_primary:
+            threads.append(threading.Thread(target=self.primary_loop,
+                                            daemon=True))
+        if self.by_secondary:
+            threads.append(threading.Thread(target=self.secondary_loop,
+                                            daemon=True))
+        for t in threads:
+            t.start()
+        try:
+            while not self.done.wait(0.5):
+                pass
+        except KeyboardInterrupt:
+            return 0
+        if self.fatal is not None:
+            with self.lock:
+                sys.stderr.write("error: %s\n" % self.fatal)
+                sys.stderr.flush()
+            return 1
+        return 0
+
+
+USAGE = ("usage: cfgpipe.py [--primary-store <base-url>] "
+         "[--secondary-store <base-url>] "
+         "[--secondary-store-poll-interval <duration>] [--watch] "
+         "<schema-file> [arg-candidates...]\n")
+
+_VALUE_FLAGS = ("primary-store", "secondary-store",
+                "secondary-store-poll-interval")
 
 
 def parse_globals(argv):
     """Parse global flags preceding the schema path.
 
     Returns (options, index_of_schema_path)."""
-    opts = {"primary-store": None}
+    opts = {name: None for name in _VALUE_FLAGS}
+    opts["watch"] = False
     i = 1
     n = len(argv)
     while i < n:
@@ -306,19 +625,33 @@ def parse_globals(argv):
             break
         if not tok.startswith("-") or tok == "-":
             break
-        if tok == "--primary-store":
-            if i + 1 >= n:
-                raise CfgError("--primary-store requires a value")
-            opts["primary-store"] = argv[i + 1]
-            i += 2
-        elif tok.startswith("--primary-store="):
-            opts["primary-store"] = tok[len("--primary-store="):]
+        if tok == "--watch":
+            opts["watch"] = True
             i += 1
-        else:
+            continue
+        matched = False
+        for name in _VALUE_FLAGS:
+            flag = "--" + name
+            if tok == flag:
+                if i + 1 >= n:
+                    raise CfgError("%s requires a value" % flag)
+                opts[name] = argv[i + 1]
+                i += 2
+                matched = True
+                break
+            if tok.startswith(flag + "="):
+                opts[name] = tok[len(flag) + 1:]
+                i += 1
+                matched = True
+                break
+        if not matched:
             raise CfgError("unknown global flag %r" % tok)
     if i >= n:
         raise CfgError("missing schema file")
     return opts, i
+
+
+DEFAULT_POLL_INTERVAL = 1.0
 
 
 def main(argv):
@@ -328,26 +661,56 @@ def main(argv):
         sys.stderr.write("error: %s\n" % exc)
         sys.stderr.write(USAGE)
         return 2
+    watch = opts["watch"]
     try:
         schema, params = load_schema(argv[idx])
-        store = None
-        base = opts["primary-store"]
-        if base is not None:
-            if base == "":
-                raise CfgError("--primary-store base URL must not be empty")
-            store = PrimaryStore(base)
-        else:
-            needing = [dotted(p) for p, d in params if "primary-store" in d]
-            if needing:
-                raise CfgError("--primary-store is not configured but required "
-                               "by parameter(s): %s" % ", ".join(needing))
+        stores = {"primary-store": None, "secondary-store": None}
+        classes = {"primary-store": PrimaryStore,
+                   "secondary-store": SecondaryStore}
+        for src in ("primary-store", "secondary-store"):
+            base = opts[src]
+            if base is not None:
+                if base == "":
+                    raise CfgError("--%s base URL must not be empty" % src)
+                stores[src] = classes[src](base)
+            else:
+                needing = [dotted(p) for p, d in params if src in d]
+                if needing:
+                    raise CfgError("--%s is not configured but required by "
+                                   "parameter(s): %s"
+                                   % (src, ", ".join(needing)))
+        poll_interval = DEFAULT_POLL_INTERVAL
+        if watch and stores["secondary-store"] is not None:
+            if opts["secondary-store-poll-interval"] is not None:
+                poll_interval = parse_duration(
+                    opts["secondary-store-poll-interval"])
+            if not poll_interval > 0:
+                raise CfgError("--secondary-store-poll-interval must be "
+                               "strictly positive")
+            if not any("secondary-store" in d for _, d in params):
+                raise CfgError("--watch with --secondary-store requires at "
+                               "least one parameter declaring "
+                               "'secondary-store'")
         args = parse_args(argv[idx + 1:])
-        out = resolve(schema, params, args, store)
+        states = seed(params, args, stores)
     except CfgError as exc:
         sys.stderr.write("error: %s\n" % exc)
         return 1
-    sys.stdout.write(json.dumps(out) + "\n")
-    return 0
+    out = build_output(schema, states)
+    if not watch:
+        sys.stdout.write(dumps(out) + "\n")
+        return 0
+    for st in states:
+        sys.stdout.write(dumps({"path": st.name, "type": st.type,
+                                "previous": "",
+                                "current": render(st.type, st.effective())})
+                         + "\n")
+    sys.stdout.write(dumps(out) + "\n")
+    sys.stdout.flush()
+    watcher = Watcher(states, stores, poll_interval)
+    if not watcher.monitorable():
+        return 0
+    return watcher.run()
 
 
 if __name__ == "__main__":
