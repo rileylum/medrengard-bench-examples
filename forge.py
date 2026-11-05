@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Forge: manage hardware blueprints with JSON output."""
+"""Forge: manage hardware blueprints and allocations with JSON output."""
 import json
 import os
 import sys
@@ -241,6 +241,135 @@ def cmd_delete(data_dir, args):
 
 COMMANDS = {"create": cmd_create, "list": cmd_list, "get": cmd_get, "delete": cmd_delete}
 
+ALLOC_FILE = "allocations.json"
+CAT_TYPE_A = "category=TYPE_A"
+
+
+def load_allocs(data_dir):
+    path = os.path.join(data_dir, ALLOC_FILE)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    if not content.strip():
+        return []
+    data = json.loads(content)
+    return data if isinstance(data, list) else []
+
+
+def save_allocs(data_dir, allocs):
+    os.makedirs(data_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=data_dir, prefix=".al-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(allocs, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(data_dir, ALLOC_FILE))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def alloc_sort_key(a):
+    return (a.get("created_at", ""), a.get("uuid", ""))
+
+
+def cmd_alloc_create(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "allocation create takes no arguments")
+    raw = sys.stdin.read()
+    try:
+        doc = json.loads(raw, parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as e:
+        raise ForgeError("validation_error", "invalid JSON input: %s" % e)
+    if not isinstance(doc, dict):
+        raise ForgeError("validation_error",
+                         "input must be a JSON object, got %s" % type_name(doc))
+    if "blueprint_name" not in doc:
+        raise ForgeError("validation_error", "blueprint_name: is required")
+    name = doc["blueprint_name"]
+    if not isinstance(name, str):
+        raise ForgeError("validation_error",
+                         "blueprint_name: must be a string, got %s" % type_name(name))
+    if name == "":
+        raise ForgeError("validation_error", "blueprint_name: must be a non-empty string")
+
+    bp = None
+    for b in load(data_dir):
+        if b.get("name") == name:
+            bp = b
+            break
+    if bp is None:
+        raise ForgeError("not_found", "blueprint with name '%s' not found" % name)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    created = []
+    for idx, rs in enumerate(bp.get("requirement_sets") or []):
+        caps = rs.get("capabilities") if isinstance(rs, dict) else None
+        n = 2 if isinstance(caps, list) and CAT_TYPE_A in caps else 1
+        for _ in range(n):
+            created.append({
+                "uuid": str(uuidlib.uuid4()),
+                "blueprint_name": name,
+                "requirement_set_index": idx,
+                "binding_status": "unbound",
+                "assignment_id": None,
+                "created_at": now,
+            })
+    allocs = load_allocs(data_dir)
+    allocs.extend(created)
+    save_allocs(data_dir, allocs)
+    return created
+
+
+def _take_opt(args, i, flag):
+    a = args[i]
+    if a == flag:
+        if i + 1 >= len(args):
+            raise ForgeError("validation_error", "%s requires a value" % flag)
+        return args[i + 1], i + 2
+    return a[len(flag) + 1:], i + 1
+
+
+def cmd_alloc_list(data_dir, args):
+    assignment = None
+    status = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--assignment" or a.startswith("--assignment="):
+            assignment, i = _take_opt(args, i, "--assignment")
+        elif a == "--status" or a.startswith("--status="):
+            status, i = _take_opt(args, i, "--status")
+        else:
+            raise ForgeError("validation_error", "unexpected argument '%s'" % a)
+    out = []
+    for al in load_allocs(data_dir):
+        if assignment is not None and al.get("assignment_id") != assignment:
+            continue
+        if status is not None and al.get("binding_status") != status:
+            continue
+        out.append(al)
+    return sorted(out, key=alloc_sort_key)
+
+
+def cmd_alloc_get(data_dir, args):
+    if len(args) != 1:
+        raise ForgeError("validation_error", "get requires exactly one argument: <uuid>")
+    ident = args[0]
+    for al in load_allocs(data_dir):
+        if al.get("uuid") == ident:
+            return al
+    raise ForgeError("not_found", "allocation '%s' not found" % ident)
+
+
+GROUPS = {
+    "blueprint": COMMANDS,
+    "allocation": {"create": cmd_alloc_create, "list": cmd_alloc_list, "get": cmd_alloc_get},
+}
+
 
 def parse_argv(argv):
     data_dir = None
@@ -262,20 +391,22 @@ def parse_argv(argv):
         i += 1
     if not data_dir:
         raise ForgeError("validation_error", "--data-dir is required")
-    if not rest or rest[0] != "blueprint":
-        raise ForgeError("validation_error", "usage: forge.py --data-dir <path> blueprint <command> [args]")
+    if not rest or rest[0] not in GROUPS:
+        raise ForgeError("validation_error",
+                         "usage: forge.py --data-dir <path> {blueprint|allocation} <command> [args]")
+    group = rest[0]
     if len(rest) < 2:
-        raise ForgeError("validation_error", "missing blueprint command")
+        raise ForgeError("validation_error", "missing %s command" % group)
     cmd = rest[1]
-    if cmd not in COMMANDS:
+    if cmd not in GROUPS[group]:
         raise ForgeError("validation_error", "unknown command '%s'" % cmd)
-    return data_dir, cmd, rest[2:]
+    return data_dir, GROUPS[group][cmd], rest[2:]
 
 
 def main(argv):
     try:
-        data_dir, cmd, args = parse_argv(argv)
-        result = COMMANDS[cmd](data_dir, args)
+        data_dir, func, args = parse_argv(argv)
+        result = func(data_dir, args)
     except ForgeError as e:
         emit({"error": e.error, "detail": e.detail}, 1)
     emit(result, 0)
