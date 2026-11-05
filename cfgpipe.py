@@ -12,6 +12,8 @@ import urllib.request
 SOURCES = ("default", "env", "file", "primary-store", "arg")
 STORE_TIMEOUT = 10
 TYPES = ("string", "integer", "float", "boolean")
+CUSTOM_TYPES = ("port",)
+ALL_TYPES = TYPES + CUSTOM_TYPES
 
 
 class CfgError(Exception):
@@ -55,6 +57,13 @@ def parse_value(typ, raw):
         if low in _FALSE:
             return "false"
         raise ParseFailure("invalid boolean %r" % raw)
+    if typ == "port":
+        if not _INT_RE.match(s):
+            raise ParseFailure("invalid port %r: not a base-10 integer" % raw)
+        v = int(s)
+        if v < 0 or v > 65535:
+            raise ParseFailure("invalid port %r: out of range 0-65535" % raw)
+        return str(v)
     raise ParseFailure("unknown type %r" % typ)
 
 
@@ -86,27 +95,61 @@ def load_schema(path):
         raise CfgError("invalid JSON in schema %s: %s" % (path, exc))
     if not isinstance(schema, dict):
         raise CfgError("schema root must be a JSON object")
-    for name, decl in schema.items():
-        if not isinstance(decl, dict):
-            raise CfgError("parameter %r: declaration must be an object" % name)
-        if "type" not in decl:
-            raise CfgError("parameter %r: missing required field 'type'" % name)
-        if not isinstance(decl["type"], str) or decl["type"] not in TYPES:
-            raise CfgError("parameter %r: invalid type %r (expected one of %s)"
-                           % (name, decl["type"], ", ".join(TYPES)))
-        for src in SOURCES:
-            if src in decl and not isinstance(decl[src], str):
-                raise CfgError("parameter %r: field %r must be a string"
-                               % (name, src))
+    if not schema:
+        raise CfgError("schema root must be a non-empty JSON object")
+    params = []
+    _walk_group(schema, (), params)
     seen = {}
-    for name, decl in schema.items():
+    for path, decl in params:
         if "primary-store" in decl:
             key = decl["primary-store"]
             if key in seen:
                 raise CfgError("parameters %r and %r share primary-store key %r"
-                               % (seen[key], name, key))
-            seen[key] = name
-    return schema
+                               % (dotted(seen[key]), dotted(path), key))
+            seen[key] = path
+    return schema, params
+
+
+def dotted(path):
+    return ".".join(path)
+
+
+def is_param(obj):
+    return isinstance(obj, dict) and isinstance(obj.get("type"), str)
+
+
+def _walk_group(group, prefix, params):
+    gname = dotted(prefix) if prefix else "<root>"
+    for key in SOURCES:
+        if key in group and not isinstance(group[key], dict):
+            raise CfgError("group %r: must not carry source annotation %r"
+                           % (gname, key))
+    for name, entry in group.items():
+        if name == "" or "." in name:
+            raise CfgError("group %r: invalid entry name %r" % (gname, name))
+        path = prefix + (name,)
+        if not isinstance(entry, dict):
+            if name == "type":
+                raise CfgError("group %r: invalid 'type' field %r"
+                               % (gname, entry))
+            raise CfgError("%r: entry must be an object (parameter declaration "
+                           "or group)" % dotted(path))
+        if is_param(entry):
+            _check_param(path, entry)
+            params.append((path, entry))
+        else:
+            _walk_group(entry, path, params)
+
+
+def _check_param(path, decl):
+    name = dotted(path)
+    if decl["type"] not in ALL_TYPES:
+        raise CfgError("parameter %r: unrecognized type %r (expected one of %s)"
+                       % (name, decl["type"], ", ".join(ALL_TYPES)))
+    for src in SOURCES:
+        if src in decl and not isinstance(decl[src], str):
+            raise CfgError("parameter %r: field %r must be a string"
+                           % (name, src))
 
 
 def parse_args(candidates):
@@ -207,10 +250,11 @@ def lookup(src, key, args, store):
     return None
 
 
-def resolve(schema, args, store=None):
-    out = {}
+def resolve(schema, params, args, store=None):
+    out = _skeleton(schema)
     unresolved = []
-    for name, decl in schema.items():
+    for path, decl in params:
+        name = dotted(path)
         typ = decl["type"]
         value = None
         # Sources are listed lowest to highest priority; later ones override.
@@ -228,9 +272,20 @@ def resolve(schema, args, store=None):
         if value is None:
             unresolved.append(name)
         else:
-            out[name] = value
+            node = out
+            for part in path[:-1]:
+                node = node[part]
+            node[path[-1]] = value
     if unresolved:
         raise CfgError("unresolved parameters: %s" % ", ".join(unresolved))
+    return out
+
+
+def _skeleton(group):
+    out = {}
+    for name, entry in group.items():
+        if not is_param(entry):
+            out[name] = _skeleton(entry)
     return out
 
 
@@ -274,7 +329,7 @@ def main(argv):
         sys.stderr.write(USAGE)
         return 2
     try:
-        schema = load_schema(argv[idx])
+        schema, params = load_schema(argv[idx])
         store = None
         base = opts["primary-store"]
         if base is not None:
@@ -282,12 +337,12 @@ def main(argv):
                 raise CfgError("--primary-store base URL must not be empty")
             store = PrimaryStore(base)
         else:
-            needing = [n for n, d in schema.items() if "primary-store" in d]
+            needing = [dotted(p) for p, d in params if "primary-store" in d]
             if needing:
                 raise CfgError("--primary-store is not configured but required "
                                "by parameter(s): %s" % ", ".join(needing))
         args = parse_args(argv[idx + 1:])
-        out = resolve(schema, args, store)
+        out = resolve(schema, params, args, store)
     except CfgError as exc:
         sys.stderr.write("error: %s\n" % exc)
         return 1
