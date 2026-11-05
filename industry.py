@@ -228,13 +228,210 @@ def cmd_recipe(args):
     return 0
 
 
+INVENTION = 8
+REVERSE_ENGINEERING = 7
+INVENTION_ACTIVITIES = (INVENTION, REVERSE_ENGINEERING)
+
+# name: (probability multiplier %, runs, ME, TE)
+DECRYPTORS = [
+    ("None", 0, 0, 0, 0),
+    ("Accelerant Decryptor", 20, 1, 2, 10),
+    ("Attainment Decryptor", 80, 4, -1, 4),
+    ("Augmentation Decryptor", -40, 9, -2, 2),
+    ("Optimized Attainment Decryptor", 90, 2, 1, -2),
+    ("Optimized Augmentation Decryptor", -10, 7, 2, 0),
+    ("Parity Decryptor", 50, 3, 1, -2),
+    ("Process Decryptor", 10, 0, 3, 6),
+    ("Symmetry Decryptor", 0, 2, 1, 8),
+]
+RELIC_QUALITIES = [("Intact", 0.26, 20), ("Malfunctioning", 0.21, 10),
+                   ("Wrecked", 0.14, 3)]
+BASE_ME, BASE_TE = 2, 4
+
+
+def relic_quality(name):
+    for idx, (q, _c, _r) in enumerate(RELIC_QUALITIES):
+        if name.startswith(q) or (" " + q + " ") in (" " + name + " "):
+            return idx
+    return None
+
+
+def name_key(s):
+    return (s.lower(), s)
+
+
+class InventionData:
+    def __init__(self, sde):
+        self.sources = {}   # target blueprint -> [(source, activity, runs)]
+        for r in read_csv(sde.path, "industryActivityProducts.csv.bz2"):
+            act = to_int(r["activityID"])
+            if act not in INVENTION_ACTIVITIES:
+                continue
+            src, prod = to_int(r["typeID"]), to_int(r["productTypeID"])
+            self.sources.setdefault(prod, []).append((src, act, to_int(r["quantity"], 1)))
+        self.probs = {}
+        for r in read_csv(sde.path, "industryActivityProbabilities.csv.bz2"):
+            act = to_int(r["activityID"])
+            if act not in INVENTION_ACTIVITIES:
+                continue
+            self.probs[(to_int(r["typeID"]), act, to_int(r["productTypeID"]))] = r["probability"]
+        self.skills = {}
+        for r in read_csv(sde.path, "industryActivitySkills.csv.bz2"):
+            act = to_int(r["activityID"])
+            if act not in INVENTION_ACTIVITIES:
+                continue
+            key = (to_int(r["typeID"]), act)
+            sid = to_int(r["skillID"])
+            lst = self.skills.setdefault(key, [])
+            if sid not in lst:
+                lst.append(sid)
+
+
+def chance(base, n_science, skill, n_encryption, mult):
+    factor = 1
+    for _ in range(n_science):
+        factor += skill / 30
+    for _ in range(n_encryption):
+        factor += skill / 40
+    p = base * factor * (1 + mult / 100)
+    return min(1.0, max(0.0, p))
+
+
+def fmt_row(cells, widths):
+    return "|" + "|".join((" " + c).ljust(w) for c, w in zip(cells, widths)) + "|"
+
+
+def cmd_invention(args):
+    sde = SDE(args.sde)
+    inv = InventionData(sde)
+    name = args.name
+    tid = sde.name_to_id.get(name)
+    if tid is None:
+        print(f"Error: no published item named '{name}'", file=sys.stderr)
+        return 1
+    # Resolve to product and its blueprint.
+    product = tid
+    if tid in sde.bp_products:
+        rec = sde.recipe_for_blueprint(tid)
+        if rec is not None:
+            product = rec[2]
+    target_bps = []
+    if tid != product:
+        target_bps.append(tid)
+    for bp, act, _q in sorted(sde.product_bps.get(product, []),
+                              key=lambda c: sde._bp_rank(c[0], c[1])):
+        if bp not in target_bps:
+            target_bps.append(bp)
+    target_bp, sources = None, []
+    for bp in target_bps:
+        if inv.sources.get(bp):
+            target_bp, sources = bp, inv.sources[bp]
+            break
+    if not sources:
+        print(f"Error: '{name}' cannot be invented or reverse engineered", file=sys.stderr)
+        return 1
+
+    def src_rank(s):
+        return (0 if sde.published(s[0]) else 1,
+                0 if s[1] == INVENTION else 1, s[0])
+
+    published_sources = [s for s in sources if sde.published(s[0])] or sources
+    relic_sources = [s for s in published_sources
+                     if relic_quality(sde.types.get(s[0], {}).get("typeName", "")) is not None
+                     and s[0] not in sde.bp_products]
+    tech = sde.tech_level(product)
+    is_t3 = tech == "Tech III" or (relic_sources and len(relic_sources) == len(published_sources))
+    if is_t3 and relic_sources:
+        used = sorted(relic_sources, key=lambda s: (
+            relic_quality(sde.types[s[0]]["typeName"]),
+            name_key(sde.types[s[0]]["typeName"]), s[0]))
+    else:
+        used = [min(published_sources, key=src_rank)]
+    tech_label = "Tech III" if is_t3 else "Tech II"
+
+    first_src, first_act, _ = used[0]
+    tname = lambda i: sde.types[i]["typeName"] if i in sde.types else str(i)
+    mats = sde.materials.get((first_src, first_act), [])
+    datacores = [(m, q) for m, q in mats if tname(m).startswith("Datacore")] or mats
+    dc_names = sorted({tname(m) for m, _q in datacores}, key=name_key)
+    per_run = datacores[0][1] if datacores else 0
+    skill_ids = inv.skills.get((first_src, first_act), [])
+    skill_names = sorted({tname(s) for s in skill_ids}, key=name_key)
+    n_enc = sum(1 for s in skill_ids if "Encryption" in tname(s))
+    n_sci = len(skill_ids) - n_enc
+    seconds = sde.times.get((first_src, first_act), 0)
+    level = args.skill
+
+    out = [
+        f"ITEM: {tname(product)} ({product})",
+        f"Group: {sde.group_line(product)}",
+        f"Market Group: {sde.market_path(product)}",
+        f"Tech Level: {tech_label}",
+        "",
+        "Invention:",
+    ]
+    if not is_t3:
+        out.append(f"Base: {tname(first_src)} ({first_src})")
+    out += [
+        f"Datacores: {', '.join(dc_names)}",
+        f"Required Per Run: {per_run}",
+        f"Skills: {', '.join(skill_names)}",
+        f"Time: {math.ceil(seconds / 60)}",
+        "Probabilities:",
+    ]
+    if is_t3:
+        widths = [30, 33, 13, 6, 4, 4]
+        headers = ["Invented From", "Decryptor", "Probability", "Runs", "ME", "TE"]
+    else:
+        widths = [33, 13, 6, 4, 4]
+        headers = ["Decryptor", "Probability", "Runs", "ME", "TE"]
+    out.append(fmt_row(headers, widths))
+    out.append("|" + "|".join("-" * w for w in widths) + "|")
+    for src, act, runs in used:
+        if is_t3:
+            q = relic_quality(tname(src))
+            _qn, base, base_runs = RELIC_QUALITIES[q]
+        else:
+            raw = inv.probs.get((src, act, target_bp))
+            base = float(raw) if raw not in (None, "", "None") else 0.0
+            base_runs = runs
+        for dname, mult, druns, dme, dte in sorted(
+                DECRYPTORS, key=lambda d: (d[0] != "None", name_key(d[0]))):
+            p = chance(base, n_sci, level, n_enc, mult)
+            cells = [f"{p * 100:.2f}", str(base_runs + druns),
+                     str(BASE_ME + dme), str(BASE_TE + dte)]
+            row = [dname] + cells
+            if is_t3:
+                row = [tname(src)] + row
+            out.append(fmt_row(row, widths))
+    print("\n".join(out))
+    return 0
+
+
+def skill_level(v):
+    try:
+        n = int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError("skill must be an integer 1-5")
+    if not 1 <= n <= 5:
+        raise argparse.ArgumentTypeError("skill must be an integer 1-5")
+    return n
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="EVE Online industry planner")
     sub = p.add_subparsers(dest="command", required=True)
     r = sub.add_parser("recipe", help="Show recipe for a product or blueprint")
     r.add_argument("name", nargs="+")
     r.add_argument("--sde", required=True)
+    i = sub.add_parser("invention", help="Plan invention / reverse engineering")
+    i.add_argument("name", nargs="+")
+    i.add_argument("--sde", required=True)
+    i.add_argument("--skill", type=skill_level, default=5)
     args = p.parse_args(argv)
+    if args.command == "invention":
+        args.name = " ".join(args.name)
+        return cmd_invention(args)
     if args.command == "recipe":
         args.name = " ".join(args.name)
         return cmd_recipe(args)
