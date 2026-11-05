@@ -5,8 +5,12 @@ import math
 import os
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
-SOURCES = ("default", "env", "file", "arg")
+SOURCES = ("default", "env", "file", "primary-store", "arg")
+STORE_TIMEOUT = 10
 TYPES = ("string", "integer", "float", "boolean")
 
 
@@ -94,6 +98,14 @@ def load_schema(path):
             if src in decl and not isinstance(decl[src], str):
                 raise CfgError("parameter %r: field %r must be a string"
                                % (name, src))
+    seen = {}
+    for name, decl in schema.items():
+        if "primary-store" in decl:
+            key = decl["primary-store"]
+            if key in seen:
+                raise CfgError("parameters %r and %r share primary-store key %r"
+                               % (seen[key], name, key))
+            seen[key] = name
     return schema
 
 
@@ -137,28 +149,75 @@ def read_file_source(path):
     return content
 
 
-def lookup(src, key, args):
+class PrimaryStore:
+    def __init__(self, base_url):
+        self.base_url = base_url.rstrip("/")
+
+    def get(self, key):
+        """Return value string, or None if the key is missing."""
+        url = "%s/v1/primary/kv?key=%s" % (
+            self.base_url, urllib.parse.quote(key, safe=""))
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=STORE_TIMEOUT) as resp:
+                status = resp.status
+                body = resp.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                body = exc.read()
+            except Exception:
+                body = b""
+        except Exception as exc:
+            raise CfgError("primary-store: request for key %r failed: %s"
+                           % (key, exc))
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            data = None
+        if status == 200:
+            if (not isinstance(data, dict) or data.get("found") is not True
+                    or not isinstance(data.get("value"), str)
+                    or ("version" in data and (
+                        not isinstance(data["version"], int)
+                        or isinstance(data["version"], bool)))):
+                raise CfgError("primary-store: malformed response for key %r"
+                               % key)
+            return data["value"]
+        if status == 404:
+            if isinstance(data, dict) and data.get("found") is False:
+                return None
+            raise CfgError("primary-store: malformed 404 response for key %r"
+                           % key)
+        raise CfgError("primary-store: unexpected HTTP status %d for key %r"
+                       % (status, key))
+
+
+def lookup(src, key, args, store):
     if src == "default":
         return key
     if src == "env":
         return os.environ.get(key)
     if src == "file":
         return read_file_source(key)
+    if src == "primary-store":
+        return store.get(key)
     if src == "arg":
         return args.get(key)
     return None
 
 
-def resolve(schema, args):
+def resolve(schema, args, store=None):
     out = {}
     unresolved = []
     for name, decl in schema.items():
         typ = decl["type"]
         value = None
+        # Sources are listed lowest to highest priority; later ones override.
         for src in SOURCES:
             if src not in decl:
                 continue
-            raw = lookup(src, decl[src], args)
+            raw = lookup(src, decl[src], args, store)
             if raw is None:
                 continue
             try:
@@ -166,7 +225,6 @@ def resolve(schema, args):
             except ParseFailure as exc:
                 raise CfgError("parameter %r: failed to parse source %r as %s: %s"
                                % (name, src, typ, exc))
-            break
         if value is None:
             unresolved.append(name)
         else:
@@ -176,14 +234,60 @@ def resolve(schema, args):
     return out
 
 
+USAGE = "usage: cfgpipe.py [--primary-store <base-url>] <schema-file> [arg-candidates...]\n"
+
+
+def parse_globals(argv):
+    """Parse global flags preceding the schema path.
+
+    Returns (options, index_of_schema_path)."""
+    opts = {"primary-store": None}
+    i = 1
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok == "--":
+            i += 1
+            break
+        if not tok.startswith("-") or tok == "-":
+            break
+        if tok == "--primary-store":
+            if i + 1 >= n:
+                raise CfgError("--primary-store requires a value")
+            opts["primary-store"] = argv[i + 1]
+            i += 2
+        elif tok.startswith("--primary-store="):
+            opts["primary-store"] = tok[len("--primary-store="):]
+            i += 1
+        else:
+            raise CfgError("unknown global flag %r" % tok)
+    if i >= n:
+        raise CfgError("missing schema file")
+    return opts, i
+
+
 def main(argv):
-    if len(argv) < 2:
-        sys.stderr.write("usage: cfgpipe.py <schema-file> [arg-candidates...]\n")
+    try:
+        opts, idx = parse_globals(argv)
+    except CfgError as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        sys.stderr.write(USAGE)
         return 2
     try:
-        schema = load_schema(argv[1])
-        args = parse_args(argv[2:])
-        out = resolve(schema, args)
+        schema = load_schema(argv[idx])
+        store = None
+        base = opts["primary-store"]
+        if base is not None:
+            if base == "":
+                raise CfgError("--primary-store base URL must not be empty")
+            store = PrimaryStore(base)
+        else:
+            needing = [n for n, d in schema.items() if "primary-store" in d]
+            if needing:
+                raise CfgError("--primary-store is not configured but required "
+                               "by parameter(s): %s" % ", ".join(needing))
+        args = parse_args(argv[idx + 1:])
+        out = resolve(schema, args, store)
     except CfgError as exc:
         sys.stderr.write("error: %s\n" % exc)
         return 1
