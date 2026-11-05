@@ -140,10 +140,20 @@ def _ex_kw(n, res):
     return {k: _ex_ev(v, res) for k, v in n.get("kw") or []}
 
 
+_EX_CUR = [None]  # (args, kwargs) of the current entrypoint call (mutation tests)
+
+
 def _ex_ev(n, res):
     t = n["t"]
     if t == "call":
         return res
+    if t == "arg":
+        cur = _EX_CUR[0]
+        if cur is None:
+            raise TypeError("no call arguments")
+        if n.get("k") is not None:
+            return cur[1][n["k"]]
+        return cur[0][n["i"]]
     if t == "v":
         return n["v"]
     if t == "bin":
@@ -933,18 +943,104 @@ def _expectations(line: int, comments, lines):
     return exp
 
 
+_TEST_LIKE_RE = re.compile(r"^(test.*|.*_test|tests|.*_tests)\.[^.]+$")
+_SKIP_DIRS = {"__pycache__", "node_modules"}
+
+
+def _generated_tester(rel):
+    return rel in ("tester.py", "tester.js", "tester.ts")
+
+
+def _test_files(tests_dir):
+    """All ``.py`` files under ``tests_dir`` (relative, forward slashes)."""
+    found = []
+    for root, dirs, files in os.walk(tests_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in _SKIP_DIRS)
+        for fn in sorted(files):
+            if fn.startswith("."):
+                continue
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, tests_dir).replace(os.sep, "/")
+            if _generated_tester(rel):
+                continue
+            stem, ext = os.path.splitext(fn)
+            if ext == ".py":
+                found.append(rel)
+            elif _TEST_LIKE_RE.match(fn) and not fn.endswith((".pyc", ".pyo")):
+                raise DiscoveryError(f"{rel}: test-like file is not a .py file")
+    found.sort(key=lambda r: r.split("/"))
+    return found
+
+
 def discover(tests_dir: str, ep_name=None):
-    """Parse tests.py. Returns list of test dicts (with ``id``)."""
-    path = os.path.join(tests_dir, "tests.py")
-    if not os.path.isfile(path):
-        raise DiscoveryError("tests.py not found")
+    """Discover tests in all .py files under tests_dir (recursively)."""
+    tests = []
+    for rel in _test_files(tests_dir):
+        try:
+            tests.extend(_discover_file(os.path.join(tests_dir, *rel.split("/")), rel, ep_name))
+        except DiscoveryError as e:
+            raise DiscoveryError(f"{rel}: {e}")
+    if not tests:
+        raise DiscoveryError("no tests discovered")
+    return tests
+
+
+def _names_in(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _has_ep_call(node, ctx):
+    return any(isinstance(n, ast.Call) and _call_matches(n.func, ctx) for n in ast.walk(node))
+
+
+def _mutation_call(stmt, ctx):
+    """If ``stmt`` is an entrypoint call statement/assignment, return the call node."""
+    if isinstance(stmt, ast.Expr):
+        v = stmt.value
+    elif isinstance(stmt, ast.Assign):
+        v = stmt.value
+    elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        v = stmt.value
+    else:
+        return None
+    if isinstance(v, ast.Call) and _call_matches(v.func, ctx):
+        return v
+    return None
+
+
+def _arg_bindings(node, ctx):
+    """Map variable names passed to the call to post-call argument IR nodes."""
+    out = {}
+    pos = 0
+    for a in node.args:
+        if isinstance(a, ast.Starred):
+            v = _arg_value(a.value, ctx)
+            pos += len(list(v))
+            continue
+        if isinstance(a, ast.Name) and a.id not in out:
+            out[a.id] = {"t": "arg", "i": pos}
+        pos += 1
+    j = pos
+    for kw in node.keywords:
+        if kw.arg is None:
+            v = _arg_value(kw.value, ctx)
+            j += len(v)
+            continue
+        if isinstance(kw.value, ast.Name) and kw.value.id not in out:
+            out[kw.value.id] = {"t": "arg", "i": j, "k": kw.arg}
+        j += 1
+    return out
+
+
+def _discover_file(path, rel, ep_name):
+    """Parse one test file. Returns list of test dicts (with ``id``)."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             source = f.read()
     except (OSError, UnicodeDecodeError) as e:
         raise DiscoveryError(str(e))
     try:
-        tree = ast.parse(source, filename="tests.py")
+        tree = ast.parse(source, filename=rel)
     except (SyntaxError, ValueError) as e:
         raise DiscoveryError(f"syntax error: {e}")
     comments, lines = _comment_lines(source)
@@ -958,8 +1054,65 @@ def discover(tests_dir: str, ep_name=None):
         t["iters"] = list(iters)
         tests.append(t)
 
+    def mutation_block(body, i, node):
+        """Handle ``f(a)`` / ``r = f(a)`` followed by asserts. Returns next index."""
+        stmt = body[i]
+        is_stmt = isinstance(stmt, ast.Expr)
+        j = i + 1
+        while j < len(body) and isinstance(body[j], ast.Assert):
+            j += 1
+        asserts = body[i + 1:j]
+        call = _parse_call(node, ctx)
+        if call is None:
+            raise DiscoveryError(f"line {stmt.lineno}: unsupported statement")
+        bindings = _arg_bindings(node, ctx)
+        if is_stmt:
+            if not asserts:
+                raise DiscoveryError(
+                    f"line {stmt.lineno}: entrypoint call statement must be followed by asserts")
+            for a in asserts:
+                if _has_ep_call(a, ctx):
+                    raise DiscoveryError(
+                        f"line {a.lineno}: assert after a mutation call must not call the entrypoint")
+                if not (_names_in(a.test) & set(bindings)):
+                    raise DiscoveryError(
+                        f"line {a.lineno}: assert does not reference a variable passed to the mutation call")
+            origin = ("stmt", stmt.lineno, stmt.col_offset)
+        else:
+            origin = ("assign", stmt.lineno, stmt.col_offset)
+        if not asserts:
+            _parse_assign(stmt, ctx)
+            return j
+        assigned = set()
+        if not is_stmt:
+            tgts = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            for tg in tgts:
+                assigned |= _names_in(tg)
+        saved = {n: ctx.env.get(n, _NO_VALUE) for n in bindings if n not in assigned}
+        if not is_stmt:
+            _parse_assign(stmt, ctx)
+        for n in saved:
+            ctx.env[n] = {"ir": bindings[n], "call": call, "origin": origin}
+        try:
+            for a in asserts:
+                add(_parse_assert(a, ctx), a.lineno)
+        finally:
+            for n, old in saved.items():
+                if old is _NO_VALUE:
+                    ctx.env.pop(n, None)
+                else:
+                    ctx.env[n] = old
+        return j
+
     def walk(body):
-        for stmt in body:
+        i = 0
+        while i < len(body):
+            stmt = body[i]
+            node = _mutation_call(stmt, ctx)
+            if node is not None:
+                i = mutation_block(body, i, node)
+                continue
+            i += 1
             if isinstance(stmt, ast.FunctionDef):
                 if stmt.decorator_list:
                     raise DiscoveryError(f"line {stmt.lineno}: decorators not allowed")
@@ -1061,7 +1214,7 @@ def discover(tests_dir: str, ep_name=None):
     walk(tree.body)
 
     for t in tests:
-        t["id"] = f"tests.py:{t['line']}" + "".join(f":{i}" for i in t.pop("iters"))
+        t["id"] = f"{rel}:{t['line']}" + "".join(f":{i}" for i in t.pop("iters"))
     counts = {}
     for t in tests:
         counts[t["id"]] = counts.get(t["id"], 0) + 1
@@ -1801,6 +1954,7 @@ def run_test(factory, t):
         return bool(t.get("ok"))
     args = copy.deepcopy(t["args"])
     kwargs = {k: copy.deepcopy(v) for k, v in t["kwargs"]}
+    _EX_CUR[0] = (args, kwargs)
     cmp = t.get("cmp")
     ok = False
     with _Capture() as cap:
@@ -2957,9 +3111,11 @@ function evKw(n, res) {
   for (const p of (n.kw || [])) kw[p[0]] = ev(p[1], res);
   return kw;
 }
+let curArgs = null;
 function ev(n, res) {
   switch (n.t) {
     case "call": return res;
+    case "arg": if (curArgs === null) throw pyErr("TypeError", "no call arguments"); return norm(curArgs[n.i]);
     case "v": return norm(n.v);
     case "bin": return binop(n.op, ev(n.a, res), ev(n.b, res));
     case "un": return unop(n.op, ev(n.a, res));
@@ -3206,6 +3362,7 @@ function resolve(loaded, name) {
 async function runTest(factory, t) {
   if (t.kind === "loop") return !!t.ok;
   const args = toJS(t.args).concat(t.kwargs.map(function (kv) { return toJS(kv[1]); }));
+  curArgs = args;
   const cmp = t.cmp || null;
   let ok = false;
   capOut = ""; capErr = "";

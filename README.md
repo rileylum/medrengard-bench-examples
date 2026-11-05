@@ -8,7 +8,7 @@ python babel_code_goat.py test <solution> <tests_dir> --lang python|javascript|t
 
 JavaScript/TypeScript testers require Node.js (TypeScript uses Node's built-in type stripping, Node >= 22.6).
 
-Supported in `tests.py` values: any hashable dict keys, `set`/`frozenset`, `collections.Counter`/`deque`/`defaultdict`/`OrderedDict`, `decimal.Decimal`.
+Supported test-file values: any hashable dict keys, `set`/`frozenset`, `collections.Counter`/`deque`/`defaultdict`/`OrderedDict`, `decimal.Decimal`.
 Float comparisons use an absolute tolerance (`--tol`, default `1e-9`), applied recursively; integers compare exactly.
 Per-assert overrides: `math.isclose(..., rel_tol=, abs_tol=)`, `abs(a - b) < tol` / `<= tol`.
 Typed raises: `except T [as e]:` with `assert "s" in str(e)`, `str(e) == "s"`, `re.search/match/fullmatch(p, str(e)[, flags])`.
@@ -28,3 +28,13 @@ that passes iff it iterates at least once (zero iterations or an unevaluable ite
 Assertions in the body get IDs `tests.py:<line>:<i>` (nested: `tests.py:<line>:<outer>:<inner>`) and must each
 trace to exactly one entrypoint call. `*args`/`**kwargs` unpacking of constants, constant `if`, `break`/`continue`
 are supported.
+
+Discovery: every `.py` file under `<tests_dir>` (recursively; hidden dirs, `__pycache__` and the generated
+`tester.*` at the root are skipped) is parsed. Test IDs are `<relative/path.py>:<line>` (`#k` for several on one
+line). Non-`.py` files with test-like names (`test*`, `*_test`, `tests`, `*_tests`) or no tests at all are
+discovery errors.
+
+Mutation-style tests: `f(a)` (statement) or `r = f(a)` immediately followed by asserts; inside that assert block,
+names passed to the call refer to the arguments after the call (each assert re-runs the call on fresh copies).
+For the statement form, it must be followed by at least one assert, and every assert must reference a passed
+variable and must not call the entrypoint; otherwise discovery fails.
