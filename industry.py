@@ -429,6 +429,243 @@ def cmd_invention(args):
     return 0
 
 
+# ---------------------------------------------------------------- plan
+from fractions import Fraction
+
+
+def load_config(path):
+    data = None
+    try:
+        import yaml  # optional
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except ImportError:
+        data = {}
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].rstrip()
+                if not line.strip() or ":" not in line:
+                    continue
+                k, _, v = line.partition(":")
+                data[k.strip().strip("'\"")] = v.strip().strip("'\"")
+    te_bonus = to_int(data.get("te_bonus", 0), None)
+    skill = to_int(data.get("invention_skill", 5), None)
+    if te_bonus is None or not 0 <= te_bonus <= 30:
+        raise ValueError("te_bonus must be an integer in [0, 30]")
+    if skill is None or not 1 <= skill <= 5:
+        raise ValueError("invention_skill must be an integer in [1, 5]")
+    return {"te_bonus": te_bonus, "invention_skill": skill}
+
+
+def is_int_token(t):
+    return t.isdigit()
+
+
+def ceil_div(a, b):
+    return -(-a // b)
+
+
+class Planner:
+    def __init__(self, sde):
+        self.sde = sde
+        self._inv = None
+        self.decryptors = {d[0]: d for d in DECRYPTORS}
+
+    @property
+    def inv(self):
+        if self._inv is None:
+            self._inv = InventionData(self.sde)
+        return self._inv
+
+    def product_recipe(self, name):
+        tid = self.sde.name_to_id.get(name)
+        if tid is None:
+            return None
+        if tid in self.sde.bp_products:
+            rec = self.sde.recipe_for_blueprint(tid)
+            if rec is not None:
+                return rec
+        return self.sde.recipe_for_product(tid)
+
+    def relic_names(self):
+        names = {}
+        for bp, srcs in self.inv.sources.items():
+            for s, _a, _r in srcs:
+                n = self.sde.types.get(s, {}).get("typeName")
+                if n and relic_quality(n) is not None and s not in self.sde.bp_products:
+                    names[n] = s
+        return names
+
+    def parse(self, build):
+        tokens = build.split()
+        jobs = 1
+        if tokens and len(tokens[-1]) > 1 and tokens[-1][0] in "xX" \
+                and tokens[-1][1:].isdigit():
+            jobs = int(tokens[-1][1:])
+            tokens = tokens[:-1]
+        if not tokens:
+            raise ValueError("empty build string")
+        text = " ".join(tokens)
+        cands = []
+        dec_names = sorted(self.decryptors, key=len, reverse=True)
+
+        def dec_split(s):
+            for d in dec_names:
+                if s == d or s.endswith(" " + d):
+                    rest = s[:len(s) - len(d)].rstrip()
+                    yield d, rest
+        # Reverse engineering: name runs decryptor relic
+        if len(tokens) >= 4:
+            relics = self.relic_names()
+            for rname in sorted(relics, key=len, reverse=True):
+                if text.endswith(" " + rname):
+                    before = text[:len(text) - len(rname)].rstrip()
+                    for d, rest in dec_split(before):
+                        rt = rest.split()
+                        if len(rt) >= 2 and is_int_token(rt[-1]):
+                            cands.append(dict(kind="re", name=" ".join(rt[:-1]),
+                                              runs=int(rt[-1]), decryptor=d,
+                                              relic=relics[rname]))
+        # Invention: name runs decryptor
+        for d, rest in dec_split(text):
+            rt = rest.split()
+            if len(rt) >= 2 and is_int_token(rt[-1]):
+                cands.append(dict(kind="invent", name=" ".join(rt[:-1]),
+                                  runs=int(rt[-1]), decryptor=d))
+        # Normal: name runs me te
+        if len(tokens) >= 4 and all(is_int_token(t) for t in tokens[-3:]):
+            cands.append(dict(kind="normal", name=" ".join(tokens[:-3]),
+                              runs=int(tokens[-3]), me=int(tokens[-2]),
+                              te=int(tokens[-1])))
+        # Item: name runs
+        if len(tokens) >= 2 and is_int_token(tokens[-1]):
+            cands.append(dict(kind="item", name=" ".join(tokens[:-1]),
+                              runs=int(tokens[-1]), me=0, te=0))
+        cands.append(dict(kind="item", name=text, runs=1, me=0, te=0))
+        for c in cands:
+            rec = self.product_recipe(c["name"])
+            if rec is not None:
+                c["recipe"] = rec
+                c["jobs"] = jobs
+                return c
+        raise ValueError(f"could not resolve build string '{build}'")
+
+    def invention_source(self, bp, relic=None):
+        srcs = self.inv.sources.get(bp, [])
+        if relic is not None:
+            for s in srcs:
+                if s[0] == relic:
+                    return s
+            return None
+        pub = [s for s in srcs if self.sde.published(s[0])] or srcs
+        norm = [s for s in pub if s[0] in self.sde.bp_products] or pub
+        if not norm:
+            return None
+        return min(norm, key=lambda s: (0 if s[1] == INVENTION else 1, s[0]))
+
+    def plan(self, spec, config):
+        sde = self.sde
+        bp, act, prod, qty = spec["recipe"]
+        runs, jobs = spec["runs"], spec["jobs"]
+        buy = {}
+
+        def add(tid, n):
+            if n:
+                buy[tid] = buy.get(tid, 0) + n
+
+        if spec["kind"] in ("invent", "re"):
+            relic = spec.get("relic")
+            src = self.invention_source(bp, relic)
+            if src is None:
+                raise ValueError(f"'{spec['name']}' cannot be invented"
+                                 + (" from that relic" if relic else ""))
+            s_id, s_act, s_runs = src
+            _dn, mult, druns, dme, dte = self.decryptors[spec["decryptor"]]
+            q = relic_quality(sde.types.get(s_id, {}).get("typeName", "")) \
+                if s_id not in sde.bp_products else None
+            if q is not None:
+                _qn, base_f, base_runs = RELIC_QUALITIES[q]
+                base = Fraction(str(base_f))
+            else:
+                raw = self.inv.probs.get((s_id, s_act, bp))
+                base = Fraction(str(raw)) if raw not in (None, "", "None") else Fraction(0)
+                base_runs = s_runs
+            skill_ids = self.inv.skills.get((s_id, s_act), [])
+            tn = lambda i: sde.types[i]["typeName"] if i in sde.types else ""
+            n_enc = sum(1 for s in skill_ids if "Encryption" in tn(s))
+            n_sci = len(skill_ids) - n_enc
+            lvl = config["invention_skill"]
+            p = base * (1 + n_sci * Fraction(lvl, 30) + n_enc * Fraction(lvl, 40)) \
+                * (1 + Fraction(mult, 100))
+            p = min(Fraction(1), max(Fraction(0), p))
+            if p <= 0:
+                raise ValueError("invention probability is zero")
+            bp_runs = max(1, base_runs + druns)
+            me, te = BASE_ME + dme, BASE_TE + dte
+            if runs <= bp_runs:
+                n_bps = ceil_div(jobs, bp_runs // runs)
+            else:
+                n_bps = jobs * ceil_div(runs, bp_runs)
+            attempts = math.ceil(Fraction(n_bps) / p)
+            for mid, mq in sde.materials.get((s_id, s_act), []):
+                add(mid, mq * attempts)
+            if q is not None:
+                add(s_id, attempts)
+            if spec["decryptor"] != "None":
+                did = sde.name_to_id.get(spec["decryptor"])
+                if did is not None:
+                    add(did, attempts)
+        else:
+            me, te = spec["me"], spec["te"]
+        if act != MANUFACTURING:
+            me, te = 0, 0
+        for mid, mq in sde.materials.get((bp, act), []):
+            per_job = max(runs, ceil_div(mq * runs * (100 - me), 100))
+            add(mid, per_job * jobs)
+        seconds = Fraction(sde.times.get((bp, act), 0) * runs) \
+            * Fraction(100 - te, 100) * Fraction(100 - config["te_bonus"], 100)
+        days = round(float(seconds / 86400), 2)
+        job_rows = [(sde.types[bp]["typeName"] if bp in sde.types else str(bp),
+                     runs, days, jobs)]
+        mat_rows = []
+        for tid, n in buy.items():
+            name = sde.types[tid]["typeName"] if tid in sde.types else str(tid)
+            vol = Decimal(sde.volume(tid)) if tid in sde.types else Decimal(0)
+            bv = float(round(vol * n, 2))
+            mat_rows.append((name, n, bv, 0, 0))
+        mat_rows.sort(key=lambda r: r[0])
+        job_rows.sort(key=lambda r: (r[0], r[1], r[3], r[2]))
+        return mat_rows, job_rows
+
+
+def cmd_plan(args):
+    try:
+        config = load_config(args.config)
+    except (OSError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    sde = SDE(args.sde)
+    planner = Planner(sde)
+    try:
+        spec = planner.parse(args.build)
+        mats, jobs = planner.plan(spec, config)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    os.makedirs(args.output, exist_ok=True)
+    with open(os.path.join(args.output, "materials.csv"), "w",
+              newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["name", "to_buy", "buy_volume", "start_amount", "end_amount"])
+        w.writerows(mats)
+    with open(os.path.join(args.output, "jobs.csv"), "w",
+              newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["name", "runs", "days", "count"])
+        w.writerows(jobs)
+    return 0
+
+
 def skill_level(v):
     try:
         n = int(v)
@@ -475,7 +712,15 @@ def main(argv=None):
     i.add_argument("name", nargs="+")
     i.add_argument("--sde", required=True)
     i.add_argument("--skill", type=skill_level, default=5)
+    pl = sub.add_parser("plan", help="Create a build plan")
+    pl.add_argument("build", nargs="+")
+    pl.add_argument("--config", required=True)
+    pl.add_argument("--sde", required=True)
+    pl.add_argument("--output", required=True)
     args = p.parse_args(argv)
+    if args.command == "plan":
+        args.build = " ".join(args.build)
+        return cmd_plan(args)
     if args.command == "invention":
         args.name = " ".join(args.name)
         return cmd_invention(args)
