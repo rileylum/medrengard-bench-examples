@@ -11,9 +11,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
+
 SOURCES = ("default", "env", "file", "primary-store", "secondary-store", "arg")
 STORE_TIMEOUT = 10
-TYPES = ("string", "integer", "float", "boolean")
+TYPES = ("string", "integer", "float", "boolean", "duration", "pattern",
+         "map", "list", "redacted")
 CUSTOM_TYPES = ("port",)
 ALL_TYPES = TYPES + CUSTOM_TYPES
 
@@ -32,14 +36,77 @@ _TRUE = {"true", "t", "yes", "y", "on", "1"}
 _FALSE = {"false", "f", "no", "n", "off", "0"}
 
 
+_DURATION_RE = re.compile(r"^(?:[0-9]+[hms])+$")
+_DURATION_PART_RE = re.compile(r"([0-9]+)([hms])")
+_DURATION_MULT = {"h": 3600, "m": 60, "s": 1}
+REDACTED_MASK = "<masked>"
+
+
+def parse_duration_value(raw):
+    s = raw.strip()
+    if not _DURATION_RE.match(s):
+        raise ParseFailure("invalid duration %r: expected one or more "
+                           "integer-unit pairs with units h, m, s" % raw)
+    total = 0
+    for num, unit in _DURATION_PART_RE.findall(s):
+        total += int(num) * _DURATION_MULT[unit]
+    return total
+
+
+def format_duration(seconds):
+    if seconds == 0:
+        return "0s"
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    out = ""
+    if h:
+        out += "%dh" % h
+    if m:
+        out += "%dm" % m
+    if sec:
+        out += "%ds" % sec
+    return out
+
+
+def format_float(v):
+    text = "%.6f" % v
+    if text.startswith("-") and float(text) == 0:
+        text = text[1:]
+    return text
+
+
 def parse_value(typ, raw):
-    if typ == "string":
+    """Parse a raw source string into the type-native value."""
+    if typ in ("string", "redacted"):
         return raw
+    if typ == "pattern":
+        try:
+            re.compile(raw)
+        except (re.error, RecursionError, OverflowError, ValueError) as exc:
+            raise ParseFailure("invalid pattern %r: %s" % (raw, exc))
+        return raw
+    if typ == "list":
+        if raw == "":
+            return []
+        return raw.split(",")
+    if typ == "map":
+        result = {}
+        if raw == "":
+            return result
+        for seg in raw.split(","):
+            if ":" not in seg:
+                raise ParseFailure("invalid map entry %r in %r: missing ':'"
+                                   % (seg, raw))
+            k, v = seg.split(":", 1)
+            result[k] = v
+        return result
+    if typ == "duration":
+        return parse_duration_value(raw)
     s = raw.strip()
     if typ == "integer":
         if not _INT_RE.match(s):
             raise ParseFailure("invalid integer %r" % raw)
-        return str(int(s))
+        return int(s)
     if typ == "float":
         if not _FLOAT_RE.match(s):
             raise ParseFailure("invalid float %r" % raw)
@@ -51,13 +118,13 @@ def parse_value(typ, raw):
             raise ParseFailure("float out of range %r" % raw)
         if v == 0:
             v = 0.0
-        return repr(v)
+        return v
     if typ == "boolean":
         low = s.lower()
         if low in _TRUE:
-            return "true"
+            return True
         if low in _FALSE:
-            return "false"
+            return False
         raise ParseFailure("invalid boolean %r" % raw)
     if typ == "port":
         if not _INT_RE.match(s):
@@ -65,8 +132,65 @@ def parse_value(typ, raw):
         v = int(s)
         if v < 0 or v > 65535:
             raise ParseFailure("invalid port %r: out of range 0-65535" % raw)
-        return str(v)
+        return v
     raise ParseFailure("unknown type %r" % typ)
+
+
+def render(typ, value):
+    """String representation of a resolved value (used by change events)."""
+    if value is None:
+        return ""
+    if typ == "redacted":
+        return REDACTED_MASK
+    if typ == "float":
+        return format_float(value)
+    if typ == "boolean":
+        return "true" if value else "false"
+    if typ in ("integer", "port"):
+        return str(value)
+    if typ == "duration":
+        return format_duration(value)
+    if typ == "map":
+        return ",".join("%s:%s" % (k, value[k]) for k in sorted(value))
+    if typ == "list":
+        return ",".join(value)
+    return value
+
+
+class RawJSON:
+    """Pre-serialized JSON fragment."""
+
+    def __init__(self, text):
+        self.text = text
+
+
+def to_json_value(typ, value):
+    """Type-native JSON value for resolved configuration output."""
+    if typ == "redacted":
+        return REDACTED_MASK
+    if typ == "float":
+        return RawJSON(format_float(value))
+    if typ == "integer":
+        return RawJSON(str(int(value)))
+    if typ == "boolean":
+        return bool(value)
+    if typ == "duration":
+        return format_duration(value)
+    if typ == "port":
+        return str(value)
+    if typ == "map":
+        return {str(k): str(v) for k, v in value.items()}
+    if typ == "list":
+        return [str(x) for x in value]
+    return value
+
+
+def changed(typ, before, after):
+    if typ == "redacted":
+        return before != after
+    if (before is None) != (after is None):
+        return True
+    return render(typ, before) != render(typ, after)
 
 
 def _no_dupes(pairs):
@@ -364,15 +488,6 @@ class Param:
         return value
 
 
-def render(typ, value):
-    """String representation of a resolved value for change events."""
-    if value is None:
-        return ""
-    if typ == "float":
-        return "%.6f" % float(value)
-    return value
-
-
 def lookup(src, key, args, store):
     if src == "default":
         return key
@@ -421,13 +536,19 @@ def seed(params, args, stores):
 
 
 def build_output(schema, states):
-    out = _skeleton(schema)
-    for st in states:
-        node = out
-        for part in st.path[:-1]:
-            node = node[part]
-        node[st.path[-1]] = st.effective()
-    return out
+    values = {st.path: to_json_value(st.type, st.effective()) for st in states}
+
+    def walk(group, prefix):
+        out = {}
+        for name, entry in group.items():
+            path = prefix + (name,)
+            if is_param(entry):
+                out[name] = values[path]
+            else:
+                out[name] = walk(entry, path)
+        return out
+
+    return walk(schema, ())
 
 
 def resolve(schema, params, args, store=None, secondary=None):
@@ -444,7 +565,18 @@ def _skeleton(group):
 
 
 def dumps(obj):
-    return json.dumps(obj, separators=(",", ":"))
+    if isinstance(obj, RawJSON):
+        return obj.text
+    if isinstance(obj, dict):
+        return "{" + ",".join(json.dumps(str(k)) + ":" + dumps(v)
+                              for k, v in obj.items()) + "}"
+    if isinstance(obj, (list, tuple)):
+        return "[" + ",".join(dumps(v) for v in obj) + "]"
+    if isinstance(obj, float):
+        return format_float(obj)
+    if isinstance(obj, int) and not isinstance(obj, bool):
+        return str(obj)
+    return json.dumps(obj)
 
 
 _DUR_RE = re.compile(r"([0-9]*\.?[0-9]+)(ns|us|µs|ms|s|m|h)")
@@ -508,7 +640,7 @@ class Watcher:
         before = st.effective()
         st.layers[src] = value
         after = st.effective()
-        if before != after:
+        if changed(st.type, before, after):
             self.emit(st, render(st.type, before), render(st.type, after))
         elif force_event:
             self.emit(st, "", render(st.type, after))
