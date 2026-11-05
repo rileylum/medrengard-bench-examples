@@ -31,12 +31,13 @@ NUMBER_RE = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
 
 
 class Tok:
-    __slots__ = ("kind", "value", "pos")
+    __slots__ = ("kind", "value", "pos", "end")
 
     def __init__(self, kind, value, pos):
         self.kind = kind  # IDENT, KW, STRING, NUMBER, OP, COMMA, DOT, LPAREN, RPAREN, STAR, EOF
         self.value = value
         self.pos = pos
+        self.end = None
 
     def __repr__(self):
         return "Tok(%s,%r,%d)" % (self.kind, self.value, self.pos)
@@ -55,6 +56,8 @@ def tokenize(src):
     i = 0
     n = len(src)
     while i < n:
+        if toks and toks[-1].end is None:
+            toks[-1].end = i
         c = src[i]
         if c.isspace():
             i += 1
@@ -126,13 +129,18 @@ def tokenize(src):
                 continue
             fail("E_PARSE", "unexpected character ':'", start)
         single = {",": "COMMA", ".": "DOT", "(": "LPAREN", ")": "RPAREN", "*": "STAR",
-                  "|": "PIPE", "{": "LBRACE", "}": "RBRACE"}
+                  "|": "PIPE", "{": "LBRACE", "}": "RBRACE",
+                  "[": "LBRACK", "]": "RBRACK"}
         if c in single:
             toks.append(Tok(single[c], c, start))
             i += 1
             continue
         fail("E_PARSE", "unexpected character %r" % c, start)
-    toks.append(Tok("EOF", None, n))
+    if toks and toks[-1].end is None:
+        toks[-1].end = n
+    eof = Tok("EOF", None, n)
+    eof.end = n
+    toks.append(eof)
     return toks
 
 
@@ -140,6 +148,7 @@ def tokenize(src):
 
 class Parser:
     def __init__(self, src):
+        self.src = src
         self.toks = tokenize(src)
         self.i = 0
 
@@ -162,7 +171,7 @@ class Parser:
             fail("E_PARSE", "expected %s but found %s" % (word, describe(t)), t.pos)
         return self.advance()
 
-    def parse_query(self):
+    def parse_query(self, nested=False):
         self.expect_kw("SELECT")
         select = self.parse_select_list()
         self.expect_kw("FROM")
@@ -171,7 +180,7 @@ class Parser:
             self.advance()
             source = (t.value, t.pos)
         elif t.kind == "KW":
-            fail("E_UNKNOWN_TABLE", "unknown table %r" % t.value, t.pos)
+            fail("E_SEMANTIC", "unknown table %r" % t.value, t.pos)
         else:
             fail("E_PARSE", "expected table name but found %s" % describe(t), t.pos)
         where = None
@@ -210,7 +219,7 @@ class Parser:
                     continue
                 break
         t = self.peek()
-        if t.kind != "EOF":
+        if t.kind != "EOF" and not (nested and t.kind in ("RPAREN", "RBRACK")):
             fail("E_PARSE", "unexpected %s" % describe(t), t.pos)
         return {"select": select, "source": source, "where": where, "gloss": gloss,
                 "conflates": conflates, "group": group}
@@ -328,11 +337,17 @@ class Parser:
             self.i += 3
             return {"kind": "astar", "source": t.value, "pos": t.pos,
                     "key": t.value + ".*", "alias": None}
-        if nxt is not None and nxt.kind == "LPAREN":
+        if self.at_pocket():
+            v = self.parse_value()
+            item = {"kind": "subq", "q": v[1], "key": v[3], "pos": t.pos}
+        elif nxt is not None and nxt.kind == "LPAREN":
             item = self.parse_agg_call()
         else:
-            path = self.parse_field_ref()
-            item = {"kind": "field", "path": path, "key": ".".join(path), "pos": t.pos}
+            v = self.parse_value()
+            if v[0] == "LIT":
+                item = {"kind": "lit", "value": v[1][1], "key": v[3], "pos": t.pos}
+            else:
+                item = {"kind": "field", "path": v[1], "key": v[3], "pos": t.pos}
         item["alias"] = None
         if self.is_word("AS"):
             self.advance()
@@ -413,16 +428,70 @@ class Parser:
             return e
         return self.parse_predicate()
 
+    def at_pocket(self, offset=0):
+        t = self.toks[min(self.i + offset, len(self.toks) - 1)]
+        if not (t.kind == "IDENT" and t.value.upper() == "POCKET"):
+            return False
+        nxt = self.toks[min(self.i + offset + 1, len(self.toks) - 1)]
+        return nxt.kind in ("LPAREN", "LBRACK")
+
+    def parse_subquery(self):
+        """POCKET ( query ) or POCKET [ query ]; returns (kind, query, text)."""
+        self.advance()  # POCKET
+        opener = self.advance()
+        closer = "RPAREN" if opener.kind == "LPAREN" else "RBRACK"
+        inner_start = self.peek().pos
+        q = self.parse_query(nested=True)
+        t = self.peek()
+        if t.kind != closer:
+            fail("E_PARSE", "expected %r to close POCKET but found %s"
+                 % (")" if closer == "RPAREN" else "]", describe(t)), t.pos)
+        text = self.src[inner_start:t.pos].strip()
+        self.advance()
+        return ("scalar" if closer == "RPAREN" else "table"), q, text
+
+    def parse_table_subquery(self, after):
+        t = self.peek()
+        if not (self.at_pocket() and self.toks[self.i + 1].kind == "LBRACK"):
+            fail("E_PARSE", "expected POCKET[<query>] after %s but found %s"
+                 % (after, describe(t)), t.pos)
+        return self.parse_subquery()[1]
+
+    def parse_value(self):
+        t = self.peek()
+        if self.at_pocket():
+            if self.toks[self.i + 1].kind == "LBRACK":
+                fail("E_PARSE", "table subquery POCKET[...] is only allowed after BEHOLDS, "
+                     "AMONGST, EITHERWISE or EVERYWISE", t.pos)
+            _, q, text = self.parse_subquery()
+            return ("SUBQ", q, t.pos, text)
+        if t.kind in ("NUMBER", "STRING") or (t.kind == "KW" and t.value in
+                                               ("TRUE", "FALSE", "NULL")):
+            lit = self.parse_literal()
+            return ("LIT", lit, t.pos, self.src[t.pos:t.end])
+        path = self.parse_field_ref()
+        return ("REF", path, t.pos, ".".join(path))
+
     def parse_predicate(self):
         ppos = self.peek().pos
-        path = self.parse_field_ref()
+        if self.is_word("BEHOLDS") and self.at_pocket(1):
+            self.advance()
+            return ("EXISTS", self.parse_table_subquery("BEHOLDS"), ppos)
+        left = self.parse_value()
+        if self.is_word("AMONGST"):
+            self.advance()
+            return ("IN", left, self.parse_table_subquery("AMONGST"), ppos)
         t = self.peek()
         if t.kind != "OP":
             fail("E_PARSE", "expected comparison operator but found %s" % describe(t), t.pos)
         self.advance()
         op = t.value
-        lit = self.parse_literal()
-        return ("CMP", path, op, lit, ppos)
+        for word, mode in (("EITHERWISE", "ANY"), ("EVERYWISE", "ALL")):
+            if self.is_word(word) and self.at_pocket(1):
+                self.advance()
+                return (mode, left, op, self.parse_table_subquery(word), ppos)
+        right = self.parse_value()
+        return ("CMP", left, op, right, ppos)
 
     def parse_literal(self):
         lt = self.peek()
@@ -466,49 +535,79 @@ def type_of(v):
     return "complex"
 
 
-def compare(value, op, lit):
-    ltype, lval = lit
-    vtype = type_of(value)
-    if ltype == "null":
+def compare(a, op, b, null_literal=False):
+    """Compare two values. Equality is deep/structural (null equals null); ordered
+    operators apply to numbers and strings (lexicographic) of the same type only.
+    `x != NULL` (a literal NULL) holds for any non-null scalar x."""
+    ta, tb = type_of(a), type_of(b)
+    if ta == "null" or tb == "null":
         if op == "=":
-            return vtype == "null"
+            return ta == tb
         if op == "!=":
-            return vtype in ("bool", "number", "string")
+            if ta == tb:
+                return False
+            other = tb if ta == "null" else ta
+            return null_literal and other in ("bool", "number", "string")
         return False
-    if vtype != ltype:
-        return False
-    if vtype == "bool":
-        if op == "=":
-            return value == lval
-        if op == "!=":
-            return value != lval
+    if ta != tb:
         return False
     if op == "=":
-        return value == lval
+        return deep_key(a) == deep_key(b)
     if op == "!=":
-        return value != lval
+        return deep_key(a) != deep_key(b)
+    if ta not in ("number", "string"):
+        return False
     if op == "<":
-        return value < lval
+        return a < b
     if op == "<=":
-        return value <= lval
+        return a <= b
     if op == ">":
-        return value > lval
+        return a > b
     if op == ">=":
-        return value >= lval
+        return a >= b
     return False
 
 
-def evaluate(expr, record):
+def eval_value(v, row):
+    kind = v[0]
+    if kind == "REF":
+        return resolve_ref(row, v[1])
+    if kind == "LIT":
+        return v[1]
+    return scalar_subquery(v[1], row)
+
+
+def evaluate(expr, row):
     kind = expr[0]
     if kind == "AND":
-        return evaluate(expr[1], record) and evaluate(expr[2], record)
+        return evaluate(expr[1], row) and evaluate(expr[2], row)
     if kind == "OR":
-        return evaluate(expr[1], record) or evaluate(expr[2], record)
-    _, ref, op, lit = expr
-    return compare(resolve_ref(record, ref), op, lit)
+        return evaluate(expr[1], row) or evaluate(expr[2], row)
+    if kind == "CMP":
+        _, lv, op, rv = expr
+        a = eval_value(lv, row)
+        b = eval_value(rv, row)
+        null_lit = ((lv[0] == "LIT" and lv[1] is None) or (rv[0] == "LIT" and rv[1] is None))
+        return compare(a, op, b, null_lit)
+    if kind == "EXISTS":
+        return len(run_subquery(expr[1], row)) > 0
+    if kind == "IN":
+        a = eval_value(expr[1], row)
+        k = deep_key(a)
+        return any(deep_key(x) == k for x in table_subquery(expr[2], row))
+    if kind == "ANY":
+        _, lv, op, sq = expr
+        a = eval_value(lv, row)
+        return any(compare(a, op, x) for x in table_subquery(sq, row))
+    if kind == "ALL":
+        _, lv, op, sq = expr
+        a = eval_value(lv, row)
+        return all(compare(a, op, x) for x in table_subquery(sq, row))
+    fail("E_RUNTIME", "unknown expression node %r" % (kind,))
 
 
 CANON_TAG = object()
+OUTER_TAG = object()
 
 
 class Canon:
@@ -521,7 +620,7 @@ class Canon:
         self.cands = cands  # list of bound (alias, path) refs
         self.default = default
         self.strict = strict
-        self.aliases = {c[0] for c in cands}
+        self.aliases = {c[0] for c in cands if c[0] is not OUTER_TAG}
 
     def value(self, row):
         """First non-null candidate (left to right); candidates whose alias is absent
@@ -547,10 +646,25 @@ def is_canon(ref):
     return ref is not None and ref[0] is CANON_TAG
 
 
+def is_outer(ref):
+    return ref is not None and ref[0] is OUTER_TAG
+
+
+def outer_record(ref):
+    """(OUTER_TAG, scope, alias, path): the enclosing query's current row."""
+    row = ref[1].row
+    if row is None:
+        return None
+    return row.get(ref[2])
+
+
 def resolve_ref(row, ref):
     """row maps alias -> record (or None when null-padded by an outer conflation)."""
     if ref[0] is CANON_TAG:
         return ref[1].value(row)
+    if ref[0] is OUTER_TAG:
+        rec = outer_record(ref)
+        return None if rec is None else resolve(rec, ref[3])
     rec = row.get(ref[0])
     if rec is None:
         return None
@@ -560,6 +674,9 @@ def resolve_ref(row, ref):
 def resolve_ref_present(row, ref):
     if ref[0] is CANON_TAG:
         return ref[1].value(row)
+    if ref[0] is OUTER_TAG:
+        rec = outer_record(ref)
+        return MISSING if rec is None else resolve_present(rec, ref[3])
     rec = row.get(ref[0])
     if rec is None:
         return MISSING
@@ -585,7 +702,7 @@ def load_records(path):
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        fail("E_INPUT", "log file is not valid UTF-8")
+        fail("E_IO", "log file is not valid UTF-8")
     if text.startswith("﻿"):
         text = text[1:]
     records = []
@@ -597,19 +714,52 @@ def load_records(path):
         try:
             obj = json.loads(line, parse_constant=_reject_constant)
         except ValueError as e:
-            fail("E_INPUT", "invalid JSON on line %d: %s" % (lineno, e))
+            fail("E_IO", "invalid JSON on line %d: %s" % (lineno, e))
         if not isinstance(obj, dict):
-            fail("E_INPUT", "line %d is not a JSON object" % lineno)
+            fail("E_IO", "line %d is not a JSON object" % lineno)
         records.append(obj)
     return records
 
 
 # ---------------------------------------------------------------- semantics
 
-def bind_query(q):
+class Scope:
+    """Binding scope of one (sub)query; `row` is the row currently being evaluated,
+    read by UPTREE references in nested queries."""
+
+    def __init__(self, aliases, parent):
+        self.aliases = aliases
+        self.parent = parent
+        self.row = None
+        self.correlated = False
+
+
+def enclosing_has(scope, alias):
+    s = scope.parent
+    while s is not None:
+        if alias in s.aliases:
+            return True
+        s = s.parent
+    return False
+
+
+def single_column(sq, pos, what):
+    sel = sq["select"]
+    if len(sel) != 1 or sel[0]["kind"] in ("star", "astar"):
+        fail("E_SEMANTIC", "%s must select exactly one column" % what, pos)
+
+
+def bind_query(q, sources, parent=None, used=None):
     """Resolve every field reference to (alias, subpath). Returns analysis info."""
     from_alias, from_pos = q["source"]
+    if from_alias not in sources:
+        fail("E_SEMANTIC", "unknown table %r; no source bound to that alias" % from_alias,
+             from_pos)
     conflates = q["conflates"]
+    for c in conflates:
+        name, pos = c["alias"]
+        if name not in sources:
+            fail("E_SEMANTIC", "unknown table %r; no source bound to that alias" % name, pos)
     multi = bool(conflates)
     aliases = [from_alias]
     for c in conflates:
@@ -617,10 +767,35 @@ def bind_query(q):
         if name in aliases:
             fail("E_SEMANTIC", "source alias %r used more than once" % name, pos)
         aliases.append(name)
+    if used is not None:
+        for al in aliases:
+            if al not in used:
+                used.append(al)
+    scope_obj = Scope(aliases, parent)
+    q["scope"] = scope_obj
 
     canons = {}
 
+    def bind_outer(path, pos):
+        if len(path) < 3:
+            fail("E_PARSE", "UPTREE reference must be UPTREE.<alias>.<field>", pos)
+        if parent is None:
+            fail("E_SEMANTIC", "UPTREE.%s used outside of a subquery" % path[1], pos)
+        s = parent
+        while s is not None and path[1] not in s.aliases:
+            s = s.parent
+        if s is None:
+            fail("E_SEMANTIC", "UPTREE.%s: alias %r is not bound in any enclosing query"
+                 % (path[1], path[1]), pos)
+        m = scope_obj
+        while m is not s:
+            m.correlated = True
+            m = m.parent
+        return (OUTER_TAG, s, path[1], tuple(path[2:]))
+
     def bind(path, pos, scope=None, canon_ok=True):
+        if len(path) >= 2 and path[0].upper() == "UPTREE" and path[0] not in aliases:
+            return bind_outer(path, pos)
         if len(path) >= 2 and path[0].upper() == "CANON" and path[0] not in aliases:
             if len(path) != 2:
                 fail("E_PARSE", "CANON reference must be CANON.<name>", pos)
@@ -630,6 +805,10 @@ def bind_query(q):
             if c is None:
                 fail("E_SEMANTIC", "undeclared canonical label CANON.%s" % path[1], pos)
             return (CANON_TAG, c)
+        if (parent is not None and len(path) >= 2 and path[0] not in aliases
+                and enclosing_has(scope_obj, path[0])):
+            fail("E_SEMANTIC", "%r refers to an enclosing query; use UPTREE.%s"
+                 % (".".join(path), ".".join(path)), pos)
         scope = aliases if scope is None else scope
         if not multi:
             if len(path) >= 2 and path[0] == from_alias:
@@ -653,26 +832,57 @@ def bind_query(q):
                      % d["name"], d["pos"])
             cands = []
             for path, pos in d["cands"]:
+                if len(path) >= 2 and path[0].upper() == "UPTREE" and path[0] not in aliases:
+                    cands.append(bind_outer(path, pos))
+                    continue
                 if len(path) < 2:
                     fail("E_SEMANTIC", "GLOSS candidate %r must be qualified with a source alias"
                          % ".".join(path), pos)
                 if path[0].upper() == "CANON" and path[0] not in aliases:
                     fail("E_SEMANTIC", "GLOSS candidate cannot reference CANON", pos)
                 if path[0] not in aliases:
+                    if parent is not None and enclosing_has(scope_obj, path[0]):
+                        fail("E_SEMANTIC", "%r refers to an enclosing query; use UPTREE.%s"
+                             % (".".join(path), ".".join(path)), pos)
                     fail("E_SEMANTIC", "unknown source alias %r in GLOSS candidate %r"
                          % (path[0], ".".join(path)), pos)
                 cands.append((path[0], tuple(path[1:])))
             canons[d["name"]] = Canon(d["name"], cands, d["default"], gloss["strict"])
 
-    def bind_expr(e):
-        if e[0] in ("AND", "OR"):
-            return (e[0], bind_expr(e[1]), bind_expr(e[2]))
-        _, path, op, lit, pos = e
-        ref = bind(path, pos)
-        if is_canon(ref) and any(a != from_alias for a in ref[1].aliases):
+    def bind_sub(sq, pos, what=None):
+        bind_query(sq, sources, scope_obj, used)
+        if what is not None:
+            single_column(sq, pos, what)
+        validate(sq)
+        return sq
+
+    def bind_value(v, in_where):
+        kind = v[0]
+        if kind == "LIT":
+            return ("LIT", v[1][1])
+        if kind == "SUBQ":
+            return ("SUBQ", bind_sub(v[1], v[2], "scalar subquery POCKET(...)"))
+        ref = bind(v[1], v[2])
+        if (in_where and is_canon(ref)
+                and any(a != from_alias for a in ref[1].aliases)):
             fail("E_SEMANTIC", "CANON.%s cannot be used in WHERE: not all candidates reference %r"
-                 % (ref[1].name, from_alias), pos)
-        return ("CMP", ref, op, lit)
+                 % (ref[1].name, from_alias), v[2])
+        return ("REF", ref)
+
+    def bind_expr(e):
+        k = e[0]
+        if k in ("AND", "OR"):
+            return (k, bind_expr(e[1]), bind_expr(e[2]))
+        if k == "CMP":
+            _, lv, op, rv, pos = e
+            return ("CMP", bind_value(lv, True), op, bind_value(rv, True))
+        if k == "EXISTS":
+            return ("EXISTS", bind_sub(e[1], e[2]))
+        if k == "IN":
+            _, lv, sq, pos = e
+            return ("IN", bind_value(lv, True), bind_sub(sq, pos, "table subquery POCKET[...]"))
+        _, lv, op, sq, pos = e  # ANY / ALL
+        return (k, bind_value(lv, True), op, bind_sub(sq, pos, "table subquery POCKET[...]"))
 
     select = q["select"]
     for it in select:
@@ -680,6 +890,8 @@ def bind_query(q):
             it["ref"] = bind(it["path"], it["pos"])
         elif it["kind"] == "agg":
             it["ref"] = bind(it["path"], it["argpos"]) if it["path"] is not None else None
+        elif it["kind"] == "subq":
+            bind_sub(it["q"], it["pos"], "scalar subquery POCKET(...)")
         elif it["kind"] == "astar":
             if it["source"] not in aliases:
                 fail("E_SEMANTIC", "unknown source alias %r in %s.*"
@@ -699,7 +911,8 @@ def bind_query(q):
         for (lp, lpos), (rp, rpos) in c["on"]:
             l = bind(lp, lpos, scope)
             r = bind(rp, rpos, scope)
-            if not is_canon(l) and not is_canon(r) and l[0] == r[0]:
+            if (not is_canon(l) and not is_canon(r) and not is_outer(l) and not is_outer(r)
+                    and l[0] == r[0]):
                 fail("E_SEMANTIC", "UPON predicate must compare two different aliases", lpos)
             on.append((l, r))
         c["on_b"] = on
@@ -709,6 +922,11 @@ def bind_query(q):
 
 def validate(q):
     """Check selection rules; returns True when the query is an aggregation."""
+    q["is_agg"] = _validate(q)
+    return q["is_agg"]
+
+
+def _validate(q):
     select = q["select"]
     group = q["group_b"]
     multi = q["multi"]
@@ -735,7 +953,7 @@ def validate(q):
                 fail("E_SEMANTIC", "duplicate expansion %r in select list" % k, it["pos"])
             if (not multi and not aggs and group is None and it["alias"] is None
                     and prev["alias"] is None and prev["kind"] == "field"):
-                fail("E_DUPLICATE_FIELD", "duplicate field %r in select list" % k, it["pos"])
+                fail("E_SEMANTIC", "duplicate field %r in select list" % k, it["pos"])
             fail("E_SEMANTIC", "duplicate output key %r" % k, it["pos"])
         seen[k] = it
     if group is not None:
@@ -745,13 +963,13 @@ def validate(q):
                 fail("E_SEMANTIC", "duplicate field %r in GROUP BY" % ".".join(path), pos)
             gseen.add(ref)
         for it in select:
-            if it["kind"] == "field" and it["ref"] not in gseen:
+            if it["kind"] == "field" and it["ref"] not in gseen and not is_outer(it["ref"]):
                 fail("E_SEMANTIC", "field %r must appear in GROUP BY or be used in an aggregate"
                      % ".".join(it["path"]), it["pos"])
         return True
     if aggs:
         for it in select:
-            if it["kind"] == "field":
+            if it["kind"] == "field" and not is_outer(it["ref"]):
                 fail("E_SEMANTIC", "field %r must appear in GROUP BY or be used in an aggregate"
                      % ".".join(it["path"]), it["pos"])
         return True
@@ -887,7 +1105,7 @@ class Agg:
         return self.uniq
 
 
-def aggregate(rows, select, group):
+def aggregate(rows, select, group, nested=False):
     group_refs = [ref for ref, _, _ in group] if group is not None else []
     agg_items = [it for it in select if it["kind"] == "agg"]
     groups = {}
@@ -903,26 +1121,35 @@ def aggregate(rows, select, group):
         gk = tuple(gk)
         state = groups.get(gk)
         if state is None:
-            state = (gk_vals, [Agg(it["func"], it["ref"]) for it in agg_items])
+            state = (gk_vals, [Agg(it["func"], it["ref"]) for it in agg_items], row)
             groups[gk] = state
             order.append(gk)
         for a in state[1]:
             a.add(row)
     if group is None and not order:
         order.append(())
-        groups[()] = ([], [Agg(it["func"], it["ref"]) for it in agg_items])
+        aggs = [Agg(it["func"], it["ref"]) for it in agg_items]
+        if nested:
+            # Spec examples 1 and 4 (Part 5): a global COUNT(*) inside a POCKET subquery
+            # whose input is empty yields 1 (the correlated row with no partner counts once).
+            for a in aggs:
+                if a.func == "COUNT" and a.path is None:
+                    a.count = 1
+        groups[()] = ([], aggs, {})
     index = {ref: i for i, ref in enumerate(group_refs)}
     out = []
     for gk in order:
-        vals, aggs = groups[gk]
+        vals, aggs, first = groups[gk]
         row = {}
         ai = 0
         for it in select:
             if it["kind"] == "agg":
                 row[it["key"]] = aggs[ai].result()
                 ai += 1
-            else:
+            elif it["kind"] == "field" and it["ref"] in index:
                 row[it["key"]] = vals[index[it["ref"]]]
+            else:
+                row[it["key"]] = eval_item(it, first)
         out.append(row)
     return out
 
@@ -1042,23 +1269,53 @@ def top_level_keys(records):
     return list(keys)
 
 
-def run(sources, query):
-    q = Parser(query).parse_query()
-    from_alias, from_pos = q["source"]
-    if from_alias not in sources:
-        fail("E_UNKNOWN_TABLE", "unknown table %r; no source bound to that alias" % from_alias,
-             from_pos)
-    for c in q["conflates"]:
-        name, pos = c["alias"]
-        if name not in sources:
-            fail("E_UNKNOWN_TABLE", "unknown table %r; no source bound to that alias" % name, pos)
-    bind_query(q)
-    is_agg = validate(q)
-    select = q["select"]
+DATA = {}
 
-    data = {}
-    for a in q["aliases"]:
-        data[a] = load_records(sources[a])
+
+def eval_item(it, row):
+    k = it["kind"]
+    if k == "lit":
+        return it["value"]
+    if k == "subq":
+        return scalar_subquery(it["q"], row)
+    return resolve_ref(row, it["ref"])
+
+
+def run_subquery(sq, row):
+    """Evaluate a nested query with the enclosing query's current row set to `row`."""
+    scope = sq["scope"]
+    if not scope.correlated and "cache" in sq:
+        return sq["cache"]
+    parent = scope.parent
+    saved = parent.row
+    parent.row = row
+    try:
+        result = execute(sq)
+    finally:
+        parent.row = saved
+    if not scope.correlated:
+        sq["cache"] = result
+    return result
+
+
+def scalar_subquery(sq, row):
+    rows = run_subquery(sq, row)
+    if not rows:
+        return None
+    if len(rows) > 1:
+        fail("E_RUNTIME", "scalar subquery POCKET(...) returned more than one row")
+    return next(iter(rows[0].values()))
+
+
+def table_subquery(sq, row):
+    return [next(iter(r.values())) for r in run_subquery(sq, row)]
+
+
+def execute(q):
+    from_alias = q["source"][0]
+    select = q["select"]
+    data = DATA
+    scope = q["scope"]
 
     rows = [{from_alias: rec} for rec in data[from_alias]]
     bound = [from_alias]
@@ -1071,8 +1328,8 @@ def run(sources, query):
     if where is not None:
         rows = [r for r in rows if evaluate(where, r)]
 
-    if is_agg:
-        return aggregate(rows, select, q["group_b"])
+    if q["is_agg"]:
+        return aggregate(rows, select, q["group_b"], scope.parent is not None)
 
     if select[0]["kind"] == "star":
         return [r[from_alias] for r in rows]
@@ -1087,25 +1344,35 @@ def run(sources, query):
                 if key in seen:
                     fail("E_SEMANTIC", "duplicate output key %r" % key, it["pos"])
                 seen.add(key)
-                plan.append((key, (it["source"], (k,))))
+                plan.append((key, {"kind": "field", "ref": (it["source"], (k,))}))
         else:
             if it["key"] in seen:
                 fail("E_SEMANTIC", "duplicate output key %r" % it["key"], it["pos"])
             seen.add(it["key"])
-            plan.append((it["key"], it["ref"]))
-    return [{key: resolve_ref(r, ref) for key, ref in plan} for r in rows]
+            plan.append((it["key"], it))
+    return [{key: eval_item(it, r) for key, it in plan} for r in rows]
+
+
+def run(sources, query):
+    q = Parser(query).parse_query()
+    used = []
+    bind_query(q, sources, None, used)
+    validate(q)
+    DATA.clear()
+    for a in used:
+        DATA[a] = load_records(sources[a])
+    return execute(q)
+
+
+CODE_MAP = {"E_ARGS": "E_PARSE", "E_UNKNOWN_TABLE": "E_SEMANTIC",
+            "E_DUPLICATE_FIELD": "E_SEMANTIC", "E_INPUT": "E_IO", "E_INTERNAL": "E_RUNTIME"}
 
 
 def emit_error(code, message, position=None):
-    if code == "E_RUNTIME":
-        # runtime errors use the flat shape shown in the Part 4 spec
-        sys.stderr.write(json.dumps({"error": message, "code": code}, ensure_ascii=False) + "\n")
-        sys.stderr.flush()
-        return
-    err = {"code": code, "message": message}
-    if position is not None:
-        err["position"] = position
-    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    code = CODE_MAP.get(code, code)
+    if not message.startswith("LOGQL_ERROR: "):
+        message = "LOGQL_ERROR: " + message
+    sys.stderr.write(json.dumps({"error": message, "code": code}, ensure_ascii=False) + "\n")
     sys.stderr.flush()
 
 
@@ -1182,7 +1449,7 @@ def main(argv=None):
         emit_error(e.code, e.message, e.position)
         return 1
     except RecursionError:
-        emit_error("E_PARSE", "query or input nested too deeply")
+        emit_error("E_RUNTIME", "query or input nested too deeply")
         return 1
     except Exception as e:  # pragma: no cover
         emit_error("E_INTERNAL", str(e))

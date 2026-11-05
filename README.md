@@ -1,12 +1,13 @@
-# LogQL (Parts 1–4)
+# LogQL (Parts 1–5)
 
 `python logql.py --log-file logs.ndjson --query 'SELECT service, COUNT(*) AS n, AVG(latency_ms) FROM logs WHERE x >= 1 GROUP BY service' [--output out.json]`
 
 `python logql.py --source a=a.ndjson --source b=b.ndjson --query 'SELECT a.*, b.status FROM a CONFLATE PRESERVING LEFT b UPON a.req = b.req'`
 
 No third-party dependencies (`requirements.txt` is empty); standard library only.
-Errors are written to stderr as `{"error": {"code": "...", "message": "...", "position": N?}}` with exit code 1.
-Codes: `E_ARGS`, `E_PARSE`, `E_UNKNOWN_TABLE`, `E_DUPLICATE_FIELD`, `E_SEMANTIC`, `E_IO`, `E_INPUT`.
+Errors are written to stderr as one line `{"error": "LOGQL_ERROR: <message>", "code": "<code>"}`
+with exit code 1 and nothing on stdout. Codes: `E_PARSE` (incl. CLI argument errors), `E_SEMANTIC`
+(incl. unknown tables, duplicate output keys), `E_IO` (missing/unreadable/invalid input files), `E_RUNTIME`.
 
 Part 2 adds `AS` aliases, `GROUP BY`, and aggregates `COUNT(*)`, `COUNT/SUM/AVG(AVERAGE)/MIN/MAX/UNIQUE(field)`.
 `AS`, `GROUP`, `BY` and function names are matched case-insensitively in context (not reserved words).
@@ -38,3 +39,18 @@ Part 4 adds `GLOSS [STRICT] { name := x.a | y.b ... [DEFAULT lit], ... }` and `C
   partner (left/right by position when both are mixed) and uses only the candidates visible on
   that side. Null matches null, as in Part 3.
 - `INTERSECTING` remains an inner join (Part 3 semantics); spec example 4 shows LEFT-join output for it.
+
+Part 5 adds nested queries: `POCKET(<query>)` (scalar, any value position incl. SELECT items and
+predicate sides), `POCKET[<query>]` (table, only after `BEHOLDS`, `AMONGST`, `<op> EITHERWISE`,
+`<op> EVERYWISE`), and `UPTREE.<alias>.<field>` correlation to the nearest enclosing query binding
+that alias. Predicates are now `<value> <op> <value>` (fields, CANON, literals, scalar subqueries).
+Notes:
+- Scalar/table subqueries (except under BEHOLDS) must select exactly one column (`E_SEMANTIC`).
+  A scalar subquery with no rows yields null; more than one row → `E_RUNTIME`.
+- Scalar POCKET without AS uses the inner query text (between the brackets, trimmed) as its key.
+- Following spec examples 1 and 4, a global `COUNT(*)` inside a subquery over zero rows yields 1.
+- Referencing an enclosing alias without `UPTREE` inside a subquery → `E_SEMANTIC`; `UPTREE` at top
+  level or to an unbound alias → `E_SEMANTIC`. GLOSS labels are local to their (sub)query.
+- `=`/`!=`/AMONGST use deep equality (null = null); ordered ops apply to same-typed numbers/strings.
+  EITHERWISE over empty → false, EVERYWISE over empty → true. Uncorrelated subqueries are cached.
+- In grouped queries, non-aggregated subquery items are evaluated against the group's first row.
