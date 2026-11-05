@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """ETL pipeline specification parser / validator / normalizer."""
 import json
+import re
 import sys
 
-SUPPORTED_OPS = ("select", "filter", "map", "rename", "limit", "branch")
+SUPPORTED_OPS = ("select", "filter", "map", "rename", "limit", "branch", "call")
+NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PARAMS_WORD = "params"
 
 
 class ETLError(Exception):
@@ -70,6 +73,25 @@ def tokenize(src):
                 j += 1
             word = src[i:j]
             low = word.lower()
+            if word == PARAMS_WORD:
+                k = j
+                while k < n and src[k].isspace():
+                    k += 1
+                if k < n and src[k] == ".":
+                    k += 1
+                    while k < n and src[k].isspace():
+                        k += 1
+                    m = k
+                    while m < n and (src[m].isalnum() or src[m] == "_"):
+                        m += 1
+                    if m == k or src[k].isdigit():
+                        raise ValueError("expected parameter name after 'params.' "
+                                         "at position %d" % i)
+                    tokens.append(("param", src[k:m], i))
+                    i = m
+                    continue
+                raise ValueError("'params' is reserved; use params.<name> "
+                                 "at position %d" % i)
             if low in KEYWORDS:
                 tokens.append((low, word, i))
             elif low in LITERAL_WORDS:
@@ -255,6 +277,9 @@ class Parser:
             self.advance()
             self.idents.append(t[1])
             return ("ident", t[1])
+        if kind == "param":
+            self.advance()
+            return ("param", t[1])
         if kind == "op" and t[1] == "(":
             self.advance()
             node = self.parse_or()
@@ -322,20 +347,22 @@ def same_kind(a, b):
     return type(a) is type(b)
 
 
-def evaluate(node, row):
+def evaluate(node, row, params=None):
     kind = node[0]
     if kind == "lit":
         return node[1]
     if kind == "ident":
         return row.get(node[1])
+    if kind == "param":
+        return (params or {}).get(node[1])
     if kind == "and":
-        return truthy(evaluate(node[1], row)) and truthy(evaluate(node[2], row))
+        return truthy(evaluate(node[1], row, params)) and truthy(evaluate(node[2], row, params))
     if kind == "or":
-        return truthy(evaluate(node[1], row)) or truthy(evaluate(node[2], row))
+        return truthy(evaluate(node[1], row, params)) or truthy(evaluate(node[2], row, params))
     if kind == "not":
-        return not truthy(evaluate(node[1], row))
+        return not truthy(evaluate(node[1], row, params))
     if kind in ("neg", "pos"):
-        v = evaluate(node[1], row)
+        v = evaluate(node[1], row, params)
         if v is None:
             return None
         if not is_number(v):
@@ -344,8 +371,8 @@ def evaluate(node, row):
         return tidy_number(-v if kind == "neg" else v)
     if kind == "arith":
         op = node[1]
-        a = evaluate(node[2], row)
-        b = evaluate(node[3], row)
+        a = evaluate(node[2], row, params)
+        b = evaluate(node[3], row, params)
         if a is None or b is None:
             return None
         if op == "+" and isinstance(a, str) and isinstance(b, str):
@@ -369,8 +396,8 @@ def evaluate(node, row):
         return tidy_number(r)
     if kind == "cmp":
         op = node[1]
-        a = evaluate(node[2], row)
-        b = evaluate(node[3], row)
+        a = evaluate(node[2], row, params)
+        b = evaluate(node[3], row, params)
         if a is None or b is None:
             return False
         if not same_kind(a, b):
@@ -430,16 +457,80 @@ def check_idents(idents, known, fpath):
             raise ETLError("MISSING_COLUMN", "unknown column '%s'" % name, fpath)
 
 
-def normalize_steps(steps, base, known):
+class DefsContext:
+    """Holds top-level definitions while validating / expanding calls."""
+
+    def __init__(self, defs):
+        self.defs = defs          # name -> raw def object (already shape-checked)
+        self.stack = []           # names of defs currently being expanded
+        self.normalized = {}      # name -> normalized steps (validated, acyclic)
+        self.normalized_known = {}  # name -> known columns after def (from None)
+
+    def def_path(self, name):
+        return "defs[%s].steps" % name
+
+
+def is_param_value(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return True
+    if isinstance(v, list):
+        return all(is_param_value(x) for x in v)
+    return False
+
+
+def normalize_call(step, path, known, ctx):
+    npath = path + ".name"
+    if "name" not in step:
+        raise schema_err("missing required field 'name'", npath)
+    name = step["name"]
+    if not isinstance(name, str):
+        raise schema_err("field 'name' must be a string, got %s" % type_name(name), npath)
+    name = name.strip()
+    if not NAME_RE.match(name):
+        raise schema_err("field 'name' must match ^[A-Za-z_][A-Za-z0-9_]*$", npath)
+    params = step.get("params")
+    ppath = path + ".params"
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise schema_err("field 'params' must be an object, got %s" % type_name(params), ppath)
+    for k, v in params.items():
+        if not is_param_value(v):
+            raise schema_err("param '%s' must be a JSON scalar or array (no nested objects)"
+                             % k,
+                             "%s.%s" % (ppath, k))
+    if ctx is None or name not in ctx.defs:
+        raise ETLError("UNKNOWN_DEF", "unknown definition '%s'" % name, npath)
+    if name in ctx.stack:
+        raise ETLError("RECURSION_FORBIDDEN",
+                       "recursive call to '%s' (%s)" % (name, " -> ".join(ctx.stack + [name])),
+                       npath)
+    if known is not None or name not in ctx.normalized:
+        known_in = known
+        ctx.stack.append(name)
+        try:
+            sub, known = normalize_steps(ctx.defs[name]["steps"], ctx.def_path(name),
+                                         known, ctx)
+        finally:
+            ctx.stack.pop()
+        if known_in is None and name not in ctx.normalized:
+            ctx.normalized[name] = sub
+            ctx.normalized_known[name] = known
+    else:
+        known = ctx.normalized_known.get(name)
+    return {"name": name, "params": dict(params)}, known
+
+
+def normalize_steps(steps, base, known, ctx=None):
     """Normalize a list of steps located at path `base` (e.g. 'pipeline.steps')."""
     out = []
     for i, step in enumerate(steps):
-        ns, known = normalize_step(step, "%s[%d]" % (base, i), known)
+        ns, known = normalize_step(step, "%s[%d]" % (base, i), known, ctx)
         out.append(ns)
     return out, known
 
 
-def normalize_branch(step, path, known):
+def normalize_branch(step, path, known, ctx=None):
     bpath = path + ".branches"
     if "branches" not in step:
         raise schema_err("missing required field 'branches'", bpath)
@@ -509,7 +600,7 @@ def normalize_branch(step, path, known):
                 raise expr_error(e, fpath)
             check_idents(idents, known, fpath)
         sub, sub_known = normalize_steps(br["steps"], jpath + ".steps",
-                                         None if known is None else set(known))
+                                         None if known is None else set(known), ctx)
         nb["steps"] = sub
         if result_known is not None:
             result_known.update(sub_known)
@@ -517,7 +608,7 @@ def normalize_branch(step, path, known):
     return {"branches": out_branches, "merge": {"strategy": strategy}}, result_known
 
 
-def normalize_step(step, path, known):
+def normalize_step(step, path, known, ctx=None):
     if not isinstance(step, dict):
         raise schema_err("step must be an object, got %s" % type_name(step), path)
     if "op" not in step:
@@ -534,7 +625,11 @@ def normalize_step(step, path, known):
     out = {"op": op}
 
     if op == "branch":
-        fields, known = normalize_branch(step, path, known)
+        fields, known = normalize_branch(step, path, known, ctx)
+        out.update(fields)
+
+    elif op == "call":
+        fields, known = normalize_call(step, path, known, ctx)
         out.update(fields)
 
     elif op == "select":
@@ -664,19 +759,51 @@ def validate_request(req):
         if not isinstance(row, dict):
             raise schema_err("dataset rows must be objects, got %s" % type_name(row),
                              "dataset[%d]" % j)
-    return steps, dataset
+    defs = req.get("defs")
+    if defs is None:
+        defs = {}
+    if not isinstance(defs, dict):
+        raise schema_err("'defs' must be an object, got %s" % type_name(defs), "defs")
+    for name, d in defs.items():
+        dpath = "defs[%s]" % name
+        if not isinstance(d, dict):
+            raise schema_err("definition must be an object, got %s" % type_name(d), dpath)
+        if "steps" not in d:
+            raise schema_err("missing required field 'steps'", dpath + ".steps")
+        if not isinstance(d["steps"], list):
+            raise schema_err("'steps' must be an array, got %s" % type_name(d["steps"]),
+                             dpath + ".steps")
+    return steps, dataset, defs
+
+
+def normalize_all(steps, defs, known):
+    """Normalize the main pipeline (expanding calls), then every definition."""
+    ctx = DefsContext(defs)
+    normalized, _ = normalize_steps(steps, "pipeline.steps", known, ctx)
+    for name in defs:
+        if name not in ctx.normalized:
+            ctx.stack.append(name)
+            try:
+                sub, _ = normalize_steps(defs[name]["steps"], ctx.def_path(name), None, ctx)
+            finally:
+                ctx.stack.pop()
+            ctx.normalized[name] = sub
+    return normalized, ctx
 
 
 def process(req):
-    steps, dataset = validate_request(req)
+    steps, dataset, defs = validate_request(req)
     known = None
     if dataset:
         known = set()
         for row in dataset:
             known.update(row.keys())
 
-    normalized, _ = normalize_steps(steps, "pipeline.steps", known)
-    return {"status": "ok", "normalized": {"steps": normalized}}
+    normalized, ctx = normalize_all(steps, defs, known)
+    result = {"steps": normalized}
+    if "defs" in req and isinstance(req["defs"], dict):
+        result["defs"] = {name: {"steps": ctx.normalized[name]} for name in defs}
+    return {"status": "ok", "normalized": result}
 
 
 def missing_col(name, path):
@@ -696,16 +823,16 @@ def rename_key(row, src, dst):
     return out
 
 
-def run_expr(ast, row, fpath):
+def run_expr(ast, row, fpath, params=None):
     try:
-        return evaluate(ast, row)
+        return evaluate(ast, row, params)
     except EvalError as e:
         raise ETLError("EXECUTION_FAILED", str(e), fpath)
     except RecursionError:
         raise ETLError("EXECUTION_FAILED", "expression too deeply nested", fpath)
 
 
-def build_plan(norm_steps, raw_steps, base):
+def build_plan(norm_steps, raw_steps, base, ctx=None, cache=None):
     """Attach compiled expressions and paths to normalized steps (recursively)."""
     plan = []
     for i, (ns, raw) in enumerate(zip(norm_steps, raw_steps)):
@@ -727,15 +854,25 @@ def build_plan(norm_steps, raw_steps, base):
                 if not cb["otherwise"]:
                     cb["ast"] = compile_expr(nb["when"])[0]
                     cb["path"] = jpath + ".when"
-                cb["plan"] = build_plan(nb["steps"], rb["steps"], jpath + ".steps")
+                cb["plan"] = build_plan(nb["steps"], rb["steps"], jpath + ".steps",
+                                        ctx, cache)
                 brs.append(cb)
             ns["_branches"] = brs
+        elif ns["op"] == "call":
+            name = ns["name"]
+            if cache is None:
+                cache = {}
+            if name not in cache:
+                cache[name] = None  # placeholder (acyclic, so never read early)
+                cache[name] = build_plan(ctx.normalized[name], ctx.defs[name]["steps"],
+                                         ctx.def_path(name), ctx, cache)
+            ns["_plan"] = cache[name]
         ns["_base"] = path
         plan.append(ns)
     return plan
 
 
-def run_steps(plan, rows):
+def run_steps(plan, rows, params=None):
     for st in plan:
         op = st["op"]
         base = st["_base"]
@@ -752,11 +889,11 @@ def run_steps(plan, rows):
             rows = new_rows
         elif op == "filter":
             ast, fpath = st["_ast"], st["_path"]
-            rows = [row for row in rows if truthy(run_expr(ast, row, fpath))]
+            rows = [row for row in rows if truthy(run_expr(ast, row, fpath, params))]
         elif op == "map":
             ast, fpath, target = st["_ast"], st["_path"], st["as"]
             for row in rows:
-                row[target] = run_expr(ast, row, fpath)
+                row[target] = run_expr(ast, row, fpath, params)
         elif op == "rename":
             mapping = st["mapping"]
             new_rows = []
@@ -779,23 +916,25 @@ def run_steps(plan, rows):
             buckets = [[] for _ in brs]
             for row in rows:
                 for k, br in enumerate(brs):
-                    if br["otherwise"] or truthy(run_expr(br["ast"], row, br["path"])):
+                    if br["otherwise"] or truthy(run_expr(br["ast"], row, br["path"], params)):
                         buckets[k].append(row)
                         break
             merged = []
             for br, bucket in zip(brs, buckets):
-                merged.extend(run_steps(br["plan"], bucket))
+                merged.extend(run_steps(br["plan"], bucket, params))
             rows = merged
+        elif op == "call":
+            rows = run_steps(st["_plan"], rows, st["params"])
     return rows
 
 
 def execute(req):
-    steps, dataset = validate_request(req)
+    steps, dataset, defs = validate_request(req)
 
     # Validate / normalize every step up front (schema + expression syntax).
     # Column existence is checked at run time against the actual rows.
-    normalized, _ = normalize_steps(steps, "pipeline.steps", None)
-    plan = build_plan(normalized, steps, "pipeline.steps")
+    normalized, ctx = normalize_all(steps, defs, None)
+    plan = build_plan(normalized, steps, "pipeline.steps", ctx, {})
 
     rows = run_steps(plan, [dict(r) for r in dataset])
     return {
