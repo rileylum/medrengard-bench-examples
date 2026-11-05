@@ -9,7 +9,13 @@ import sys
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 VALID_TYPES = ("INTEGER", "TEXT", "REAL", "BLOB", "TIMESTAMP")
-OPERATION_TYPES = ("create_table", "add_column", "drop_column")
+OPERATION_TYPES = (
+    "create_table", "add_column", "drop_column",
+    "transform_data", "migrate_column_data", "backfill_data",
+)
+VALUE_KEYWORDS = (
+    "NULL", "TRUE", "FALSE", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
+)
 COLUMN_BOOL_FIELDS = ("primary_key", "auto_increment", "not_null", "unique")
 TABLE_CONSTRAINT_KEYWORDS = ("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN")
 
@@ -122,6 +128,81 @@ def validate_operation(op, index):
         if "column" not in op:
             raise schema_error(f"{ctx}: missing required field 'column'")
         validate_identifier(op["column"], "column name", ctx)
+    elif otype == "transform_data":
+        if "transformations" not in op:
+            raise schema_error(f"{ctx}: missing required field 'transformations'")
+        trs = op["transformations"]
+        if not isinstance(trs, list):
+            raise schema_error(f"{ctx}: field 'transformations' must be an array")
+        if not trs:
+            raise schema_error(f"{ctx}: field 'transformations' must not be empty")
+        for j, tr in enumerate(trs):
+            tctx = f"{ctx}, transformation {j}"
+            if not isinstance(tr, dict):
+                raise schema_error(f"{tctx}: transformation must be an object")
+            for field in ("column", "expression"):
+                if field not in tr:
+                    raise schema_error(f"{tctx}: missing required field '{field}'")
+            validate_identifier(tr["column"], "column name", tctx)
+            validate_expression(tr["expression"], "expression", tctx)
+            if "type" in tr:
+                t = tr["type"]
+                if not isinstance(t, str) or t.upper() not in VALID_TYPES:
+                    raise schema_error(
+                        f"{tctx}: invalid column type {json.dumps(t)} "
+                        f"(expected one of {', '.join(VALID_TYPES)})"
+                    )
+    elif otype == "migrate_column_data":
+        for field in ("from_column", "to_column"):
+            if field not in op:
+                raise schema_error(f"{ctx}: missing required field '{field}'")
+            validate_identifier(op[field], "column name", ctx)
+        if "default_value" in op:
+            validate_value(op["default_value"], "default_value", ctx)
+    elif otype == "backfill_data":
+        for field in ("column", "value"):
+            if field not in op:
+                raise schema_error(f"{ctx}: missing required field '{field}'")
+        validate_identifier(op["column"], "column name", ctx)
+        validate_value(op["value"], "value", ctx)
+        if op.get("where") is not None:
+            validate_expression(op["where"], "where", ctx)
+
+
+def validate_expression(value, field, ctx):
+    if not isinstance(value, str):
+        raise schema_error(f"{ctx}: field '{field}' must be a string")
+    if not value.strip():
+        raise schema_error(f"{ctx}: field '{field}' must not be empty")
+    if ";" in _strip_literals(value):
+        raise schema_error(f"{ctx}: field '{field}' must be a single SQL expression")
+
+
+def validate_value(value, field, ctx):
+    if value is None or isinstance(value, (bool, int, float)):
+        return
+    if isinstance(value, str):
+        if ";" in _strip_literals(value):
+            raise schema_error(
+                f"{ctx}: field '{field}' must be a single SQL expression"
+            )
+        return
+    raise schema_error(f"{ctx}: field '{field}' must be a string, number, boolean or null")
+
+
+def _strip_literals(sql):
+    """Remove quoted strings/identifiers from an SQL fragment."""
+    out = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        if sql[i] in "'\"`[":
+            i = _skip_quoted(sql, i)
+            out.append(" ")
+            continue
+        out.append(sql[i])
+        i += 1
+    return "".join(out)
 
 
 def validate_migration(mig):
@@ -366,10 +447,179 @@ def apply_drop_column(conn, op):
         conn.execute(sql)
 
 
+# --------------------------------------------------------------------------
+# Data migrations
+# --------------------------------------------------------------------------
+
+def _require_table(conn, table):
+    if not table_exists(conn, table):
+        raise op_error(f"table '{table}' does not exist")
+
+
+def _column_types(conn, table):
+    """Map of column name -> declared type (upper case)."""
+    return {r[1]: (r[2] or "").upper() for r in table_info(conn, table)}
+
+
+def _require_column(cols, table, column):
+    if column not in cols:
+        raise op_error(f"column '{column}' does not exist in table '{table}'")
+
+
+def _check_expression(conn, table, expr, what):
+    """Make sure an SQL expression compiles against the table."""
+    try:
+        conn.execute(f"SELECT ({expr}) FROM {quote_ident(table)} LIMIT 0").fetchall()
+    except sqlite3.Error as e:
+        raise op_error(f"invalid SQL expression in {what} '{expr}': {e}")
+
+
+def _check_where(conn, table, where):
+    try:
+        conn.execute(
+            f"SELECT 1 FROM {quote_ident(table)} WHERE ({where}) LIMIT 0"
+        ).fetchall()
+    except sqlite3.Error as e:
+        raise op_error(f"invalid SQL expression in where clause '{where}': {e}")
+
+
+def _run_update(conn, sql, params, table, column):
+    try:
+        cur = conn.execute(sql, params)
+    except sqlite3.IntegrityError as e:
+        raise MigrationError(
+            f"data type mismatch: cannot write to column '{column}' "
+            f"of table '{table}': {e}"
+        )
+    except sqlite3.Error as e:
+        raise MigrationError(f"SQL error: {e}")
+    return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+
+
+def _check_types(conn, table, column, declared):
+    """Detect values that could not be coerced to a numeric column's type."""
+    if "INT" in declared:
+        bad_types = ("text", "blob")
+        label = "INTEGER"
+    elif any(k in declared for k in ("REAL", "FLOA", "DOUB")):
+        bad_types = ("text", "blob")
+        label = "REAL"
+    else:
+        return
+    placeholders = ", ".join("?" for _ in bad_types)
+    row = conn.execute(
+        f"SELECT {quote_ident(column)} FROM {quote_ident(table)} "
+        f"WHERE typeof({quote_ident(column)}) IN ({placeholders}) LIMIT 1",
+        bad_types,
+    ).fetchone()
+    if row is not None:
+        val = row[0]
+        if isinstance(val, bytes):
+            val = "<blob>"
+        raise MigrationError(
+            f"data type mismatch: value {json.dumps(val)} cannot be stored "
+            f"in {label} column '{column}' of table '{table}'"
+        )
+
+
+def _value_sql(value, cols):
+    """Return (sql_fragment, params) for a backfill value."""
+    if value is None:
+        return "NULL", ()
+    if isinstance(value, bool):
+        return "?", (1 if value else 0,)
+    if isinstance(value, (int, float)):
+        return "?", (value,)
+    stripped = value.strip()
+    if (
+        IDENT_RE.match(stripped)
+        and stripped.upper() not in VALUE_KEYWORDS
+        and stripped.lower() not in (c.lower() for c in cols)
+    ):
+        # A bare word that isn't a column or keyword: treat as a string constant.
+        return "?", (value,)
+    if not stripped:
+        return "?", (value,)
+    return f"({value})", ()
+
+
+def apply_transform_data(conn, op):
+    table = op["table"]
+    _require_table(conn, table)
+    total = 0
+    for tr in op["transformations"]:
+        cols = _column_types(conn, table)
+        column = tr["column"]
+        match = next((c for c in cols if c.lower() == column.lower()), None)
+        if match is None:
+            ctype = tr.get("type")
+            type_sql = f" {ctype.upper()}" if ctype else ""
+            conn.execute(
+                f"ALTER TABLE {quote_ident(table)} "
+                f"ADD COLUMN {quote_ident(column)}{type_sql}"
+            )
+            cols = _column_types(conn, table)
+            match = column
+        expr = tr["expression"]
+        _check_expression(conn, table, expr, f"transformation for column '{match}'")
+        total = _run_update(
+            conn,
+            f"UPDATE {quote_ident(table)} SET {quote_ident(match)} = ({expr})",
+            (), table, match,
+        )
+        _check_types(conn, table, match, cols[match])
+    return {"rows_affected": total}
+
+
+def apply_migrate_column_data(conn, op):
+    table = op["table"]
+    _require_table(conn, table)
+    cols = _column_types(conn, table)
+    src, dst = op["from_column"], op["to_column"]
+    _require_column(cols, table, src)
+    _require_column(cols, table, dst)
+    default = op.get("default_value")
+    if default is None:
+        expr, params = quote_ident(src), ()
+    else:
+        if isinstance(default, bool):
+            default = 1 if default else 0
+        expr, params = f"COALESCE({quote_ident(src)}, ?)", (default,)
+    rows = _run_update(
+        conn,
+        f"UPDATE {quote_ident(table)} SET {quote_ident(dst)} = {expr}",
+        params, table, dst,
+    )
+    _check_types(conn, table, dst, cols[dst])
+    return {"from_column": src, "to_column": dst, "rows_affected": rows}
+
+
+def apply_backfill_data(conn, op):
+    table = op["table"]
+    _require_table(conn, table)
+    cols = _column_types(conn, table)
+    column = op["column"]
+    _require_column(cols, table, column)
+    value_sql, params = _value_sql(op["value"], cols)
+    if not params and value_sql != "NULL":
+        _check_expression(conn, table, value_sql, f"value for column '{column}'")
+    sql = f"UPDATE {quote_ident(table)} SET {quote_ident(column)} = {value_sql}"
+    where = op.get("where")
+    if where is not None:
+        _check_where(conn, table, where)
+        sql += f" WHERE ({where})"
+    rows = _run_update(conn, sql, params, table, column)
+    _check_types(conn, table, column, cols[column])
+    return {"column": column, "rows_affected": rows}
+
+
 OPERATIONS = {
     "create_table": apply_create_table,
     "add_column": apply_add_column,
     "drop_column": apply_drop_column,
+    "transform_data": apply_transform_data,
+    "migrate_column_data": apply_migrate_column_data,
+    "backfill_data": apply_backfill_data,
 }
 
 
@@ -430,13 +680,15 @@ def migrate(migration_path, db_path):
         try:
             conn.execute("BEGIN")
             for op in mig["operations"]:
-                OPERATIONS[op["type"]](conn, op)
+                extra = OPERATIONS[op["type"]](conn, op)
                 event = {"event": "operation_applied", "type": op["type"],
                          "table": op["table"]}
                 if op["type"] == "add_column":
                     event["column"] = op["column"]["name"]
                 elif op["type"] == "drop_column":
                     event["column"] = op["column"]
+                if extra:
+                    event.update(extra)
                 event["version"] = version
                 emit(event)
             conn.execute(
