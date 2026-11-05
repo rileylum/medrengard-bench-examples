@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """babel_code_goat: translate a restricted Python ``tests.py`` into a tester
-for python / javascript / typescript, and run that tester against a solution.
+for python / javascript / typescript / cpp / rust, and run that tester against a solution.
 
 Commands:
-    generate <tests_dir> --entrypoint <name> --lang <python|javascript|typescript>
-    test <solution_path> <tests_dir> --lang <python|javascript|typescript> [--timeout SECONDS] [--tol FLOAT]
+    generate <tests_dir> --entrypoint <name> --lang <python|javascript|typescript|cpp|rust>
+    test <solution_path> <tests_dir> --lang <python|javascript|typescript|cpp|rust> [--timeout SECONDS] [--tol FLOAT]
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ import tempfile
 import threading
 import tokenize
 
-LANG_EXT = {"python": "py", "javascript": "js", "typescript": "ts"}
+LANG_EXT = {"python": "py", "javascript": "js", "typescript": "ts", "cpp": "cpp", "rust": "rs"}
 MARKER = "@@BABEL_CODE_GOAT@@ "
 META_PREFIX = "BABEL_CODE_GOAT_META: "
 DEFAULT_TIMEOUT = 10.0
@@ -948,7 +948,7 @@ _SKIP_DIRS = {"__pycache__", "node_modules"}
 
 
 def _generated_tester(rel):
-    return rel in ("tester.py", "tester.js", "tester.ts")
+    return rel in ("tester.py", "tester.js", "tester.ts", "tester.cpp", "tester.rs")
 
 
 def _test_files(tests_dir):
@@ -1913,6 +1913,8 @@ __EXPR_RT__
 
 
 def _exc_matches(e, names):
+    if getattr(type(e), "_bcg_native", False):
+        return True  # native exceptions/panics are untyped: any expected type matches
     if names is None:
         return isinstance(e, Exception)
     mro_names = {c.__name__ for c in type(e).__mro__}
@@ -3486,6 +3488,1573 @@ def render_tester(lang: str, tests, entrypoint: str) -> str:
     return out
 
 
+CPP_RUNTIME = r'''// ---- babel_code_goat C++ runtime ----
+#include <bits/stdc++.h>
+#include <pthread.h>
+#include <cxxabi.h>
+#include <unistd.h>
+using namespace std;
+namespace __bcg {
+struct Val {
+  enum K { NONE, BOOL, INT, FLOAT, DEC, STR, CHAR, LIST, TUPLE, SET, DICT, DEQUE } k = NONE;
+  bool b = false;
+  __int128 i = 0;
+  long double f = 0;
+  std::string s;
+  std::vector<Val> items;  // DICT: k0 v0 k1 v1 ...
+};
+struct ConvError : std::exception {
+  std::string m;
+  explicit ConvError(std::string s) : m(std::move(s)) {}
+  const char* what() const noexcept override { return m.c_str(); }
+};
+struct Reader {
+  const std::string& d; size_t p = 0;
+  explicit Reader(const std::string& s) : d(s) {}
+  std::string until(char c) {
+    size_t q = d.find(c, p);
+    if (q == std::string::npos) throw ConvError("bad input");
+    std::string r = d.substr(p, q - p); p = q + 1; return r;
+  }
+  Val read() {
+    if (p >= d.size()) throw ConvError("bad input");
+    char c = d[p++];
+    Val v;
+    switch (c) {
+      case 'N': v.k = Val::NONE; break;
+      case 'T': v.k = Val::BOOL; v.b = true; break;
+      case 'F': v.k = Val::BOOL; v.b = false; break;
+      case 'i': {
+        std::string t = until(';'); v.k = Val::INT;
+        bool neg = false; size_t j = 0; if (!t.empty() && t[0] == '-') { neg = true; j = 1; }
+        __int128 x = 0; for (; j < t.size(); ++j) x = x * 10 + (t[j] - '0');
+        v.i = neg ? -x : x; break;
+      }
+      case 'f': v.k = Val::FLOAT; v.f = std::strtold(until(';').c_str(), nullptr); break;
+      case 'd': v.k = Val::DEC; v.s = until(';'); v.f = std::strtold(v.s.c_str(), nullptr); break;
+      case 's': case 'c': {
+        size_t n = std::stoul(until(':')); v.k = c == 's' ? Val::STR : Val::CHAR;
+        v.s = d.substr(p, n); p += n; break;
+      }
+      case 'l': case 't': case 'e': case 'm': case 'q': {
+        size_t n = std::stoul(until(':'));
+        v.k = c == 'l' ? Val::LIST : c == 't' ? Val::TUPLE : c == 'e' ? Val::SET : c == 'm' ? Val::DICT : Val::DEQUE;
+        if (c == 'm') n *= 2;
+        for (size_t j = 0; j < n; ++j) v.items.push_back(read());
+        break;
+      }
+      default: throw ConvError("bad input");
+    }
+    return v;
+  }
+};
+inline std::string i128s(__int128 x) {
+  if (x == 0) return "0";
+  bool neg = x < 0; unsigned __int128 u = neg ? (unsigned __int128)(-(x + 1)) + 1 : (unsigned __int128)x;
+  std::string r; while (u) { r += char('0' + int(u % 10)); u /= 10; }
+  if (neg) r += '-';
+  std::reverse(r.begin(), r.end()); return r;
+}
+inline void write(const Val& v, std::string& o) {
+  switch (v.k) {
+    case Val::NONE: o += 'N'; break;
+    case Val::BOOL: o += v.b ? 'T' : 'F'; break;
+    case Val::INT: o += 'i'; o += i128s(v.i); o += ';'; break;
+    case Val::FLOAT: case Val::DEC: {
+      char buf[64];
+      if (std::isnan(v.f)) std::snprintf(buf, sizeof buf, "nan");
+      else if (std::isinf(v.f)) std::snprintf(buf, sizeof buf, v.f > 0 ? "inf" : "-inf");
+      else std::snprintf(buf, sizeof buf, "%.21Lg", v.f);
+      o += 'f'; o += buf; o += ';'; break;
+    }
+    case Val::STR: case Val::CHAR:
+      o += v.k == Val::STR ? 's' : 'c'; o += std::to_string(v.s.size()); o += ':'; o += v.s; break;
+    default: {
+      char c = v.k == Val::LIST ? 'l' : v.k == Val::TUPLE ? 't' : v.k == Val::SET ? 'e' : v.k == Val::DICT ? 'm' : 'q';
+      o += c; o += std::to_string(v.k == Val::DICT ? v.items.size() / 2 : v.items.size()); o += ':';
+      for (auto& x : v.items) write(x, o);
+    }
+  }
+}
+inline const char* kname(const Val& v) {
+  static const char* n[] = {"None", "bool", "int", "float", "Decimal", "str", "str", "list", "tuple", "set", "dict", "deque"};
+  return n[v.k];
+}
+[[noreturn]] inline void bad(const Val& v, const char* want) {
+  throw ConvError(std::string("cannot convert ") + kname(v) + " to " + want);
+}
+inline bool is_seq(const Val& v) { return v.k == Val::LIST || v.k == Val::TUPLE || v.k == Val::SET || v.k == Val::DEQUE; }
+
+template <class T, class = void> struct Conv;  // from_val / to_val
+
+template <class T> T from_val(const Val& v) { return Conv<std::remove_cv_t<T>>::from(v); }
+template <class T> Val to_val(const T& x) { return Conv<std::remove_cv_t<T>>::to(x); }
+
+inline Val mk(Val::K k) { Val v; v.k = k; return v; }
+
+template <> struct Conv<bool> {
+  static bool from(const Val& v) {
+    if (v.k == Val::BOOL) return v.b;
+    if (v.k == Val::INT) return v.i != 0;
+    bad(v, "bool");
+  }
+  static Val to(bool x) { Val v = mk(Val::BOOL); v.b = x; return v; }
+};
+template <> struct Conv<char> {
+  static char from(const Val& v) {
+    if ((v.k == Val::STR || v.k == Val::CHAR) && v.s.size() == 1) return v.s[0];
+    if (v.k == Val::INT) return (char)v.i;
+    bad(v, "char");
+  }
+  static Val to(char x) { Val v = mk(Val::CHAR); v.s = std::string(1, x); return v; }
+};
+template <class T> struct Conv<T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool> && !std::is_same_v<T, char>>> {
+  static T from(const Val& v) {
+    if (v.k == Val::INT) return (T)v.i;
+    if (v.k == Val::BOOL) return (T)v.b;
+    if ((v.k == Val::FLOAT || v.k == Val::DEC) && v.f == std::floor(v.f)) return (T)v.f;
+    bad(v, "integer");
+  }
+  static Val to(T x) { Val v = mk(Val::INT); v.i = (__int128)x; return v; }
+};
+template <class T> struct Conv<T, std::enable_if_t<std::is_floating_point_v<T>>> {
+  static T from(const Val& v) {
+    if (v.k == Val::FLOAT || v.k == Val::DEC) return (T)v.f;
+    if (v.k == Val::INT) return (T)v.i;
+    if (v.k == Val::BOOL) return (T)v.b;
+    bad(v, "floating point");
+  }
+  static Val to(T x) {
+    Val v = mk(Val::FLOAT); v.f = (long double)x;
+    if constexpr (std::is_same_v<T, float>) {
+      if (std::isfinite(x)) {  // shortest decimal that round-trips the float
+        char buf[64];
+        for (int p = 1; p <= 9; ++p) {
+          std::snprintf(buf, sizeof buf, "%.*g", p, (double)x);
+          if (std::strtof(buf, nullptr) == x) { v.f = std::strtold(buf, nullptr); break; }
+        }
+      }
+    }
+    return v;
+  }
+};
+template <class T> struct Conv<T, std::enable_if_t<std::is_enum_v<T>>> {
+  static T from(const Val& v) { return (T)Conv<long long>::from(v); }
+  static Val to(T x) { return Conv<long long>::to((long long)x); }
+};
+template <> struct Conv<std::string> {
+  static std::string from(const Val& v) {
+    if (v.k == Val::STR || v.k == Val::CHAR || v.k == Val::DEC) return v.s;
+    bad(v, "string");
+  }
+  static Val to(const std::string& x) { Val v = mk(Val::STR); v.s = x; return v; }
+};
+template <> struct Conv<std::string_view> {
+  static std::string_view from(const Val& v) {
+    auto* s = new std::string(Conv<std::string>::from(v)); return *s;
+  }
+  static Val to(std::string_view x) { Val v = mk(Val::STR); v.s = std::string(x); return v; }
+};
+template <> struct Conv<const char*> {
+  static const char* from(const Val& v) { auto* s = new std::string(Conv<std::string>::from(v)); return s->c_str(); }
+  static Val to(const char* x) { if (!x) return mk(Val::NONE); Val v = mk(Val::STR); v.s = x; return v; }
+};
+template <> struct Conv<char*> {
+  static char* from(const Val& v) { auto* s = new std::string(Conv<std::string>::from(v)); return s->data(); }
+  static Val to(char* x) { return Conv<const char*>::to(x); }
+};
+template <> struct Conv<std::nullptr_t> {
+  static std::nullptr_t from(const Val&) { return nullptr; }
+  static Val to(std::nullptr_t) { return mk(Val::NONE); }
+};
+template <> struct Conv<std::nullopt_t> {
+  static Val to(std::nullopt_t) { return mk(Val::NONE); }
+};
+template <> struct Conv<std::monostate> {
+  static std::monostate from(const Val&) { return {}; }
+  static Val to(std::monostate) { return mk(Val::NONE); }
+};
+template <class T> struct Conv<std::optional<T>> {
+  static std::optional<T> from(const Val& v) {
+    if (v.k == Val::NONE) return std::nullopt;
+    return from_val<T>(v);
+  }
+  static Val to(const std::optional<T>& x) { return x ? to_val<T>(*x) : mk(Val::NONE); }
+};
+template <class T> struct Conv<std::shared_ptr<T>> {
+  static std::shared_ptr<T> from(const Val& v) {
+    if (v.k == Val::NONE) return nullptr;
+    return std::make_shared<T>(from_val<T>(v));
+  }
+  static Val to(const std::shared_ptr<T>& x) { return x ? to_val<T>(*x) : mk(Val::NONE); }
+};
+template <class T> struct Conv<std::unique_ptr<T>> {
+  static std::unique_ptr<T> from(const Val& v) {
+    if (v.k == Val::NONE) return nullptr;
+    return std::make_unique<T>(from_val<T>(v));
+  }
+  static Val to(const std::unique_ptr<T>& x) { return x ? to_val<T>(*x) : mk(Val::NONE); }
+};
+
+// sequence-like containers
+template <class C> struct SeqConv {
+  using E = typename C::value_type;
+  static std::vector<Val> elems(const Val& v) {
+    if (is_seq(v)) return v.items;
+    if (v.k == Val::STR) {
+      std::vector<Val> r;
+      for (char ch : v.s) { Val c = mk(Val::STR); c.s = std::string(1, ch); r.push_back(c); }
+      return r;
+    }
+    if (v.k == Val::DICT) {
+      std::vector<Val> r;
+      for (size_t j = 0; j < v.items.size(); j += 2) r.push_back(v.items[j]);
+      return r;
+    }
+    bad(v, "sequence");
+  }
+  static Val to_items(const C& c, Val::K k) {
+    Val v = mk(k);
+    for (auto it = c.begin(); it != c.end(); ++it) v.items.push_back(to_val<E>(static_cast<E>(*it)));
+    return v;
+  }
+};
+template <class T, class A> struct Conv<std::vector<T, A>> : SeqConv<std::vector<T, A>> {
+  static std::vector<T, A> from(const Val& v) {
+    std::vector<T, A> r; for (auto& x : SeqConv<std::vector<T, A>>::elems(v)) r.push_back(from_val<T>(x)); return r;
+  }
+  static Val to(const std::vector<T, A>& c) { return SeqConv<std::vector<T, A>>::to_items(c, Val::LIST); }
+};
+template <class T, class A> struct Conv<std::list<T, A>> : SeqConv<std::list<T, A>> {
+  static std::list<T, A> from(const Val& v) {
+    std::list<T, A> r; for (auto& x : SeqConv<std::list<T, A>>::elems(v)) r.push_back(from_val<T>(x)); return r;
+  }
+  static Val to(const std::list<T, A>& c) { return SeqConv<std::list<T, A>>::to_items(c, Val::LIST); }
+};
+template <class T, class A> struct Conv<std::deque<T, A>> : SeqConv<std::deque<T, A>> {
+  static std::deque<T, A> from(const Val& v) {
+    std::deque<T, A> r; for (auto& x : SeqConv<std::deque<T, A>>::elems(v)) r.push_back(from_val<T>(x)); return r;
+  }
+  static Val to(const std::deque<T, A>& c) { return SeqConv<std::deque<T, A>>::to_items(c, Val::DEQUE); }
+};
+template <class T, size_t N> struct Conv<std::array<T, N>> : SeqConv<std::array<T, N>> {
+  static std::array<T, N> from(const Val& v) {
+    auto e = SeqConv<std::array<T, N>>::elems(v);
+    if (e.size() != N) throw ConvError("array size mismatch");
+    std::array<T, N> r{}; for (size_t j = 0; j < N; ++j) r[j] = from_val<T>(e[j]); return r;
+  }
+  static Val to(const std::array<T, N>& c) { return SeqConv<std::array<T, N>>::to_items(c, Val::LIST); }
+};
+#define BCG_SETCONV(TPL, PARAMS, ARGS)                                                   \
+  template <PARAMS> struct Conv<TPL<ARGS>> : SeqConv<TPL<ARGS>> {                        \
+    static TPL<ARGS> from(const Val& v) {                                                \
+      TPL<ARGS> r;                                                                       \
+      for (auto& x : SeqConv<TPL<ARGS>>::elems(v)) r.insert(from_val<typename TPL<ARGS>::value_type>(x)); \
+      return r;                                                                          \
+    }                                                                                    \
+    static Val to(const TPL<ARGS>& c) { return SeqConv<TPL<ARGS>>::to_items(c, Val::SET); } \
+  };
+#define BCG_COMMA ,
+BCG_SETCONV(std::set, class T BCG_COMMA class C BCG_COMMA class A, T BCG_COMMA C BCG_COMMA A)
+BCG_SETCONV(std::unordered_set, class T BCG_COMMA class H BCG_COMMA class E BCG_COMMA class A, T BCG_COMMA H BCG_COMMA E BCG_COMMA A)
+template <class T, class C, class A> struct Conv<std::multiset<T, C, A>> : SeqConv<std::multiset<T, C, A>> {
+  static std::multiset<T, C, A> from(const Val& v) {
+    std::multiset<T, C, A> r; for (auto& x : SeqConv<std::multiset<T, C, A>>::elems(v)) r.insert(from_val<T>(x)); return r;
+  }
+  static Val to(const std::multiset<T, C, A>& c) { return SeqConv<std::multiset<T, C, A>>::to_items(c, Val::LIST); }
+};
+template <class M> struct MapConv {
+  using K = typename M::key_type; using V = typename M::mapped_type;
+  static M from(const Val& v) {
+    M r;
+    if (v.k == Val::DICT) {
+      for (size_t j = 0; j < v.items.size(); j += 2) r.emplace(from_val<K>(v.items[j]), from_val<V>(v.items[j + 1]));
+      return r;
+    }
+    if (is_seq(v)) {
+      for (auto& p : v.items) {
+        if (!is_seq(p) || p.items.size() != 2) bad(p, "map entry");
+        r.emplace(from_val<K>(p.items[0]), from_val<V>(p.items[1]));
+      }
+      return r;
+    }
+    bad(v, "map");
+  }
+  static Val to(const M& m) {
+    Val v = mk(Val::DICT);
+    for (auto& kv : m) { v.items.push_back(to_val<K>(kv.first)); v.items.push_back(to_val<V>(kv.second)); }
+    return v;
+  }
+};
+template <class K, class V, class C, class A> struct Conv<std::map<K, V, C, A>> : MapConv<std::map<K, V, C, A>> {};
+template <class K, class V, class H, class E, class A> struct Conv<std::unordered_map<K, V, H, E, A>> : MapConv<std::unordered_map<K, V, H, E, A>> {};
+template <class K, class V, class C, class A> struct Conv<std::multimap<K, V, C, A>> : MapConv<std::multimap<K, V, C, A>> {};
+template <class A, class B> struct Conv<std::pair<A, B>> {
+  static std::pair<A, B> from(const Val& v) {
+    if (!is_seq(v) || v.items.size() != 2) bad(v, "pair");
+    return {from_val<A>(v.items[0]), from_val<B>(v.items[1])};
+  }
+  static Val to(const std::pair<A, B>& p) {
+    Val v = mk(Val::TUPLE); v.items.push_back(to_val<A>(p.first)); v.items.push_back(to_val<B>(p.second)); return v;
+  }
+};
+template <class... Ts> struct Conv<std::tuple<Ts...>> {
+  template <size_t... I> static std::tuple<Ts...> build(const Val& v, std::index_sequence<I...>) {
+    return std::tuple<Ts...>(from_val<Ts>(v.items[I])...);
+  }
+  static std::tuple<Ts...> from(const Val& v) {
+    if (!is_seq(v) || v.items.size() != sizeof...(Ts)) bad(v, "tuple");
+    return build(v, std::index_sequence_for<Ts...>{});
+  }
+  static Val to(const std::tuple<Ts...>& t) {
+    Val v = mk(Val::TUPLE);
+    std::apply([&](const auto&... x) { (v.items.push_back(to_val(x)), ...); }, t);
+    return v;
+  }
+};
+template <class... Ts> struct Conv<std::variant<Ts...>> {
+  template <class T> static bool try_one(const Val& v, std::optional<std::variant<Ts...>>& out) {
+    if (out) return true;
+    try { out = from_val<T>(v); return true; } catch (const ConvError&) { return false; }
+  }
+  static std::variant<Ts...> from(const Val& v) {
+    std::optional<std::variant<Ts...>> out;
+    (try_one<Ts>(v, out), ...);
+    if (!out) bad(v, "variant");
+    return *out;
+  }
+  static Val to(const std::variant<Ts...>& x) { return std::visit([](const auto& y) { return to_val(y); }, x); }
+};
+template <class C> struct Conv<std::stack<C>> {};
+template <class C> struct Conv<std::queue<C>> {};
+
+// ---- function traits ----
+template <class F> struct FnTraits;
+#define BCG_FT(Q)                                                                         \
+  template <class R, class... A> struct FnTraits<R (*)(A...) Q> { using Ret = R; using Args = std::tuple<A...>; static constexpr bool member = false; }; \
+  template <class R, class C, class... A> struct FnTraits<R (C::*)(A...) Q> { using Ret = R; using Args = std::tuple<A...>; static constexpr bool member = true; }; \
+  template <class R, class C, class... A> struct FnTraits<R (C::*)(A...) const Q> { using Ret = R; using Args = std::tuple<A...>; static constexpr bool member = true; }; \
+  template <class R, class C, class... A> struct FnTraits<R (C::*)(A...) & Q> { using Ret = R; using Args = std::tuple<A...>; static constexpr bool member = true; }; \
+  template <class R, class C, class... A> struct FnTraits<R (C::*)(A...) const & Q> { using Ret = R; using Args = std::tuple<A...>; static constexpr bool member = true; };
+BCG_FT()
+BCG_FT(noexcept)
+template <class R, class... A> struct FnTraits<R (*)(A..., ...)> { using Ret = R; using Args = std::tuple<A...>; static constexpr bool member = false; };
+
+template <class P> struct IsMutRef : std::bool_constant<std::is_lvalue_reference_v<P> && !std::is_const_v<std::remove_reference_t<P>>> {};
+template <class P> struct IsMutPtr : std::bool_constant<std::is_pointer_v<P> && !std::is_const_v<std::remove_pointer_t<P>> && !std::is_same_v<P, char*>> {};
+template <class P> using Store = std::conditional_t<IsMutPtr<P>::value, std::remove_pointer_t<P>, std::decay_t<P>>;
+
+struct Outcome {
+  int status = 0;  // 0 ok, 1 exception, 2 internal error
+  std::string msg, etype;
+  Val result;
+  std::vector<std::pair<size_t, Val>> post;
+};
+}  // namespace __bcg
+// ---- end runtime ----
+'''
+
+
+CPP_HARNESS = r'''// ---- babel_code_goat C++ harness ----
+namespace __bcg {
+using EntryPtr = decltype(&BCG_ENTRY_PTR);
+using Tr = FnTraits<EntryPtr>;
+using Params = typename Tr::Args;
+using Ret = typename Tr::Ret;
+constexpr size_t ARITY = std::tuple_size_v<Params>;
+template <size_t I> using P = std::tuple_element_t<I, Params>;
+
+template <class Pt, class S> decltype(auto) pass(S& s) {
+  if constexpr (IsMutPtr<Pt>::value) return &s;
+  else return static_cast<Pt>(s);
+}
+template <class Seq, class = void> struct CanCall : std::false_type {};
+template <size_t... I>
+struct CanCall<std::index_sequence<I...>, std::void_t<decltype(BCG_PROBE(std::declval<P<I>>()...))>> : std::true_type {};
+
+inline std::string demangle(const char* n) {
+  int st = 0;
+  char* d = abi::__cxa_demangle(n, nullptr, nullptr, &st);
+  std::string r = (st == 0 && d) ? d : n;
+  std::free(d);
+  return r;
+}
+
+template <size_t... I> Outcome do_call(const std::vector<Val>& args, std::index_sequence<I...>) {
+  std::tuple<Store<P<I>>...> st{from_val<Store<P<I>>>(args[I])...};
+  Outcome o;
+  BCG_OBJ_DECL
+  try {
+    if constexpr (std::is_void_v<Ret>) {
+      BCG_CALL(pass<P<I>>(std::get<I>(st))...);
+      o.result = mk(Val::NONE);
+    } else {
+      decltype(auto) r = BCG_CALL(pass<P<I>>(std::get<I>(st))...);
+      o.result = to_val<std::decay_t<decltype(r)>>(r);
+    }
+  } catch (const ConvError& e) {
+    throw;
+  } catch (const std::exception& e) {
+    o.status = 1; o.msg = e.what(); o.etype = demangle(typeid(e).name());
+  } catch (const char* e) {
+    o.status = 1; o.msg = e ? e : ""; o.etype = "const char*";
+  } catch (const std::string& e) {
+    o.status = 1; o.msg = e; o.etype = "std::string";
+  } catch (...) {
+    o.status = 1; o.etype = "unknown";
+  }
+  auto rb = [&](auto ic) {
+    constexpr size_t J = decltype(ic)::value;
+    if constexpr (IsMutRef<P<J>>::value || IsMutPtr<P<J>>::value)
+      o.post.emplace_back(J, to_val<Store<P<J>>>(std::get<J>(st)));
+  };
+  (rb(std::integral_constant<size_t, I>{}), ...);
+  return o;
+}
+template <size_t K> Outcome run_k(const std::vector<Val>& args) {
+  if constexpr (K > ARITY) {
+    throw ConvError("wrong number of arguments");
+  } else {
+    if (args.size() == K) {
+      if constexpr (CanCall<std::make_index_sequence<K>>::value) return do_call(args, std::make_index_sequence<K>{});
+      else throw ConvError("wrong number of arguments");
+    }
+    return run_k<K + 1>(args);
+  }
+}
+struct Job { std::string in; std::string out; };
+inline void* worker(void* p) {
+  Job* j = static_cast<Job*>(p);
+  std::string& o = j->out;
+  try {
+    Reader rd(j->in);
+    Val a = rd.read();
+    Outcome r = run_k<0>(a.items);
+    std::cout.flush(); std::cerr.flush(); std::fflush(stdout); std::fflush(stderr);
+    if (r.status == 1) {
+      o += 'E'; Val m = mk(Val::STR); m.s = r.msg; write(m, o); Val t = mk(Val::STR); t.s = r.etype; write(t, o);
+    } else {
+      o += 'R'; write(r.result, o);
+    }
+    Val post = mk(Val::LIST);
+    for (auto& pv : r.post) { Val pr = mk(Val::TUPLE); Val ix = mk(Val::INT); ix.i = (__int128)pv.first; pr.items.push_back(ix); pr.items.push_back(pv.second); post.items.push_back(pr); }
+    write(post, o);
+  } catch (const std::exception& e) {
+    o = "X"; Val m = mk(Val::STR); m.s = e.what(); write(m, o);
+  } catch (...) {
+    o = "X"; Val m = mk(Val::STR); m.s = "internal error"; write(m, o);
+  }
+  return nullptr;
+}
+}  // namespace __bcg
+
+int main(int argc, char** argv) {
+  if (argc < 2) return 2;
+  std::ios::sync_with_stdio(true);
+  __bcg::Job job;
+  { std::stringstream ss; ss << std::cin.rdbuf(); job.in = ss.str(); }
+  pthread_attr_t attr; pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, (size_t)1 << 30);
+  pthread_t th;
+  if (pthread_create(&th, &attr, __bcg::worker, &job) != 0) __bcg::worker(&job);
+  else pthread_join(th, nullptr);
+  std::cout.flush(); std::fflush(stdout); std::fflush(stderr);
+  FILE* f = std::fopen(argv[1], "wb");
+  if (!f) return 3;
+  std::fwrite(job.out.data(), 1, job.out.size(), f);
+  std::fclose(f);
+  return 0;
+}
+'''
+
+
+RUST_RUNTIME = r'''// ---- babel_code_goat Rust runtime ----
+#[allow(dead_code, unused_imports, non_snake_case)]
+pub mod __bcg_rt {
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+    use std::hash::Hash;
+
+    #[derive(Clone, Debug)]
+    pub enum Val {
+        None, Bool(bool), Int(i128), Float(f64), Dec(String), Str(String), Char(char),
+        List(Vec<Val>), Tuple(Vec<Val>), Set(Vec<Val>), Dict(Vec<(Val, Val)>), Deque(Vec<Val>),
+    }
+
+    pub struct ConvError(pub String);
+
+    fn kname(v: &Val) -> &'static str {
+        match v {
+            Val::None => "None", Val::Bool(_) => "bool", Val::Int(_) => "int", Val::Float(_) => "float",
+            Val::Dec(_) => "Decimal", Val::Str(_) | Val::Char(_) => "str", Val::List(_) => "list",
+            Val::Tuple(_) => "tuple", Val::Set(_) => "set", Val::Dict(_) => "dict", Val::Deque(_) => "deque",
+        }
+    }
+    pub fn bad(v: &Val, want: &str) -> ! {
+        std::panic::panic_any(ConvError(format!("cannot convert {} to {}", kname(v), want)))
+    }
+
+    // ---- wire format ----
+    pub struct Reader<'a> { d: &'a [u8], p: usize }
+    impl<'a> Reader<'a> {
+        pub fn new(d: &'a [u8]) -> Self { Reader { d, p: 0 } }
+        fn until(&mut self, c: u8) -> String {
+            let start = self.p;
+            while self.p < self.d.len() && self.d[self.p] != c { self.p += 1; }
+            if self.p >= self.d.len() { std::panic::panic_any(ConvError("bad input".into())); }
+            let s = String::from_utf8_lossy(&self.d[start..self.p]).into_owned();
+            self.p += 1;
+            s
+        }
+        fn count(&mut self) -> usize { self.until(b':').parse().unwrap_or(0) }
+        pub fn read(&mut self) -> Val {
+            if self.p >= self.d.len() { std::panic::panic_any(ConvError("bad input".into())); }
+            let c = self.d[self.p];
+            self.p += 1;
+            match c {
+                b'N' => Val::None,
+                b'T' => Val::Bool(true),
+                b'F' => Val::Bool(false),
+                b'i' => Val::Int(self.until(b';').parse().unwrap_or(0)),
+                b'f' => Val::Float(parse_f64(&self.until(b';'))),
+                b'd' => Val::Dec(self.until(b';')),
+                b's' | b'c' => {
+                    let n = self.count();
+                    let s = String::from_utf8_lossy(&self.d[self.p..self.p + n]).into_owned();
+                    self.p += n;
+                    if c == b's' { Val::Str(s) } else { Val::Char(s.chars().next().unwrap_or('\0')) }
+                }
+                b'm' => {
+                    let n = self.count();
+                    let mut v = Vec::new();
+                    for _ in 0..n { let k = self.read(); let x = self.read(); v.push((k, x)); }
+                    Val::Dict(v)
+                }
+                b'l' | b't' | b'e' | b'q' => {
+                    let n = self.count();
+                    let v: Vec<Val> = (0..n).map(|_| self.read()).collect();
+                    match c { b'l' => Val::List(v), b't' => Val::Tuple(v), b'e' => Val::Set(v), _ => Val::Deque(v) }
+                }
+                _ => std::panic::panic_any(ConvError("bad input".into())),
+            }
+        }
+    }
+    fn parse_f64(s: &str) -> f64 {
+        match s { "nan" => f64::NAN, "inf" => f64::INFINITY, "-inf" => f64::NEG_INFINITY, _ => s.parse().unwrap_or(f64::NAN) }
+    }
+    fn wstr(tag: char, s: &str, o: &mut String) { o.push(tag); o.push_str(&s.len().to_string()); o.push(':'); o.push_str(s); }
+    fn wseq(tag: char, v: &[Val], o: &mut String) {
+        o.push(tag); o.push_str(&v.len().to_string()); o.push(':');
+        for x in v { write(x, o); }
+    }
+    pub fn write(v: &Val, o: &mut String) {
+        match v {
+            Val::None => o.push('N'),
+            Val::Bool(b) => o.push(if *b { 'T' } else { 'F' }),
+            Val::Int(i) => { o.push('i'); o.push_str(&i.to_string()); o.push(';'); }
+            Val::Float(f) => {
+                o.push('f');
+                if f.is_nan() { o.push_str("nan"); } else if f.is_infinite() { o.push_str(if *f > 0.0 { "inf" } else { "-inf" }); } else { o.push_str(&format!("{:e}", f)); }
+                o.push(';');
+            }
+            Val::Dec(s) => { o.push('d'); o.push_str(s); o.push(';'); }
+            Val::Str(s) => wstr('s', s, o),
+            Val::Char(c) => wstr('c', &c.to_string(), o),
+            Val::List(v) => wseq('l', v, o),
+            Val::Tuple(v) => wseq('t', v, o),
+            Val::Set(v) => wseq('e', v, o),
+            Val::Deque(v) => wseq('q', v, o),
+            Val::Dict(v) => {
+                o.push('m'); o.push_str(&v.len().to_string()); o.push(':');
+                for (k, x) in v { write(k, o); write(x, o); }
+            }
+        }
+    }
+
+    // ---- argument slots (post-call readback of &mut arguments) ----
+    thread_local! {
+        pub static SLOT: RefCell<usize> = RefCell::new(0);
+        pub static POST: RefCell<Vec<(usize, Box<dyn Fn() -> Val>)>> = RefCell::new(Vec::new());
+    }
+    pub fn arg<T: FromVal>(v: &Val, slot: usize) -> T {
+        SLOT.with(|s| *s.borrow_mut() = slot);
+        T::from_val(v)
+    }
+    fn register(f: Box<dyn Fn() -> Val>) {
+        let slot = SLOT.with(|s| *s.borrow());
+        POST.with(|p| p.borrow_mut().push((slot, f)));
+    }
+
+    pub trait FromVal: Sized { fn from_val(v: &Val) -> Self; }
+    pub trait ToVal { fn to_val(&self) -> Val; }
+
+    fn seq_items(v: &Val) -> Vec<Val> {
+        match v {
+            Val::List(x) | Val::Tuple(x) | Val::Set(x) | Val::Deque(x) => x.clone(),
+            Val::Str(s) => s.chars().map(Val::Char).collect(),
+            Val::Dict(d) => d.iter().map(|(k, _)| k.clone()).collect(),
+            _ => bad(v, "sequence"),
+        }
+    }
+    fn dict_items(v: &Val) -> Vec<(Val, Val)> {
+        match v {
+            Val::Dict(d) => d.clone(),
+            Val::List(x) | Val::Tuple(x) | Val::Set(x) | Val::Deque(x) => x.iter().map(|p| match p {
+                Val::List(e) | Val::Tuple(e) if e.len() == 2 => (e[0].clone(), e[1].clone()),
+                _ => bad(p, "map entry"),
+            }).collect(),
+            _ => bad(v, "map"),
+        }
+    }
+    fn as_f64(v: &Val) -> f64 {
+        match v {
+            Val::Float(f) => *f, Val::Int(i) => *i as f64, Val::Bool(b) => *b as i32 as f64,
+            Val::Dec(s) => parse_f64(s), _ => bad(v, "float"),
+        }
+    }
+
+    macro_rules! ints { ($($t:ty),*) => { $(
+        impl FromVal for $t { fn from_val(v: &Val) -> Self { match v {
+            Val::Int(i) => *i as $t, Val::Bool(b) => *b as $t,
+            Val::Float(f) if f.fract() == 0.0 => *f as $t,
+            Val::Char(c) => *c as u32 as $t,
+            _ => bad(v, "integer") } } }
+        impl ToVal for $t { fn to_val(&self) -> Val { Val::Int(*self as i128) } }
+    )* } }
+    ints!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+    impl FromVal for f64 { fn from_val(v: &Val) -> Self { as_f64(v) } }
+    impl ToVal for f64 { fn to_val(&self) -> Val { Val::Float(*self) } }
+    impl FromVal for f32 { fn from_val(v: &Val) -> Self { as_f64(v) as f32 } }
+    impl ToVal for f32 { fn to_val(&self) -> Val { Val::Float(if self.is_finite() { format!("{}", self).parse().unwrap_or(*self as f64) } else { *self as f64 }) } }
+    impl FromVal for bool { fn from_val(v: &Val) -> Self { match v { Val::Bool(b) => *b, Val::Int(i) => *i != 0, _ => bad(v, "bool") } } }
+    impl ToVal for bool { fn to_val(&self) -> Val { Val::Bool(*self) } }
+    impl FromVal for char { fn from_val(v: &Val) -> Self { match v {
+        Val::Char(c) => *c,
+        Val::Str(s) if s.chars().count() == 1 => s.chars().next().unwrap(),
+        _ => bad(v, "char") } } }
+    impl ToVal for char { fn to_val(&self) -> Val { Val::Char(*self) } }
+    impl FromVal for String { fn from_val(v: &Val) -> Self { match v {
+        Val::Str(s) => s.clone(), Val::Char(c) => c.to_string(), Val::Dec(s) => s.clone(), _ => bad(v, "String") } } }
+    impl ToVal for String { fn to_val(&self) -> Val { Val::Str(self.clone()) } }
+    impl ToVal for str { fn to_val(&self) -> Val { Val::Str(self.to_string()) } }
+    impl<'a> FromVal for &'a str { fn from_val(v: &Val) -> Self { Box::leak(String::from_val(v).into_boxed_str()) } }
+    impl<'a> FromVal for &'a mut str { fn from_val(v: &Val) -> Self { Box::leak(String::from_val(v).into_boxed_str()) } }
+    impl ToVal for () { fn to_val(&self) -> Val { Val::None } }
+    impl FromVal for () { fn from_val(_: &Val) -> Self { () } }
+
+    impl<T: ToVal + ?Sized> ToVal for &T { fn to_val(&self) -> Val { (**self).to_val() } }
+    impl<T: ToVal + ?Sized> ToVal for &mut T { fn to_val(&self) -> Val { (**self).to_val() } }
+    impl<T: ToVal + ?Sized> ToVal for Box<T> { fn to_val(&self) -> Val { (**self).to_val() } }
+    impl<T: FromVal> FromVal for Box<T> { fn from_val(v: &Val) -> Self { Box::new(T::from_val(v)) } }
+    impl<T: ToVal + ?Sized> ToVal for std::rc::Rc<T> { fn to_val(&self) -> Val { (**self).to_val() } }
+    impl<T: FromVal> FromVal for std::rc::Rc<T> { fn from_val(v: &Val) -> Self { std::rc::Rc::new(T::from_val(v)) } }
+    impl<T: ToVal> ToVal for std::cell::RefCell<T> { fn to_val(&self) -> Val { self.borrow().to_val() } }
+    impl<T: FromVal> FromVal for std::cell::RefCell<T> { fn from_val(v: &Val) -> Self { RefCell::new(T::from_val(v)) } }
+    impl<'a, T: FromVal + 'static> FromVal for &'a T { fn from_val(v: &Val) -> Self { Box::leak(Box::new(T::from_val(v))) } }
+    impl<'a, T: FromVal + ToVal + 'static> FromVal for &'a mut T {
+        fn from_val(v: &Val) -> Self {
+            let b: &'static mut T = Box::leak(Box::new(T::from_val(v)));
+            let p = b as *mut T as usize;
+            register(Box::new(move || unsafe { (*(p as *const T)).to_val() }));
+            b
+        }
+    }
+    impl<'a, T: FromVal + 'static> FromVal for &'a [T] {
+        fn from_val(v: &Val) -> Self { Box::leak(Vec::<T>::from_val(v).into_boxed_slice()) }
+    }
+    impl<'a, T: FromVal + ToVal + 'static> FromVal for &'a mut [T] {
+        fn from_val(v: &Val) -> Self {
+            let b: &'static mut [T] = Box::leak(Vec::<T>::from_val(v).into_boxed_slice());
+            let (p, n) = (b.as_ptr() as usize, b.len());
+            register(Box::new(move || unsafe { std::slice::from_raw_parts(p as *const T, n) }.to_val()));
+            b
+        }
+    }
+    impl<T: ToVal> ToVal for [T] { fn to_val(&self) -> Val { Val::List(self.iter().map(|x| x.to_val()).collect()) } }
+    impl<T: ToVal, const N: usize> ToVal for [T; N] { fn to_val(&self) -> Val { Val::List(self.iter().map(|x| x.to_val()).collect()) } }
+    impl<T: FromVal, const N: usize> FromVal for [T; N] {
+        fn from_val(v: &Val) -> Self {
+            let items: Vec<T> = seq_items(v).iter().map(T::from_val).collect();
+            match items.try_into() { Ok(a) => a, Err(_) => bad(v, "array of fixed length") }
+        }
+    }
+    impl<T: FromVal> FromVal for Option<T> { fn from_val(v: &Val) -> Self { match v { Val::None => None, _ => Some(T::from_val(v)) } } }
+    impl<T: ToVal> ToVal for Option<T> { fn to_val(&self) -> Val { match self { None => Val::None, Some(x) => x.to_val() } } }
+    impl<T: FromVal> FromVal for Vec<T> { fn from_val(v: &Val) -> Self { seq_items(v).iter().map(T::from_val).collect() } }
+    impl<T: ToVal> ToVal for Vec<T> { fn to_val(&self) -> Val { Val::List(self.iter().map(|x| x.to_val()).collect()) } }
+    impl<T: FromVal> FromVal for VecDeque<T> { fn from_val(v: &Val) -> Self { seq_items(v).iter().map(T::from_val).collect() } }
+    impl<T: ToVal> ToVal for VecDeque<T> { fn to_val(&self) -> Val { Val::Deque(self.iter().map(|x| x.to_val()).collect()) } }
+    impl<T: FromVal> FromVal for std::collections::LinkedList<T> { fn from_val(v: &Val) -> Self { seq_items(v).iter().map(T::from_val).collect() } }
+    impl<T: ToVal> ToVal for std::collections::LinkedList<T> { fn to_val(&self) -> Val { Val::List(self.iter().map(|x| x.to_val()).collect()) } }
+    impl<T: FromVal + Ord> FromVal for std::collections::BinaryHeap<T> { fn from_val(v: &Val) -> Self { seq_items(v).iter().map(T::from_val).collect() } }
+    impl<T: ToVal + Ord + Clone> ToVal for std::collections::BinaryHeap<T> { fn to_val(&self) -> Val { Val::List(self.clone().into_sorted_vec().iter().rev().map(|x| x.to_val()).collect()) } }
+    impl<T: ToVal> ToVal for std::cmp::Reverse<T> { fn to_val(&self) -> Val { self.0.to_val() } }
+    impl<T: FromVal> FromVal for std::cmp::Reverse<T> { fn from_val(v: &Val) -> Self { std::cmp::Reverse(T::from_val(v)) } }
+    impl<T: FromVal + Eq + Hash, S: std::hash::BuildHasher + Default> FromVal for HashSet<T, S> { fn from_val(v: &Val) -> Self { seq_items(v).iter().map(T::from_val).collect() } }
+    impl<T: ToVal, S> ToVal for HashSet<T, S> { fn to_val(&self) -> Val { Val::Set(self.iter().map(|x| x.to_val()).collect()) } }
+    impl<T: FromVal + Ord> FromVal for BTreeSet<T> { fn from_val(v: &Val) -> Self { seq_items(v).iter().map(T::from_val).collect() } }
+    impl<T: ToVal> ToVal for BTreeSet<T> { fn to_val(&self) -> Val { Val::Set(self.iter().map(|x| x.to_val()).collect()) } }
+    impl<K: FromVal + Eq + Hash, V: FromVal, S: std::hash::BuildHasher + Default> FromVal for std::collections::HashMap<K, V, S> {
+        fn from_val(v: &Val) -> Self { dict_items(v).iter().map(|(k, x)| (K::from_val(k), V::from_val(x))).collect() }
+    }
+    impl<K: ToVal, V: ToVal, S> ToVal for std::collections::HashMap<K, V, S> {
+        fn to_val(&self) -> Val { Val::Dict(self.iter().map(|(k, x)| (k.to_val(), x.to_val())).collect()) }
+    }
+    impl<K: FromVal + Eq + Hash, V: FromVal, S: std::hash::BuildHasher + Default> FromVal for super::__bcg_prelude::HashMap<K, V, S> {
+        fn from_val(v: &Val) -> Self { super::__bcg_prelude::HashMap(FromVal::from_val(v)) }
+    }
+    impl<K: ToVal, V: ToVal, S> ToVal for super::__bcg_prelude::HashMap<K, V, S> { fn to_val(&self) -> Val { self.0.to_val() } }
+    impl<K: FromVal + Ord, V: FromVal> FromVal for BTreeMap<K, V> {
+        fn from_val(v: &Val) -> Self { dict_items(v).iter().map(|(k, x)| (K::from_val(k), V::from_val(x))).collect() }
+    }
+    impl<K: ToVal, V: ToVal> ToVal for BTreeMap<K, V> {
+        fn to_val(&self) -> Val { Val::Dict(self.iter().map(|(k, x)| (k.to_val(), x.to_val())).collect()) }
+    }
+    macro_rules! tuples { ($(($n:expr; $($t:ident $i:tt),+)),*) => { $(
+        impl<$($t: FromVal),+> FromVal for ($($t,)+) { fn from_val(v: &Val) -> Self {
+            let e = match v { Val::List(x) | Val::Tuple(x) | Val::Deque(x) if x.len() == $n => x, _ => bad(v, "tuple") };
+            ($($t::from_val(&e[$i]),)+) } }
+        impl<$($t: ToVal),+> ToVal for ($($t,)+) { fn to_val(&self) -> Val { Val::Tuple(vec![$(self.$i.to_val()),+]) } }
+    )* } }
+    tuples!((1; A 0), (2; A 0, B 1), (3; A 0, B 1, C 2), (4; A 0, B 1, C 2, D 3), (5; A 0, B 1, C 2, D 3, E 4),
+            (6; A 0, B 1, C 2, D 3, E 4, F 5), (7; A 0, B 1, C 2, D 3, E 4, F 5, G 6), (8; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7));
+
+    // Result<T, E>: Err is reported as an exception.
+    pub struct ErrPanic(pub String);
+    pub fn dbg_msg<E: std::fmt::Debug>(e: &E) -> String {
+        let s = format!("{:?}", e);
+        if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+            if let Ok(Val::Str(u)) = unescape(&s) { return u; }
+        }
+        s
+    }
+    fn unescape(s: &str) -> Result<Val, ()> {
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::new();
+        let mut it = inner.chars();
+        while let Some(c) = it.next() {
+            if c != '\\' { out.push(c); continue; }
+            match it.next() {
+                Some('n') => out.push('\n'), Some('t') => out.push('\t'), Some('r') => out.push('\r'),
+                Some('0') => out.push('\0'), Some('\\') => out.push('\\'), Some('"') => out.push('"'), Some('\'') => out.push('\''),
+                Some('u') => {
+                    let h: String = it.by_ref().skip(1).take_while(|c| *c != '}').collect();
+                    out.push(u32::from_str_radix(&h, 16).ok().and_then(char::from_u32).ok_or(())?);
+                }
+                _ => return Err(()),
+            }
+        }
+        Ok(Val::Str(out))
+    }
+    impl<T: ToVal, E: std::fmt::Debug> ToVal for Result<T, E> {
+        fn to_val(&self) -> Val {
+            match self { Ok(x) => x.to_val(), Err(e) => std::panic::panic_any(ErrPanic(dbg_msg(e))) }
+        }
+    }
+
+    pub fn panic_msg(p: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = p.downcast_ref::<&str>() { return s.to_string(); }
+        if let Some(s) = p.downcast_ref::<String>() { return s.clone(); }
+        if let Some(e) = p.downcast_ref::<ErrPanic>() { return e.0.clone(); }
+        String::new()
+    }
+
+    pub fn main_with(run: fn(&[Val]) -> Val) {
+        use std::io::{Read, Write};
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.len() < 2 { std::process::exit(2); }
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).ok();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = std::thread::Builder::new().stack_size(1 << 30).spawn(move || {
+            let mut o = String::new();
+            let parsed = std::panic::catch_unwind(|| match Reader::new(&input).read() { Val::List(v) => v, _ => Vec::new() });
+            let args = match parsed { Ok(a) => a, Err(_) => { o.push('X'); write(&Val::Str("bad input".into()), &mut o); return o; } };
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&args)));
+            std::io::stdout().flush().ok();
+            match r {
+                Ok(v) => { o.push('R'); write(&v, &mut o); }
+                Err(p) => {
+                    if let Some(c) = p.downcast_ref::<ConvError>() {
+                        o.clear(); o.push('X'); write(&Val::Str(c.0.clone()), &mut o); return o;
+                    }
+                    o.push('E'); write(&Val::Str(panic_msg(&*p)), &mut o);
+                    write(&Val::Str(if p.is::<ErrPanic>() { "Err".into() } else { "panic".into() }), &mut o);
+                }
+            }
+            let post: Vec<Val> = POST.with(|p| {
+                let p = p.borrow();
+                let mut seen = std::collections::BTreeMap::new();
+                for (slot, f) in p.iter() { seen.insert(*slot, f); }
+                seen.into_iter().map(|(s, f)| {
+                    let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f())).unwrap_or(Val::None);
+                    Val::Tuple(vec![Val::Int(s as i128), v])
+                }).collect()
+            });
+            write(&Val::List(post), &mut o);
+            o
+        }).unwrap().join().unwrap_or_else(|_| "Xs14:internal error".to_string());
+        std::io::stdout().flush().ok();
+        if let Ok(mut f) = std::fs::File::create(&argv[1]) { f.write_all(out.as_bytes()).ok(); }
+    }
+}
+
+#[allow(dead_code, unused_imports)]
+pub mod __bcg_prelude {
+    pub use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, LinkedList, VecDeque};
+    pub use std::collections::{btree_map, btree_set, hash_map, hash_set};
+    pub use std::cmp::{max, min, Ordering, Reverse};
+    pub use std::rc::Rc;
+    pub use std::cell::RefCell;
+    pub use std::fmt;
+    use std::borrow::Borrow;
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash};
+
+    /// `std::collections::HashMap` whose key lookups also accept owned keys
+    /// (`map.get_mut(String::from("k"))`) besides references.
+    #[derive(Clone)]
+    pub struct HashMap<K, V, S = RandomState>(pub std::collections::HashMap<K, V, S>);
+    impl<K, V, S: Default> Default for HashMap<K, V, S> {
+        fn default() -> Self { HashMap(std::collections::HashMap::default()) }
+    }
+    impl<K: Eq + Hash, V: PartialEq, S: BuildHasher> PartialEq for HashMap<K, V, S> {
+        fn eq(&self, o: &Self) -> bool { self.0 == o.0 }
+    }
+    impl<K: Eq + Hash, V: Eq, S: BuildHasher> Eq for HashMap<K, V, S> {}
+
+    pub trait KeyArg<K> {
+        type Q: ?Sized + Hash + Eq;
+        fn key_ref(&self) -> &Self::Q;
+    }
+    impl<'a, K, Q: ?Sized + Hash + Eq> KeyArg<K> for &'a Q where K: Borrow<Q> {
+        type Q = Q;
+        fn key_ref(&self) -> &Q { *self }
+    }
+    impl<'a, K, Q: ?Sized + Hash + Eq> KeyArg<K> for &'a mut Q where K: Borrow<Q> {
+        type Q = Q;
+        fn key_ref(&self) -> &Q { &**self }
+    }
+    impl KeyArg<String> for String {
+        type Q = str;
+        fn key_ref(&self) -> &str { self.as_str() }
+    }
+    macro_rules! owned_keys { ($($t:ty),*) => { $(
+        impl KeyArg<$t> for $t { type Q = $t; fn key_ref(&self) -> &$t { self } }
+    )* } }
+    owned_keys!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, char, bool);
+
+    impl<K, V> HashMap<K, V, RandomState> {
+        pub fn new() -> Self { HashMap(std::collections::HashMap::new()) }
+        pub fn with_capacity(n: usize) -> Self { HashMap(std::collections::HashMap::with_capacity(n)) }
+    }
+    impl<K, V, S> HashMap<K, V, S> {
+        pub fn with_hasher(h: S) -> Self { HashMap(std::collections::HashMap::with_hasher(h)) }
+        pub fn with_capacity_and_hasher(n: usize, h: S) -> Self { HashMap(std::collections::HashMap::with_capacity_and_hasher(n, h)) }
+        pub fn into_inner(self) -> std::collections::HashMap<K, V, S> { self.0 }
+        pub fn into_keys(self) -> std::collections::hash_map::IntoKeys<K, V> { self.0.into_keys() }
+        pub fn into_values(self) -> std::collections::hash_map::IntoValues<K, V> { self.0.into_values() }
+    }
+    impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
+        pub fn get<A: KeyArg<K>>(&self, k: A) -> Option<&V> where K: Borrow<A::Q> { self.0.get(k.key_ref()) }
+        pub fn get_mut<A: KeyArg<K>>(&mut self, k: A) -> Option<&mut V> where K: Borrow<A::Q> { self.0.get_mut(k.key_ref()) }
+        pub fn get_key_value<A: KeyArg<K>>(&self, k: A) -> Option<(&K, &V)> where K: Borrow<A::Q> { self.0.get_key_value(k.key_ref()) }
+        pub fn contains_key<A: KeyArg<K>>(&self, k: A) -> bool where K: Borrow<A::Q> { self.0.contains_key(k.key_ref()) }
+        pub fn remove<A: KeyArg<K>>(&mut self, k: A) -> Option<V> where K: Borrow<A::Q> { self.0.remove(k.key_ref()) }
+        pub fn remove_entry<A: KeyArg<K>>(&mut self, k: A) -> Option<(K, V)> where K: Borrow<A::Q> { self.0.remove_entry(k.key_ref()) }
+    }
+    impl<K, V, S> std::ops::Deref for HashMap<K, V, S> {
+        type Target = std::collections::HashMap<K, V, S>;
+        fn deref(&self) -> &Self::Target { &self.0 }
+    }
+    impl<K, V, S> std::ops::DerefMut for HashMap<K, V, S> {
+        fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    }
+    impl<K: fmt::Debug, V: fmt::Debug, S> fmt::Debug for HashMap<K, V, S> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
+    }
+    impl<K: Eq + Hash, V, S: BuildHasher + Default> FromIterator<(K, V)> for HashMap<K, V, S> {
+        fn from_iter<I: IntoIterator<Item = (K, V)>>(it: I) -> Self { HashMap(it.into_iter().collect()) }
+    }
+    impl<K: Eq + Hash, V, S: BuildHasher> Extend<(K, V)> for HashMap<K, V, S> {
+        fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, it: I) { self.0.extend(it) }
+    }
+    impl<'a, K: Eq + Hash + Copy, V: Copy, S: BuildHasher> Extend<(&'a K, &'a V)> for HashMap<K, V, S> {
+        fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, it: I) { self.0.extend(it) }
+    }
+    impl<K: Eq + Hash, V, const N: usize> From<[(K, V); N]> for HashMap<K, V, RandomState> {
+        fn from(a: [(K, V); N]) -> Self { HashMap(std::collections::HashMap::from(a)) }
+    }
+    impl<K, V, S> From<std::collections::HashMap<K, V, S>> for HashMap<K, V, S> {
+        fn from(m: std::collections::HashMap<K, V, S>) -> Self { HashMap(m) }
+    }
+    impl<K, V, S> From<HashMap<K, V, S>> for std::collections::HashMap<K, V, S> {
+        fn from(m: HashMap<K, V, S>) -> Self { m.0 }
+    }
+    impl<K, V, S> IntoIterator for HashMap<K, V, S> {
+        type Item = (K, V);
+        type IntoIter = std::collections::hash_map::IntoIter<K, V>;
+        fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }
+    }
+    impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S> {
+        type Item = (&'a K, &'a V);
+        type IntoIter = std::collections::hash_map::Iter<'a, K, V>;
+        fn into_iter(self) -> Self::IntoIter { self.0.iter() }
+    }
+    impl<'a, K, V, S> IntoIterator for &'a mut HashMap<K, V, S> {
+        type Item = (&'a K, &'a mut V);
+        type IntoIter = std::collections::hash_map::IterMut<'a, K, V>;
+        fn into_iter(self) -> Self::IntoIter { self.0.iter_mut() }
+    }
+    impl<K: Eq + Hash + Borrow<Q>, Q: ?Sized + Eq + Hash, V, S: BuildHasher> std::ops::Index<&Q> for HashMap<K, V, S> {
+        type Output = V;
+        fn index(&self, k: &Q) -> &V { &self.0[k] }
+    }
+}
+'''
+
+
+# --------------------------------------------------------------------------
+# Native (C++ / Rust) targets
+# --------------------------------------------------------------------------
+# The generated tester.cpp / tester.rs holds the native runtime (value wire
+# format, conversions to/from the solution's parameter and return types, the
+# call harness). ``test`` splices the solution into it, compiles it, and drives
+# the resulting binary (one process per entrypoint call) from a Python tester
+# that evaluates all assertions with the same semantics as the Python target.
+
+NATIVE_LANGS = ("cpp", "rust")
+SOLUTION_MARKER = "@@BCG_SOLUTION@@"
+
+
+def render_native_tester(lang, tests, entrypoint):
+    meta = META_PREFIX + json.dumps({"entrypoint": entrypoint, "lang": lang,
+                                     "ids": [t["id"] for t in tests]})
+    usage = ("// Usage: python babel_code_goat.py test <solution.%s> <tests_dir> --lang %s\n"
+             % (LANG_EXT[lang], lang))
+    head = "// Auto-generated by babel_code_goat.py -- do not edit.\n// " + meta + "\n" + usage
+    if lang == "cpp":
+        return head + CPP_RUNTIME + "\n// " + SOLUTION_MARKER + "\n" + CPP_HARNESS
+    return head + RUST_RUNTIME + "\n// " + SOLUTION_MARKER + "\n"
+
+
+def _blank_cpp_like(src, rust=False):
+    """Replace comments and string/char literals with spaces (keeps offsets)."""
+    out = list(src)
+    i, n = 0, len(src)
+
+    def blank(a, b):
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = src[i]
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif src.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith("/*", j) and rust:
+                    depth += 1
+                    j += 2
+                elif src.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif not rust and src.startswith('R"', i) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            m = re.match(r'R"([^(\s]{0,16})\(', src[i:])
+            if m:
+                end = src.find(")" + m.group(1) + '"', i)
+                j = n if end < 0 else end + len(m.group(1)) + 2
+                blank(i, j)
+                i = j
+            else:
+                i += 1
+        elif rust and re.match(r'(?:b|c)?r#*"', src[i:]) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            m = re.match(r'(?:b|c)?r(#*)"', src[i:])
+            end = src.find('"' + m.group(1), i + m.end())
+            j = n if end < 0 else end + 1 + len(m.group(1))
+            blank(i, j)
+            i = j
+        elif c == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            blank(i, j + 1)
+            i = j + 1
+        elif c == "'":
+            if rust:
+                m = re.match(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|.)|[^\\'\n])'", src[i:])
+                if m:
+                    blank(i, i + m.end())
+                    i += m.end()
+                else:
+                    i += 1  # lifetime
+            else:
+                if i > 0 and src[i - 1].isalnum():  # digit separator 1'000
+                    i += 1
+                    continue
+                j = i + 1
+                while j < n and src[j] != "'" and src[j] != "\n":
+                    j += 2 if src[j] == "\\" else 1
+                blank(i, j + 1)
+                i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _match_close(s, i, open_c, close_c):
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == open_c:
+            depth += 1
+        elif s[j] == close_c:
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _split_top(s, sep=","):
+    parts, depth, cur = [], 0, []
+    for ch in s:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return parts
+
+
+def _name_variants(name):
+    out = [name]
+    camel = re.sub(r"_+([a-zA-Z0-9])", lambda m: m.group(1).upper(), name)
+    if camel != name and camel:
+        out.append(camel)
+    snake = re.sub(r"(?<=[a-z0-9])([A-Z])", lambda m: "_" + m.group(1).lower(), name)
+    if snake != name:
+        out.append(snake)
+    return out
+
+
+def _scan_defs(code, names, rust):
+    """Find function definitions named in ``names``.
+
+    Returns [(name, scope_path, kind_of_innermost_scope, param_text)] where
+    scope_path is a list of (kind, name) for enclosing namespace/class/impl scopes.
+    """
+    found = []
+    stack = []  # (kind, name) per open brace
+    seg_start = 0
+    i, n = 0, len(code)
+    name_re = re.compile(r"\b(" + "|".join(re.escape(x) for x in names) + r")\s*(<[^(){};]*>)?\s*\(")
+    while i < n:
+        c = code[i]
+        if c == "{":
+            seg = code[seg_start:i]
+            kind, nm = "block", None
+            if all(k in ("ns", "class", "impl", "mod") for k, _ in stack):
+                if rust:
+                    m = re.search(r"\bimpl\b(?:\s*<[^{]*?>)?\s+(?:[\w:<>,\s&']+\s+for\s+)?([A-Za-z_]\w*)(?:\s*<[^{}]*>)?\s*(?:where\b[^{]*)?$", seg)
+                    m2 = re.search(r"\bmod\s+([A-Za-z_]\w*)\s*$", seg)
+                    if m and not re.search(r"\bfn\b", seg[m.start():]):
+                        kind, nm = "impl", m.group(1)
+                    elif m2:
+                        kind, nm = "mod", m2.group(1)
+                else:
+                    m = re.search(r"\b(class|struct)\s+(?:alignas\s*\([^)]*\)\s*)?([A-Za-z_]\w*)\s*(?:final\s*)?(?::[^{;()]*)?$", seg)
+                    m2 = re.search(r"\bnamespace\s*([A-Za-z_][\w:]*)?\s*$", seg)
+                    if m and not re.search(r"\benum\b", seg[:m.start()][-20:]):
+                        kind, nm = "class", m.group(2)
+                    elif m2:
+                        kind, nm = "ns", m2.group(1)
+                if kind == "block":
+                    # a function body: check whether it is one of ours
+                    for mm in name_re.finditer(seg):
+                        pre = seg[:mm.start()].rstrip()
+                        if pre.endswith((".", "->", "::")) or re.search(r"\b(return|new|throw)$", pre):
+                            continue
+                        if rust and not re.search(r"\bfn$", pre):
+                            continue
+                        po = mm.end() - 1
+                        pc = _match_close(seg, po, "(", ")")
+                        if pc < 0:
+                            continue
+                        tail = seg[pc + 1:]
+                        if rust or re.fullmatch(r"\s*(const|noexcept(\s*\([^)]*\))?|override|final|&|&&|->[^;{}]*|\s)*\s*(:[^;{}]*)?", tail or ""):
+                            if not rust and pre and pre[-1] in "=(,":
+                                continue
+                            found.append((mm.group(1), list(stack), seg[po + 1:pc], seg[:mm.start()]))
+                            break
+            stack.append((kind, nm))
+            seg_start = i + 1
+        elif c == "}":
+            if stack:
+                stack.pop()
+            seg_start = i + 1
+        elif c == ";":
+            # declaration (prototype) inside a class: methods defined out of line
+            seg = code[seg_start:i]
+            if not rust and stack and stack[-1][0] == "class":
+                for mm in name_re.finditer(seg):
+                    pre = seg[:mm.start()].rstrip()
+                    if pre.endswith((".", "->")) or (pre and pre[-1] in "=(,"):
+                        continue
+                    po = mm.end() - 1
+                    pc = _match_close(seg, po, "(", ")")
+                    if pc > 0:
+                        found.append((mm.group(1), list(stack), seg[po + 1:pc], seg[:mm.start()]))
+                        break
+            seg_start = i + 1
+        i += 1
+    return found
+
+
+def _param_names(ptext, rust):
+    names = []
+    for p in _split_top(ptext):
+        p = p.strip()
+        if not p or p == "void" or p == "...":
+            continue
+        if rust:
+            if re.fullmatch(r"&?\s*('\w+\s+)?(mut\s+)?self(\s*:.*)?", p, re.S):
+                names.append(None)
+                continue
+            head = _split_top(p, ":")[0].strip() if ":" in p else p
+            head = re.sub(r"^(ref\s+)?(mut\s+)?", "", head).strip()
+            names.append(head if re.fullmatch(r"[A-Za-z_]\w*", head) else "")
+        else:
+            p = _split_top(p, "=")[0].strip()
+            p = re.sub(r"\[[^\]]*\]\s*$", "", p).strip()
+            m = re.search(r"([A-Za-z_]\w*)\s*$", p)
+            names.append(m.group(1) if m and p[:m.start()].strip() else "")
+    return names
+
+
+def _native_entry(lang, source, entrypoint):
+    """Locate the entrypoint in the solution. Returns dict or None."""
+    parts = entrypoint.split(".")
+    name, class_hint = parts[-1], (parts[-2] if len(parts) > 1 else None)
+    rust = lang == "rust"
+    code = _blank_cpp_like(source, rust)
+    defs = _scan_defs(code, _name_variants(name), rust)
+    if not defs:
+        return None
+
+    def scope_classes(st):
+        return [nm for k, nm in st if k in ("class", "impl")]
+
+    def score(d):
+        nm, st, _p, _pre = d
+        cls = scope_classes(st)
+        s = 0 if nm == name else 1
+        if class_hint:
+            return (0 if cls and cls[-1] == class_hint else 1 if not cls else 2, s)
+        return (0 if not cls else 1, s)
+
+    nm, st, ptext, pre = min(defs, key=score)
+    params = _param_names(ptext, rust)
+    info = {"name": nm, "params": [p for p in params if p is not None]}
+    path = [x for _k, x in st if x]
+    if rust:
+        info["self"] = bool(params) and params[0] is None
+        info["path"] = "::".join(["self"] + path + [nm]) if not info["self"] else None
+        if info["self"]:
+            info["owner"] = "::".join(["self"] + path)
+    else:
+        kinds = [k for k, _x in st]
+        is_member = bool(kinds) and kinds[-1] == "class"
+        info["member"] = is_member and not re.search(r"\bstatic\b", pre.split(";")[-1].split("}")[-1])
+        info["path"] = "::" + "::".join(path + [nm])
+        if is_member:
+            info["owner"] = "::" + "::".join(path)
+    return info
+
+
+def _cpp_config(info):
+    if info.get("owner") and info["member"]:
+        call = "__bcg_obj.%s(__VA_ARGS__)" % info["name"]
+        probe = "std::declval<%s&>().%s(__VA_ARGS__)" % (info["owner"], info["name"])
+        decl = "%s __bcg_obj{};" % info["owner"]
+    else:
+        call = probe = "%s(__VA_ARGS__)" % info["path"]
+        decl = ""
+    return ("#define BCG_ENTRY_PTR %s\n#define BCG_PROBE(...) %s\n#define BCG_CALL(...) %s\n"
+            "#define BCG_OBJ_DECL %s\n" % (info["path"], probe, call, decl))
+
+
+def _rust_rewrite_solution(src):
+    """Make the solution use the prelude ``HashMap`` (accepts owned-key lookups)."""
+    code = _blank_cpp_like(src, True)
+    out = []
+    pos = 0
+    # inner attributes cannot appear inside the wrapping module: drop them
+    for m in re.finditer(r"#!\s*\[", code):
+        end = _match_close(code, m.end() - 1, "[", "]")
+        if end < 0:
+            continue
+        out.append(src[pos:m.start()])
+        out.append(" " * 0)
+        pos = end + 1
+    out.append(src[pos:])
+    src = "".join(out)
+    code = _blank_cpp_like(src, True)
+    edits = []
+    for m in re.finditer(r"\buse\s+(::)?std\b[^;]*;", code):
+        stmt = code[m.start():m.end()]
+        for h in re.finditer(r"\bHashMap\b(?!\s+as\b)", stmt):
+            edits.append((m.start() + h.end(), m.start() + h.end(), " as _"))
+        for h in re.finditer(r"\bcollections\s*::\s*\*", stmt):
+            edits.append((m.start() + h.start(), m.start() + h.end(),
+                          "collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, LinkedList, VecDeque, "
+                          "btree_map, btree_set, hash_map, hash_set}"))
+    for m in re.finditer(r"(?<![\w:])(::)?std\s*::\s*collections\s*::\s*(hash_map\s*::\s*)?HashMap\b", code):
+        if any(a <= m.start() < b for a, b in
+               ((u.start(), u.end()) for u in re.finditer(r"\buse\s+(::)?std\b[^;]*;", code))):
+            continue
+        edits.append((m.start(), m.end(), "crate::__bcg_prelude::HashMap"))
+    for a, b, rep in sorted(edits, reverse=True):
+        src = src[:a] + rep + src[b:]
+    return src
+
+
+def _rust_owner_ctor(owner, src):
+    base = owner.split("::")[-1]
+    code = _blank_cpp_like(src, True)
+    if re.search(r"\bstruct\s+" + re.escape(base) + r"\s*;", code):
+        return owner
+    if (re.search(r"#\[derive\([^)]*\bDefault\b[^)]*\)\]\s*(pub(\([^)]*\))?\s+)?struct\s+" + re.escape(base) + r"\b", code)
+            or re.search(r"\bimpl\s+Default\s+for\s+" + re.escape(base) + r"\b", code)):
+        return "<%s as ::std::default::Default>::default()" % owner
+    if re.search(r"\bfn\s+new\s*\(\s*\)", code):
+        return owner + "::new()"
+    return "<%s as ::std::default::Default>::default()" % owner
+
+
+def _rust_main(info, src):
+    k = len(info["params"])
+    args = ", ".join("__bcg_rt::arg(&__a[%d], %d)" % (i, i) for i in range(k))
+    if info["self"]:
+        pre = "#[allow(unused_mut)] let mut __bcg_self = %s;" % _rust_owner_ctor(info["owner"], src)
+        call = "__bcg_self.%s(%s)" % (info["name"], args)
+    else:
+        pre = ""
+        call = "%s(%s)" % (info["path"], args)
+    return ("    #[allow(unused)]\n    pub fn __bcg_run(__a: &[crate::__bcg_rt::Val]) -> crate::__bcg_rt::Val {\n"
+            "        use crate::__bcg_rt;\n"
+            "        if __a.len() != %d { __bcg_rt::bad(&crate::__bcg_rt::Val::None, \"wrong number of arguments\") }\n"
+            "        %s\n        let __r = %s;\n        __bcg_rt::ToVal::to_val(&__r)\n    }\n" % (k, pre, call))
+
+
+def _compose_native(lang, tester_text, solution_src, info):
+    i = tester_text.find(SOLUTION_MARKER)
+    if i < 0:
+        return None
+    nl = tester_text.find("\n", i)
+    head, tail = tester_text[:i], tester_text[nl + 1:] if nl >= 0 else ""
+    if lang == "cpp":
+        return (head + "\n#define main __bcg_user_main\n#line 1 \"solution.cpp\"\n" + solution_src +
+                "\n#undef main\n" + _cpp_config(info) + tail)
+    sol = _rust_rewrite_solution(solution_src)
+    return (head + "\n#[allow(unused_imports, dead_code, non_snake_case, unused_variables, unused_mut)]\n"
+            "mod __bcg_sol {\nuse crate::__bcg_prelude::*;\n" + sol + "\n" +
+            _rust_main(info, solution_src) + "}\nfn main() { __bcg_rt::main_with(__bcg_sol::__bcg_run); }\n" + tail)
+
+
+def _compile_native(lang, src, workdir, timeout=600):
+    """Compile; returns binary path or None."""
+    exe = os.path.join(workdir, "bcg_bin")
+    if lang == "cpp":
+        path = os.path.join(workdir, "bcg_main.cpp")
+        cxx = os.environ.get("CXX") or shutil.which("g++") or shutil.which("clang++") or shutil.which("c++")
+        if not cxx:
+            return None
+        cmds = [[cxx, "-std=gnu++20", "-O2", "-w", "-o", exe, path, "-pthread"],
+                [cxx, "-std=gnu++17", "-O2", "-w", "-o", exe, path, "-pthread"]]
+    else:
+        path = os.path.join(workdir, "bcg_main.rs")
+        rustc = shutil.which("rustc")
+        if not rustc:
+            return None
+        cmds = [[rustc, "--edition", "2021", "-C", "opt-level=2", "--cap-lints", "allow",
+                 "-C", "debuginfo=0", "-o", exe, path]]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(src)
+    for cmd in cmds:
+        try:
+            p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=timeout, cwd=workdir)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if p.returncode == 0 and os.path.isfile(exe):
+            return exe
+        if os.environ.get("BCG_DEBUG"):
+            sys.stderr.write(p.stderr.decode("utf-8", "replace"))
+        if lang == "cpp" and b"gnu++20" not in p.stderr and b"c++20" not in p.stderr:
+            break
+    return None
+
+
+NATIVE_SHIM = r'''# Auto-generated proxy: forwards entrypoint calls to a compiled native binary.
+import collections as _c
+import decimal as _d
+import os as _os
+import subprocess as _sp
+import sys as _sys
+import tempfile as _tf
+
+_BIN = __BIN__
+_PARAMS = __PARAMS__
+
+
+class _NativeFail(BaseException):
+    """Harness-level failure (crash, conversion error): never a test pass."""
+
+
+class NativeError(Exception):
+    """An exception thrown (C++) / panic or Err (Rust) by the solution."""
+    _bcg_native = True
+
+    def __init__(self, msg, etype=""):
+        Exception.__init__(self, msg)
+        self.etype = etype
+
+
+def _enc(v, o):
+    if v is None:
+        o.append(b"N")
+    elif v is True:
+        o.append(b"T")
+    elif v is False:
+        o.append(b"F")
+    elif isinstance(v, int):
+        o.append(b"i%d;" % v)
+    elif isinstance(v, float):
+        o.append(b"f" + repr(v).encode() + b";")
+    elif isinstance(v, _d.Decimal):
+        o.append(b"d" + str(v).encode() + b";")
+    elif isinstance(v, str):
+        b = v.encode("utf-8", "surrogatepass")
+        o.append(b"s%d:" % len(b) + b)
+    elif isinstance(v, (set, frozenset)):
+        items = list(v)
+        try:
+            items.sort()
+        except Exception:
+            items.sort(key=lambda x: (type(x).__name__, repr(x)))
+        o.append(b"e%d:" % len(items))
+        for x in items:
+            _enc(x, o)
+    elif isinstance(v, dict):
+        o.append(b"m%d:" % len(v))
+        for k, x in v.items():
+            _enc(k, o)
+            _enc(x, o)
+    elif isinstance(v, (list, tuple, _c.deque)):
+        o.append((b"l" if isinstance(v, list) else b"t" if isinstance(v, tuple) else b"q") + b"%d:" % len(v))
+        for x in v:
+            _enc(x, o)
+    else:
+        raise _NativeFail("unsupported value %r" % type(v))
+
+
+def _frozen(x):
+    if isinstance(x, list) or isinstance(x, _c.deque):
+        return tuple(_frozen(y) for y in x)
+    if isinstance(x, set):
+        return frozenset(_frozen(y) for y in x)
+    if isinstance(x, dict):
+        return tuple((_frozen(k), _frozen(v)) for k, v in x.items())
+    return x
+
+
+class _Dec:
+    def __init__(self, data):
+        self.d = data
+        self.p = 0
+
+    def until(self, ch):
+        q = self.d.index(ch, self.p)
+        s = self.d[self.p:q]
+        self.p = q + 1
+        return s
+
+    def read(self):
+        c = self.d[self.p:self.p + 1]
+        self.p += 1
+        if c == b"N":
+            return None
+        if c == b"T":
+            return True
+        if c == b"F":
+            return False
+        if c == b"i":
+            return int(self.until(b";"))
+        if c == b"f":
+            return float(self.until(b";").decode())
+        if c == b"d":
+            return _d.Decimal(self.until(b";").decode())
+        if c in (b"s", b"c"):
+            n = int(self.until(b":"))
+            s = self.d[self.p:self.p + n]
+            self.p += n
+            return s.decode("utf-8", "surrogateescape")
+        if c == b"m":
+            n = int(self.until(b":"))
+            out = {}
+            for _ in range(n):
+                k = self.read()
+                out[_frozen(k)] = self.read()
+            return out
+        if c in (b"l", b"t", b"e", b"q"):
+            n = int(self.until(b":"))
+            items = [self.read() for _ in range(n)]
+            if c == b"t":
+                return tuple(items)
+            if c == b"e":
+                return set(_frozen(x) for x in items)
+            if c == b"q":
+                return _c.deque(items)
+            return items
+        raise _NativeFail("bad response")
+
+
+def _update(orig, new):
+    try:
+        if isinstance(orig, _c.deque) and isinstance(new, (list, tuple, _c.deque)):
+            orig.clear()
+            orig.extend(new)
+        elif isinstance(orig, list) and isinstance(new, (list, tuple, _c.deque)):
+            orig[:] = list(new)
+        elif isinstance(orig, dict) and isinstance(new, dict):
+            orig.clear()
+            orig.update(new)
+        elif isinstance(orig, set) and isinstance(new, (set, list, tuple)):
+            orig.clear()
+            orig.update(new)
+    except Exception:
+        pass
+
+
+def _call(*args, **kwargs):
+    args = list(args)
+    if kwargs:
+        rest = dict(kwargs)
+        for p in _PARAMS[len(args):]:
+            if p in rest:
+                args.append(rest.pop(p))
+            else:
+                break
+        if rest:
+            raise _NativeFail("unknown or out-of-order keyword arguments: %s" % ", ".join(rest))
+    o = []
+    _enc(args, o)
+    fd, path = _tf.mkstemp(prefix="bcg_res_")
+    _os.close(fd)
+    try:
+        try:
+            p = _sp.run([_BIN, path], input=b"".join(o),
+                        stdout=_sp.PIPE, stderr=_sp.PIPE)
+        except OSError as e:
+            raise _NativeFail(str(e))
+        if p.stdout:
+            _sys.stdout.write(p.stdout.decode("utf-8", "replace"))
+        if p.stderr:
+            _sys.stderr.write(p.stderr.decode("utf-8", "replace"))
+        with open(path, "rb") as f:
+            resp = f.read()
+    finally:
+        try:
+            _os.unlink(path)
+        except OSError:
+            pass
+    if not resp:
+        raise _NativeFail("native process failed (exit %s)" % p.returncode)
+    dec = _Dec(resp)
+    tag = resp[0:1]
+    dec.p = 1
+    try:
+        if tag == b"X":
+            raise _NativeFail(dec.read())
+        if tag == b"E":
+            msg, etype = dec.read(), dec.read()
+            result = None
+        elif tag == b"R":
+            result = dec.read()
+        else:
+            raise _NativeFail("bad response")
+        post = dec.read()
+    except _NativeFail:
+        raise
+    except Exception:
+        raise _NativeFail("bad response")
+    allv = list(args)
+    for idx, val in post or []:
+        if 0 <= idx < len(allv):
+            _update(allv[idx], val)
+    if tag == b"E":
+        raise NativeError(msg, etype)
+    return result
+
+
+globals()[__NAME__] = _call
+'''
+
+
+def _native_shim(binary, name, params):
+    return (NATIVE_SHIM.replace("__BIN__", repr(binary)).replace("__PARAMS__", repr(params))
+            .replace("__NAME__", repr(name)))
+
+
+def run_native(lang, tester, solution, tests, entrypoint, timeout, tol):
+    """Compile and run; returns dict id->bool, or None when not runnable."""
+    try:
+        with open(tester, "r", encoding="utf-8") as f:
+            tester_text = f.read()
+        with open(solution, "r", encoding="utf-8", errors="surrogateescape") as f:
+            source = f.read()
+    except OSError:
+        return None
+    if SOLUTION_MARKER not in tester_text:
+        return None
+    work = tempfile.mkdtemp(prefix="bcg_native_")
+    try:
+        info = _native_entry(lang, source, entrypoint)
+        binary = None
+        if info is not None:
+            src = _compose_native(lang, tester_text, source, info)
+            if src is not None:
+                binary = _compile_native(lang, src, work)
+        name = entrypoint.split(".")[-1]
+        shim = os.path.join(work, "bcg_solution.py")
+        with open(shim, "w", encoding="utf-8") as f:
+            if binary is None:
+                f.write("raise ImportError('solution did not compile')\n")
+            else:
+                f.write(_native_shim(binary, name, info["params"]))
+        py_tester = os.path.join(work, "tester.py")
+        with open(py_tester, "w", encoding="utf-8") as f:
+            f.write(render_tester("python", tests, name))
+        return _run_tester([sys.executable], py_tester, shim, len(tests), timeout,
+                           ["--tol", repr(float(tol))])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
@@ -3513,7 +5082,10 @@ def cmd_generate(args) -> int:
         sys.stderr.write(f"error: {e}\n")
         return 1
     try:
-        content = render_tester(lang, tests, ep)
+        if lang in NATIVE_LANGS:
+            content = render_native_tester(lang, tests, ep)
+        else:
+            content = render_tester(lang, tests, ep)
     except Exception as e:  # pragma: no cover
         sys.stderr.write(f"error: {e}\n")
         return 1
@@ -3689,6 +5261,19 @@ def cmd_test(args) -> int:
     if not os.path.isfile(solution):
         return emit_result("error", [], ids)
     solution = os.path.abspath(solution)
+    if lang in NATIVE_LANGS:
+        if not ids:
+            return emit_result("pass", [], [])
+        timeout = args.timeout if args.timeout and args.timeout > 0 else DEFAULT_TIMEOUT
+        ep = meta["entrypoint"] if meta and isinstance(meta.get("entrypoint"), str) else None
+        if ep is None:
+            return emit_result("error", [], ids)
+        results = run_native(lang, os.path.abspath(tester), solution, tests, ep, timeout, tol)
+        if results is None:
+            return emit_result("error", [], ids)
+        passed = [i for i in ids if results.get(i) is True]
+        failed = [i for i in ids if results.get(i) is not True]
+        return emit_result("pass" if not failed else "fail", passed, failed)
     if lang == "python":
         base = [sys.executable]
     else:
