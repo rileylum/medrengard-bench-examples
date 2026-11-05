@@ -451,22 +451,68 @@ class SecondaryStore:
         if not isinstance(data, dict) or not isinstance(data.get("items"), list):
             raise CfgError("secondary-store: malformed batch-read response")
         items = data["items"]
-        if len(items) != len(keys):
-            raise CfgError("secondary-store: batch-read item count mismatch")
+        by_key = {}
+        for idx, item in enumerate(items):
+            if isinstance(item, dict) and isinstance(item.get("key"), str):
+                by_key.setdefault(item["key"], item)
+            elif idx < len(keys) and isinstance(item, dict):
+                by_key.setdefault(keys[idx], item)
         out = []
-        for key, item in zip(keys, items):
-            if not isinstance(item, dict) or item.get("key") != key:
-                raise CfgError("secondary-store: malformed batch-read item")
+        for key in keys:
+            item = by_key.get(key)
+            if item is None:
+                # Per-key failure: no usable item for this key.
+                out.append((key, "error", None))
+                continue
             st = item.get("status")
-            if st == "ok":
-                if not isinstance(item.get("value"), str):
-                    raise CfgError("secondary-store: malformed batch-read item")
+            if st == "ok" and isinstance(item.get("value"), str):
                 out.append((key, "ok", item["value"]))
-            elif st in ("missing", "error"):
-                out.append((key, st, None))
+            elif st == "missing":
+                out.append((key, "missing", None))
             else:
-                raise CfgError("secondary-store: malformed batch-read item")
+                out.append((key, "error", None))
         return out
+
+    def read_each(self, keys):
+        """Per-key reads; operational failures are isolated per key."""
+        out = []
+        for key in keys:
+            try:
+                value = self.get(key)
+            except Exception:
+                out.append((key, "error", None))
+                continue
+            if value is None:
+                out.append((key, "missing", None))
+            else:
+                out.append((key, "ok", value))
+        return out
+
+
+def compose_primary_key(prefix, key):
+    if prefix is None:
+        return key
+    p = prefix.strip("/")
+    k = key.lstrip("/")
+    if p == "":
+        return k
+    return p + "/" + k
+
+
+def compose_secondary_key(prefix, separator, key):
+    if not prefix:
+        return key
+    return prefix + (separator or "") + key
+
+
+def store_key(stores, src, key):
+    if src == "primary-store":
+        return compose_primary_key(stores.get("primary-store-prefix"), key)
+    if src == "secondary-store":
+        return compose_secondary_key(stores.get("secondary-store-key-prefix"),
+                                     stores.get("secondary-store-key-separator"),
+                                     key)
+    return key
 
 
 class Param:
@@ -513,9 +559,11 @@ def seed(params, args, stores):
             key = decl[src]
             version = None
             if src == "primary-store":
-                raw, version = stores["primary-store"].get_versioned(key)
+                raw, version = stores["primary-store"].get_versioned(
+                    store_key(stores, src, key))
             elif src == "secondary-store":
-                raw = stores["secondary-store"].get(key)
+                raw = stores["secondary-store"].get(
+                    store_key(stores, src, key))
             else:
                 raw = lookup(src, key, args, None)
             if raw is None:
@@ -622,9 +670,11 @@ class Watcher:
         self.by_secondary = {}
         for st in states:
             if "primary-store" in st.decl and stores["primary-store"]:
-                self.by_primary[st.decl["primary-store"]] = st
+                self.by_primary[store_key(stores, "primary-store",
+                                          st.decl["primary-store"])] = st
             if "secondary-store" in st.decl and stores["secondary-store"]:
-                self.by_secondary[st.decl["secondary-store"]] = st
+                self.by_secondary[store_key(stores, "secondary-store",
+                                            st.decl["secondary-store"])] = st
 
     def monitorable(self):
         return bool(self.by_primary) or bool(self.by_secondary)
@@ -681,13 +731,16 @@ class Watcher:
         while not self.done.is_set():
             try:
                 items = store.batch_read(keys)
-            except CfgError as exc:
-                sys.stderr.write("warning: %s\n" % exc)
-                sys.stderr.flush()
-                items = []
+            except Exception:
+                try:
+                    items = store.read_each(keys)
+                except Exception:
+                    items = []
             with self.lock:
                 for key, status, value in items:
-                    st = self.by_secondary[key]
+                    st = self.by_secondary.get(key)
+                    if st is None:
+                        continue
                     if status == "error":
                         continue
                     if status == "missing":
@@ -735,11 +788,15 @@ class Watcher:
 
 USAGE = ("usage: cfgpipe.py [--primary-store <base-url>] "
          "[--secondary-store <base-url>] "
-         "[--secondary-store-poll-interval <duration>] [--watch] "
+         "[--secondary-store-poll-interval <duration>] "
+         "[--primary-store-prefix <path>] "
+         "[--secondary-store-key-prefix <prefix> "
+         "--secondary-store-key-separator <separator>] [--watch] "
          "<schema-file> [arg-candidates...]\n")
 
 _VALUE_FLAGS = ("primary-store", "secondary-store",
-                "secondary-store-poll-interval")
+                "secondary-store-poll-interval", "primary-store-prefix",
+                "secondary-store-key-prefix", "secondary-store-key-separator")
 
 
 def parse_globals(argv):
@@ -795,8 +852,17 @@ def main(argv):
         return 2
     watch = opts["watch"]
     try:
+        if (opts["secondary-store-key-prefix"] is not None
+                and opts["secondary-store-key-separator"] is None):
+            raise CfgError("--secondary-store-key-prefix requires "
+                           "--secondary-store-key-separator")
         schema, params = load_schema(argv[idx])
-        stores = {"primary-store": None, "secondary-store": None}
+        stores = {"primary-store": None, "secondary-store": None,
+                  "primary-store-prefix": opts["primary-store-prefix"],
+                  "secondary-store-key-prefix":
+                      opts["secondary-store-key-prefix"],
+                  "secondary-store-key-separator":
+                      opts["secondary-store-key-separator"]}
         classes = {"primary-store": PrimaryStore,
                    "secondary-store": SecondaryStore}
         for src in ("primary-store", "secondary-store"):
@@ -811,6 +877,16 @@ def main(argv):
                     raise CfgError("--%s is not configured but required by "
                                    "parameter(s): %s"
                                    % (src, ", ".join(needing)))
+        for src in ("primary-store", "secondary-store"):
+            seen = {}
+            for path, decl in params:
+                if src in decl:
+                    ck = store_key(stores, src, decl[src])
+                    if ck in seen:
+                        raise CfgError("parameters %r and %r share composed "
+                                       "%s key %r" % (dotted(seen[ck]),
+                                                      dotted(path), src, ck))
+                    seen[ck] = path
         poll_interval = DEFAULT_POLL_INTERVAL
         if watch and stores["secondary-store"] is not None:
             if opts["secondary-store-poll-interval"] is not None:
