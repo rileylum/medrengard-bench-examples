@@ -16,8 +16,9 @@ Commands:
   check <file.circ>    Parse and validate a .circ circuit file and report
                        its interface.
   eval <file.circ> [--set name=value ...] [--default 0|1] [--allow-extra]
-       [--radix bin|hex|dec]
-                       Evaluate the circuit (2-valued) and print outputs.
+       [--radix bin|hex|dec] [--mode 2val|3val]
+                       Evaluate the circuit (2-valued, or 3-valued with X)
+                       and print outputs.
 
 Global flags:
   --help               Show this help and exit.
@@ -88,6 +89,7 @@ InputValueParseError = _mk("InputValueParseError", 2)
 WidthMismatchError = _mk("WidthMismatchError", 3)
 IndexOutOfBoundsError = _mk("IndexOutOfBoundsError", 3)
 InputWidthMismatchError = _mk("InputWidthMismatchError", 3)
+RadixNotAllowedIn3ValError = _mk("RadixNotAllowedIn3ValError", 1)
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +161,69 @@ def format_value(value, width, radix):
     if radix == "dec":
         return str(value)
     return "0b" + format(value, "0%db" % width)
+
+
+def parse_literal3(text):
+    """Parse a 3-valued runtime literal; return ((value, xmask), width).
+
+    Binary forms may contain X/x digits; hex and decimal forms may not.
+    Raise ValueError on bad syntax."""
+    t = text
+    if t in ("X", "x"):
+        return (0, 1), 1
+    digits = None
+    width = None
+    if "'" in t:
+        size_s, _, rest = t.partition("'")
+        if rest[:1] in ("b", "B"):
+            size_s2 = size_s.replace("_", "")
+            if not size_s2 or not set(size_s2) <= _DEC_DIGITS:
+                raise ValueError("invalid literal size in %r" % text)
+            width = int(size_s2)
+            if width < 1:
+                raise ValueError("literal width must be at least 1 in %r" % text)
+            digits = rest[1:].replace("_", "")
+            if not digits:
+                raise ValueError("missing digits in literal %r" % text)
+    elif len(t) >= 2 and t[0] == "0" and t[1] in "bB":
+        digits = t[2:].replace("_", "")
+        if not digits:
+            raise ValueError("missing digits in literal %r" % text)
+    if digits is None:
+        v, w = parse_literal(t)
+        return (v, 0), w
+    if not set(digits) <= set("01xX"):
+        raise ValueError("invalid binary digits in literal %r" % text)
+    if width is None:
+        width = len(digits)
+    elif len(digits) > width:
+        extra = digits[:len(digits) - width]
+        if set(extra) != {"0"}:
+            raise ValueError("literal %r does not fit in %d bit(s)" % (text, width))
+        digits = digits[len(digits) - width:]
+    v = 0
+    x = 0
+    for ch in digits:
+        v <<= 1
+        x <<= 1
+        if ch == "1":
+            v |= 1
+        elif ch in "xX":
+            x |= 1
+    return (v, x), width
+
+
+def format_value3(val, width):
+    v, x = val
+    out = []
+    for i in range(width - 1, -1, -1):
+        if (x >> i) & 1:
+            out.append("X")
+        else:
+            out.append(str((v >> i) & 1))
+    if width == 1:
+        return out[0]
+    return "0b" + "".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +762,14 @@ def parse_runtime_literal(text, what):
         raise InputValueParseError("invalid value %r for %s: %s" % (text, what, ex))
 
 
+def parse_runtime_literal3(text, what):
+    v = text.strip()
+    try:
+        return parse_literal3(v)
+    except ValueError as ex:
+        raise InputValueParseError("invalid value %r for %s: %s" % (text, what, ex))
+
+
 def eval_expr(e, env, c):
     if isinstance(e, Const):
         return e.value
@@ -748,6 +821,107 @@ def eval_expr(e, env, c):
     raise CircoptError("unknown operator %s" % op)
 
 
+def _not3(a, m):
+    v, x = a
+    return (~v & ~x & m, x)
+
+
+def _and3(a, b, m):
+    k0 = (~a[0] & ~a[1] & m) | (~b[0] & ~b[1] & m)
+    one = a[0] & b[0]
+    return (one, m & ~k0 & ~one)
+
+
+def _or3(a, b, m):
+    one = (a[0] | b[0]) & m
+    k0 = (~a[0] & ~a[1]) & (~b[0] & ~b[1]) & m
+    return (one, m & ~k0 & ~one)
+
+
+def _xor3(a, b, m):
+    x = (a[1] | b[1]) & m
+    return ((a[0] ^ b[0]) & ~x & m, x)
+
+
+def eval_expr3(e, env, c):
+    """3-valued evaluation; values are (value_bits, x_bits) pairs."""
+    if isinstance(e, Const):
+        return (e.value, 0)
+    if isinstance(e, Ident):
+        return env[e.name]
+    if isinstance(e, Index):
+        lsb = c.ranges[e.name][1]
+        v, x = env[e.name]
+        sh = e.idx - lsb
+        return ((v >> sh) & 1, (x >> sh) & 1)
+    if isinstance(e, Slice):
+        lsb = c.ranges[e.name][1]
+        v, x = env[e.name]
+        sh = e.lo - lsb
+        m = mask(e.w)
+        return ((v >> sh) & m, (x >> sh) & m)
+    if isinstance(e, Concat):
+        rv = 0
+        rx = 0
+        for p in e.parts:
+            pv, px = eval_expr3(p, env, c)
+            rv = (rv << p.w) | pv
+            rx = (rx << p.w) | px
+        return (rv, rx)
+    vals = [eval_expr3(a, env, c) for a in e.args]
+    op = e.op
+    m = mask(e.w)
+    if op == "BUF":
+        return vals[0]
+    if op == "NOT":
+        return _not3(vals[0], m)
+    if op in ("AND", "NAND", "OR", "NOR", "XOR", "XNOR"):
+        base = {"NAND": "AND", "NOR": "OR", "XNOR": "XOR"}.get(op, op)
+        fn = {"AND": _and3, "OR": _or3, "XOR": _xor3}[base]
+        r = vals[0]
+        for v in vals[1:]:
+            r = fn(r, v, m)
+        return r if base == op else _not3(r, m)
+    if op in ("MUX", "ITE"):
+        sv, sx = vals[0]
+        a, b = vals[1], vals[2]
+        if not sx:
+            return a if sv else b
+        x = (a[1] | b[1] | (a[0] ^ b[0])) & m
+        return (a[0] & ~x & m, x)
+    if op in ("REDUCE_AND", "REDUCE_OR", "REDUCE_XOR"):
+        w = e.args[0].w
+        v, x = vals[0]
+        am = mask(w)
+        if op == "REDUCE_AND":
+            if (~v & ~x & am):
+                return (0, 0)
+            return (0, 1) if x else (1, 0)
+        if op == "REDUCE_OR":
+            if v & am:
+                return (1, 0)
+            return (0, 1) if x else (0, 0)
+        if x:
+            return (0, 1)
+        return (bin(v).count("1") & 1, 0)
+    if op == "EQ":
+        (av, ax), (bv, bx) = vals
+        known = ~(ax | bx) & mask(e.args[0].w)
+        if (av ^ bv) & known:
+            return (0, 0)
+        if ax | bx:
+            return (0, 1)
+        return (1, 0)
+    raise CircoptError("unknown operator %s" % op)
+
+
+def evaluate3(c, inputs):
+    env = dict(inputs)
+    for name in topo_order(c):
+        env[name] = eval_expr3(c.assigns[name], env, c)
+    return env
+
+
 def topo_order(c):
     order = []
     state = {}
@@ -788,6 +962,22 @@ def evaluate(c, inputs):
 def cmd_eval(args, opts):
     if len(args) != 1:
         raise CliUsageError("eval requires exactly one file argument")
+    mode = "2val"
+    if opts.get("--mode"):
+        mode = opts["--mode"][-1].strip().lower()
+        if mode not in ("2val", "3val"):
+            raise CliUsageError("invalid --mode %r (expected 2val or 3val)"
+                                % opts["--mode"][-1])
+    tri = mode == "3val"
+    radix = "bin"
+    if opts.get("--radix"):
+        radix = opts["--radix"][-1].strip().lower()
+        if radix not in ("bin", "hex", "dec"):
+            raise CliUsageError("invalid --radix %r (expected bin, hex or dec)"
+                                % opts["--radix"][-1])
+    if tri and radix != "bin":
+        raise RadixNotAllowedIn3ValError(
+            "--radix %s is not allowed with --mode 3val (only bin)" % radix)
     sets = []
     for s in opts.get("--set", []):
         if "=" not in s:
@@ -796,17 +986,18 @@ def cmd_eval(args, opts):
         name = name.strip()
         if not name:
             raise InputValueParseError("invalid --set %r (empty name)" % s)
-        sets.append((name, val, parse_runtime_literal(val, name)))
+        if tri:
+            sets.append((name, val, parse_runtime_literal3(val, name)))
+        else:
+            sets.append((name, val, parse_runtime_literal(val, name)))
     default = None
     if opts.get("--default"):
-        default = parse_bit(opts["--default"][-1], "--default")
+        d = opts["--default"][-1].strip()
+        if tri and d in ("X", "x"):
+            default = "X"
+        else:
+            default = parse_bit(opts["--default"][-1], "--default")
     allow_extra = bool(opts.get("--allow-extra"))
-    radix = "bin"
-    if opts.get("--radix"):
-        radix = opts["--radix"][-1].strip().lower()
-        if radix not in ("bin", "hex", "dec"):
-            raise CliUsageError("invalid --radix %r (expected bin, hex or dec)"
-                                % opts["--radix"][-1])
 
     c = load_circ(args[0])
     inputs = {}
@@ -830,18 +1021,25 @@ def cmd_eval(args, opts):
                                     % ", ".join(missing))
         for n in missing:
             msb, lsb = c.ranges[n]
-            inputs[n] = mask(msb - lsb + 1) if default else 0
-    env = evaluate(c, inputs)
+            m = mask(msb - lsb + 1)
+            if tri:
+                inputs[n] = (0, m) if default == "X" else ((m if default else 0), 0)
+            else:
+                inputs[n] = m if default else 0
+    env = evaluate3(c, inputs) if tri else evaluate(c, inputs)
     outs = sorted(c.outputs)
     result = {
-        "mode": "2val",
+        "mode": mode,
         "radix": radix,
         "outputs": [],
     }
     lines = []
     for n in outs:
         msb, lsb = c.ranges[n]
-        val = format_value(env[n], msb - lsb + 1, radix)
+        if tri:
+            val = format_value3(env[n], msb - lsb + 1)
+        else:
+            val = format_value(env[n], msb - lsb + 1, radix)
         result["outputs"].append({"name": n, "msb": msb, "lsb": lsb, "value": val})
         lines.append("%s=%s" % (n, val))
     text = "\n".join(lines)
@@ -853,7 +1051,7 @@ COMMANDS = {"check": cmd_check, "eval": cmd_eval}
 COMMAND_FLAGS = {
     "check": {},
     "eval": {"--set": True, "--default": True, "--allow-extra": False,
-             "--radix": True},
+             "--radix": True, "--mode": True},
 }
 ALL_VALUE_FLAGS = {f for d in COMMAND_FLAGS.values() for f, v in d.items() if v}
 ALL_CMD_FLAGS = {f for d in COMMAND_FLAGS.values() for f in d}
