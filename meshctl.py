@@ -120,7 +120,17 @@ def validate_resource(kind, value, regex, mult, errors, default=None):
     return {"limit": as_str(limit), "request": as_str(request)}
 
 
-def validate(doc):
+def default_replication(instances):
+    return max(1, min(2, instances))
+
+
+def as_qstr(v):
+    return str(v) if is_int(v) else v
+
+
+def validate(doc, update=False):
+    """Validate a document. With update=True the spec is an already-merged spec
+    (stored values + provided fields) and instances may be 0."""
     errors = []
     result = {}
 
@@ -152,12 +162,19 @@ def validate(doc):
     spec = {}
     # instances
     inst = spec_in.get("instances")
+    min_inst = 0 if update else 1
+    inst_ok = False
     if inst is None:
         spec["instances"] = 1
-    elif not is_int(inst) or inst < 1:
-        errors.append(err("spec.instances", "instances must be a positive integer", "invalid"))
+        inst_ok = True
+    elif not is_int(inst) or inst < min_inst:
+        if update:
+            errors.append(err("spec.instances", "instances must be a non-negative integer", "invalid"))
+        else:
+            errors.append(err("spec.instances", "instances must be a positive integer", "invalid"))
     else:
         spec["instances"] = inst
+        inst_ok = True
 
     # runtime
     if "runtime" in spec_in and spec_in["runtime"] is not None:
@@ -221,21 +238,142 @@ def validate(doc):
                 errors.append(err("spec.migration.strategy", 'strategy must be "FullStop"', "invalid"))
     spec["migration"] = {"strategy": strategy}
 
+    # network
+    net_in = spec_in.get("network")
+    if net_in is None:
+        net_in = {}
+    if not isinstance(net_in, dict):
+        errors.append(err("spec.network", "network must be a mapping", "invalid"))
+        net_in = {}
+    network = {}
+    sto_in = net_in.get("storage")
+    if sto_in is None:
+        sto_in = {}
+    if not isinstance(sto_in, dict):
+        errors.append(err("spec.network.storage", "storage must be a mapping", "invalid"))
+        sto_in = {}
+    storage = {}
+    size = sto_in.get("size")
+    if size is None:
+        storage["size"] = "1Gi"
+    elif parse_quantity(size, MEM_RE, MEM_MULT) is None:
+        errors.append(err("spec.network.storage.size",
+                          "invalid storage size quantity: %r" % (size,), "invalid"))
+    else:
+        storage["size"] = as_qstr(size)
+    eph = sto_in.get("ephemeral")
+    if eph is None:
+        storage["ephemeral"] = False
+    elif not isinstance(eph, bool):
+        errors.append(err("spec.network.storage.ephemeral", "ephemeral must be a boolean", "invalid"))
+    else:
+        storage["ephemeral"] = eph
+    cn = sto_in.get("className")
+    if cn is not None:
+        if not isinstance(cn, str) or cn == "":
+            errors.append(err("spec.network.storage.className",
+                              "className must be a non-empty string", "invalid"))
+        else:
+            storage["className"] = cn
+    network["storage"] = storage
+
+    rf = net_in.get("replicationFactor")
+    if rf is None:
+        if inst_ok:
+            network["replicationFactor"] = default_replication(spec["instances"])
+    elif not is_int(rf) or rf < 1:
+        errors.append(err("spec.network.replicationFactor",
+                          "replicationFactor must be a positive integer, got %r (minimum 1)" % (rf,),
+                          "invalid"))
+    else:
+        network["replicationFactor"] = rf
+        if inst_ok and spec["instances"] > 0 and rf > spec["instances"]:
+            errors.append(err("spec.network.replicationFactor",
+                              "replicationFactor %d exceeds spec.instances %d"
+                              % (rf, spec["instances"]), "invalid"))
+    spec["network"] = network
+
     result["spec"] = spec
-    result["status"] = {"state": "Running"}
     return result, name, errors
+
+
+# ---------------------------------------------------------------- status
+
+def set_condition(status, ctype, cstatus="True", message=""):
+    conds = [c for c in status.get("conditions", []) if c.get("type") != ctype]
+    conds.append({"type": ctype, "status": cstatus, "message": message})
+    status["conditions"] = sorted(conds, key=lambda c: c["type"])
+
+
+def clear_condition(status, ctype):
+    status["conditions"] = sorted(
+        [c for c in status.get("conditions", []) if c.get("type") != ctype],
+        key=lambda c: c["type"])
+
+
+def has_condition(status, ctype):
+    return any(c.get("type") == ctype for c in status.get("conditions", []))
+
+
+def settle(resource):
+    """Complete transient transitions. Returns True if anything changed."""
+    st = resource.get("status", {})
+    changed = False
+    n = resource["spec"]["instances"]
+    if has_condition(st, "Scaling"):
+        clear_condition(st, "Scaling")
+        changed = True
+    inst = st.get("instances", {})
+    if n > 0 and (inst.get("starting", 0) != 0 or inst.get("ready") != n):
+        st["instances"] = {"ready": n, "starting": 0, "stopped": 0}
+        changed = True
+    if not st.get("stable", True) or "stable" not in st:
+        st["stable"] = True
+        changed = True
+    resource["status"] = st
+    return changed
+
+
+def render(resource):
+    r = json.loads(json.dumps(resource))
+    sto = r.get("spec", {}).get("network", {}).get("storage")
+    if isinstance(sto, dict) and sto.get("ephemeral"):
+        r["spec"]["network"]["storage"] = {"ephemeral": True}
+    st = r.get("status", {})
+    order = ["state", "stable", "instances", "conditions", "desiredInstancesOnResume"]
+    if "conditions" in st:
+        st["conditions"] = [{"type": c.get("type"), "status": c.get("status"),
+                             "message": c.get("message", "")}
+                            for c in sorted(st["conditions"], key=lambda c: c.get("type", ""))]
+    r["status"] = {k: st[k] for k in order if k in st}
+    return r
+
+
+def deep_merge(base, patch):
+    if not isinstance(base, dict) or not isinstance(patch, dict):
+        return patch
+    res = dict(base)
+    for k, v in patch.items():
+        if v is None:
+            continue
+        if isinstance(v, dict) and isinstance(res.get(k), dict):
+            res[k] = deep_merge(res[k], v)
+        else:
+            res[k] = v
+    return res
 
 
 # ---------------------------------------------------------------- commands
 
-def cmd_create(args):
+def read_doc(args):
+    """Return (doc, error_code_or_None)."""
     path = None
     i = 0
     while i < len(args):
         a = args[i]
         if a in ("-f", "--filename", "--file"):
             if i + 1 >= len(args):
-                return fail([err("", "flag -f requires a path", "parse")])
+                return None, fail([err("", "flag -f requires a path", "parse")])
             path = args[i + 1]
             i += 2
         elif a.startswith("--filename=") or a.startswith("--file="):
@@ -247,7 +385,7 @@ def cmd_create(args):
         else:
             i += 1
     if path is None:
-        return fail([err("", "missing -f <path>", "parse")])
+        return None, fail([err("", "missing -f <path>", "parse")])
     try:
         import yaml
         if path == "-":
@@ -257,19 +395,131 @@ def cmd_create(args):
                 text = f.read()
         doc = yaml.safe_load(text)
     except Exception as e:
-        return fail([err("", "cannot read or parse YAML: %s" % str(e).replace("\n", " "), "parse")])
+        return None, fail([err("", "cannot read or parse YAML: %s" % str(e).replace("\n", " "), "parse")])
     if not isinstance(doc, dict):
-        return fail([err("", "YAML document must be a mapping", "parse")])
+        return None, fail([err("", "YAML document must be a mapping", "parse")])
+    return doc, None
 
+
+def cmd_create(args):
+    doc, code = read_doc(args)
+    if code is not None:
+        return code
     resource, name, errors = validate(doc)
     store = load_store()
     if name is not None and name in store:
         errors.append(err("metadata.name", "mesh %r already exists" % name, "duplicate"))
     if errors:
         return fail(errors)
+    n = resource["spec"]["instances"]
+    status = {
+        "state": "Running" if n > 0 else "Stopped",
+        "stable": True,
+        "instances": {"ready": n, "starting": 0, "stopped": 0},
+        "conditions": [],
+    }
+    set_condition(status, "Healthy")
+    set_condition(status, "PrechecksPassed")
+    resource["status"] = status
     store[name] = resource
     save_store(store)
-    out(resource)
+    out(render(resource))
+    return 0
+
+
+def cmd_update(args):
+    doc, code = read_doc(args)
+    if code is not None:
+        return code
+    errors = []
+    metadata = doc.get("metadata")
+    raw_name = metadata.get("name") if isinstance(metadata, dict) else None
+    if raw_name is None or raw_name == "":
+        return fail([err("metadata.name", "name is required", "required")])
+    if not isinstance(raw_name, str) or not NAME_RE.match(raw_name):
+        return fail([err("metadata.name", "name must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$", "invalid")])
+    store = load_store()
+    if raw_name not in store:
+        return fail([err("metadata.name", "mesh %r not found" % raw_name, "not_found")])
+    stored = json.loads(json.dumps(store[raw_name]))
+    settle(stored)
+    old_status = stored["status"]
+    old_n = stored["spec"]["instances"]
+    stopped = has_condition(old_status, "GracefulShutdown")
+
+    spec_patch = doc.get("spec")
+    if spec_patch is None:
+        spec_patch = {}
+    if not isinstance(spec_patch, dict):
+        return fail([err("spec", "spec must be a mapping", "invalid")])
+
+    req_inst = spec_patch.get("instances")
+    resuming = False
+    if stopped and old_n == 0:
+        if req_inst is None:
+            target = old_status.get("desiredInstancesOnResume") or 1
+            spec_patch = dict(spec_patch)
+            spec_patch["instances"] = target
+            resuming = True
+        elif is_int(req_inst) and req_inst > 0:
+            resuming = True
+
+    merged_spec = deep_merge(stored["spec"], spec_patch)
+    resource, _, errors = validate({"metadata": {"name": raw_name}, "spec": merged_spec}, update=True)
+
+    # immutable storage size
+    new_size = None
+    sto_patch = spec_patch.get("network", {})
+    if isinstance(sto_patch, dict):
+        sto_patch = sto_patch.get("storage", {})
+        if isinstance(sto_patch, dict):
+            new_size = sto_patch.get("size")
+    old_size = stored["spec"].get("network", {}).get("storage", {}).get("size")
+    if new_size is not None:
+        nv = parse_quantity(new_size, MEM_RE, MEM_MULT)
+        ov = parse_quantity(old_size, MEM_RE, MEM_MULT) if old_size is not None else None
+        if nv is not None and (old_size is None or nv != ov):
+            errors = [e for e in errors if e["field"] != "spec.network.storage.size"]
+            errors.append(err("spec.network.storage.size",
+                              "field 'spec.network.storage.size' is immutable after creation",
+                              "immutable"))
+        elif nv is not None:
+            resource["spec"]["network"]["storage"]["size"] = old_size
+    if errors:
+        return fail(errors)
+
+    new_n = resource["spec"]["instances"]
+    status = old_status
+    if resuming:
+        clear_condition(status, "GracefulShutdown")
+        status.pop("desiredInstancesOnResume", None)
+        status["instances"] = {"ready": 0, "starting": new_n, "stopped": 0}
+        status["state"] = "Running"
+        status["stable"] = False
+    elif new_n == 0 and old_n > 0:
+        set_condition(status, "GracefulShutdown")
+        status["desiredInstancesOnResume"] = old_n
+        status["instances"] = {"ready": 0, "starting": 0, "stopped": old_n}
+        status["state"] = "Stopped"
+        status["stable"] = True
+    elif new_n > old_n:
+        set_condition(status, "Scaling", "True",
+                      "scaling up from %d to %d instances" % (old_n, new_n))
+        status["instances"] = {"ready": old_n, "starting": new_n - old_n, "stopped": 0}
+        status["state"] = "Running"
+        status["stable"] = False
+    elif new_n < old_n:
+        set_condition(status, "Scaling", "True",
+                      "scaling down from %d to %d instances" % (old_n, new_n))
+        status["instances"] = {"ready": new_n, "starting": 0, "stopped": 0}
+        status["state"] = "Running"
+        status["stable"] = False
+    else:
+        status["state"] = "Running" if new_n > 0 else "Stopped"
+    resource["status"] = status
+    store[raw_name] = resource
+    save_store(store)
+    out(render(resource))
     return 0
 
 
@@ -282,7 +532,7 @@ def cmd_list(args):
     store = load_store()
     items = []
     for name in sorted(store.keys()):
-        r = store[name]
+        r = render(store[name])
         items.append({"name": name, "status": r.get("status", {"state": "Running"})})
     out(items)
     return 0
@@ -295,7 +545,10 @@ def cmd_describe(args):
     store = load_store()
     if name not in store:
         return fail([err("metadata.name", "mesh %r not found" % name, "not_found")])
-    out(store[name])
+    r = store[name]
+    if settle(r):
+        save_store(store)
+    out(render(r))
     return 0
 
 
@@ -318,12 +571,13 @@ COMMANDS = {
     "describe": cmd_describe,
     "get": cmd_describe,
     "delete": cmd_delete,
+    "update": cmd_update,
 }
 
 
 def main(argv):
     if len(argv) < 2 or argv[0] != "mesh" or argv[1] not in COMMANDS:
-        return fail([err("", "usage: meshctl.py mesh <create|list|describe|delete> [arguments]",
+        return fail([err("", "usage: meshctl.py mesh <create|list|describe|delete|update> [arguments]",
                          "invalid")])
     return COMMANDS[argv[1]](argv[2:])
 
