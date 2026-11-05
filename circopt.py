@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """circopt - circuit tool (Part 1: CLI basics and `check`; Part 2: `eval`;
-Part 3: vectors, richer expressions and `--radix`)."""
+Part 3: vectors, richer expressions and `--radix`;
+Parts 4-6: 3-valued eval, input formats, stats/lint/dot)."""
 
 import json
 import os
@@ -20,6 +21,12 @@ Commands:
        [--radix bin|hex|dec] [--mode 2val|3val]
                        Evaluate the circuit (2-valued, or 3-valued with X)
                        and print outputs.
+  stats <file> [--format ...]
+                       Print circuit metrics (counts, depth, op histogram).
+  lint <file> [--format ...] [--max-input-bits N]
+                       Report warnings (unused inputs, constant outputs).
+  dot <file> -o <dot_file> [--format ...] [--cone out1,out2,...]
+                       Export the circuit as a Graphviz DOT graph.
 
 Global flags:
   --help               Show this help and exit.
@@ -1361,12 +1368,231 @@ def cmd_eval(args, opts):
     return result, text
 
 
-COMMANDS = {"check": cmd_check, "eval": cmd_eval}
+# ---------------------------------------------------------------------------
+# Analysis: stats, lint, dot
+# ---------------------------------------------------------------------------
+
+HIST_CATEGORIES = ("AND", "BUF", "CONCAT", "EQ", "MUX", "NAND", "NOR", "NOT",
+                   "OR", "REDUCE_AND", "REDUCE_OR", "REDUCE_XOR", "XOR", "XNOR")
+OP_ALIASES = {"ITE": "MUX"}
+
+
+def op_category(e):
+    if isinstance(e, Concat):
+        return "CONCAT"
+    if isinstance(e, Call):
+        return OP_ALIASES.get(e.op, e.op)
+    return "BUF"
+
+
+def dep_names(e):
+    refs = []
+    expr_refs(e, refs)
+    return [r.name for r in refs]
+
+
+def is_scalar(c, name):
+    return c.ranges[name] == (0, 0)
+
+
+def sig_label(c, name):
+    if is_scalar(c, name):
+        return name
+    msb, lsb = c.ranges[name]
+    return "%s[%d:%d]" % (name, msb, lsb)
+
+
+def signal_depths(c):
+    depth = {n: 0 for n in c.inputs}
+    for name in topo_order(c):
+        ds = [depth.get(d, 0) for d in dep_names(c.assigns[name])]
+        depth[name] = 1 + (max(ds) if ds else 0)
+    return depth
+
+
+def backward_cone(c, roots):
+    seen = set()
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        if n in c.assigns:
+            stack.extend(dep_names(c.assigns[n]))
+    return seen
+
+
+def cmd_stats(args, opts):
+    if len(args) != 1:
+        raise CliUsageError("stats requires exactly one file argument")
+    c, _fmt = load_circuit(args[0], get_format_opt(opts))
+    outs = set(c.outputs)
+    hist = {k: 0 for k in HIST_CATEGORIES}
+    edges = 0
+    for name in c.order:
+        e = c.assigns[name]
+        cat = op_category(e)
+        hist[cat] = hist.get(cat, 0) + 1
+        edges += len(dep_names(e))
+    depth = signal_depths(c)
+    result = {
+        "inputs_count": len(c.inputs),
+        "outputs_count": len(c.outputs),
+        "wires_count": len([w for w in c.wires if w not in outs]),
+        "assignments_count": len(c.assigns),
+        "edges_count": edges,
+        "depth": max([depth.get(o, 0) for o in c.outputs] or [0]),
+        "op_histogram": hist,
+    }
+    lines = ["%s: %s" % (k, result[k]) for k in
+             ("inputs_count", "outputs_count", "wires_count",
+              "assignments_count", "edges_count", "depth")]
+    lines.append("op_histogram:")
+    for k, v in hist.items():
+        lines.append("  %s: %d" % (k, v))
+    return result, "\n".join(lines)
+
+
+def _int_opt(opts, flag, default):
+    if not opts.get(flag):
+        return default
+    raw = opts[flag][-1]
+    s = raw.strip()
+    if not s.isdigit():
+        raise CliUsageError("invalid %s %r (expected a non-negative integer)"
+                            % (flag, raw))
+    return int(s)
+
+
+def cmd_lint(args, opts):
+    if len(args) != 1:
+        raise CliUsageError("lint requires exactly one file argument")
+    fmt = get_format_opt(opts)
+    limit = _int_opt(opts, "--max-input-bits", 16)
+    c, _fmt = load_circuit(args[0], fmt)
+    warnings = []
+    used = backward_cone(c, c.outputs)
+    for n in c.inputs:
+        if n not in used:
+            warnings.append({"type": "UnusedInputWarning", "name": n,
+                             "message": "input '%s' is not used by any output" % n})
+    widths = [(n, c.ranges[n][0] - c.ranges[n][1] + 1) for n in c.inputs]
+    total = sum(w for _, w in widths)
+    if total > limit:
+        warnings.append({
+            "type": "ConstantOutputCheckSkippedWarning", "name": None,
+            "message": "constant output check skipped: %d input bits exceeds "
+                       "limit %d" % (total, limit)})
+    else:
+        order = topo_order(c)
+        outs = list(dict.fromkeys(c.outputs))
+        first = {}
+        candidates = set(outs)
+        for combo in range(1 << total):
+            env = {}
+            shift = 0
+            for n, w in widths:
+                env[n] = (combo >> shift) & mask(w)
+                shift += w
+            for name in order:
+                env[name] = eval_expr(c.assigns[name], env, c)
+            for o in list(candidates):
+                if combo == 0:
+                    first[o] = env[o]
+                elif env[o] != first[o]:
+                    candidates.discard(o)
+            if not candidates:
+                break
+        for o in outs:
+            if o in candidates:
+                msb, lsb = c.ranges[o]
+                w = msb - lsb + 1
+                if is_scalar(c, o):
+                    val = str(first[o])
+                else:
+                    val = "0b" + format(first[o], "0%db" % w)
+                warnings.append({"type": "ConstantOutputWarning", "name": o,
+                                 "message": "output '%s' is constant" % o,
+                                 "value": val})
+    warnings.sort(key=lambda w: (w["type"], w["name"] or ""))
+    lines = []
+    for w in warnings:
+        lines.append("warning: %s: %s" % (w["type"], w["message"]))
+    return {"warnings": warnings}, "\n".join(lines) if lines else "no warnings"
+
+
+def _q(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def build_dot(c, cone=None):
+    inputs = set(c.inputs)
+    keep = backward_cone(c, cone) if cone is not None else None
+
+    def nid(n):
+        return ("in:" if n in inputs else "sig:") + n
+
+    lines = set()
+    for n in c.inputs:
+        if keep is None or n in keep:
+            lines.add("  %s [label=%s];" % (_q(nid(n)), _q(sig_label(c, n))))
+    for n in list(c.wires) + list(c.outputs):
+        if n in inputs or (keep is not None and n not in keep):
+            continue
+        lines.add("  %s [label=%s];" % (_q(nid(n)), _q(sig_label(c, n))))
+    for lhs, e in c.assigns.items():
+        if keep is not None and lhs not in keep:
+            continue
+        op = "op:" + lhs
+        lines.add("  %s [label=%s];" % (_q(op), _q(op_category(e))))
+        for d in dep_names(e):
+            lines.add("  %s -> %s;" % (_q(nid(d)), _q(op)))
+        lines.add("  %s -> %s;" % (_q(op), _q(nid(lhs))))
+    return "digraph circopt {\n" + "".join(l + "\n" for l in sorted(lines)) + "}\n"
+
+
+def cmd_dot(args, opts):
+    if len(args) != 1:
+        raise CliUsageError("dot requires exactly one file argument")
+    fmt = get_format_opt(opts)
+    if not opts.get("-o"):
+        raise CliUsageError("dot requires -o <dot_file>")
+    out_path = opts["-o"][-1]
+    if not out_path:
+        raise CliUsageError("dot requires a non-empty -o <dot_file>")
+    cone = None
+    if opts.get("--cone"):
+        cone = []
+        for raw in opts["--cone"]:
+            cone.extend(p.strip() for p in raw.split(",") if p.strip())
+        if not cone:
+            raise CliUsageError("--cone requires at least one output name")
+    c, _fmt = load_circuit(args[0], fmt)
+    if cone is not None:
+        outs = set(c.outputs)
+        for n in cone:
+            if n not in outs:
+                raise UndefinedNameError("unknown output: %s" % n)
+    text = build_dot(c, cone)
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        raise CliUsageError("cannot write %s: %s" % (out_path, e))
+    return {"dot_path": out_path}, "wrote %s" % out_path
+
+
+COMMANDS = {"check": cmd_check, "eval": cmd_eval, "stats": cmd_stats,
+            "lint": cmd_lint, "dot": cmd_dot}
 # command -> {flag: takes_value}
 COMMAND_FLAGS = {
     "check": {"--format": True},
     "eval": {"--format": True, "--set": True, "--default": True, "--allow-extra": False,
              "--radix": True, "--mode": True},
+    "stats": {"--format": True},
+    "lint": {"--format": True, "--max-input-bits": True},
+    "dot": {"--format": True, "-o": True, "--cone": True},
 }
 ALL_VALUE_FLAGS = {f for d in COMMAND_FLAGS.values() for f, v in d.items() if v}
 ALL_CMD_FLAGS = {f for d in COMMAND_FLAGS.values() for f in d}
