@@ -254,6 +254,8 @@ def build(doc, state, mode="create", stored=None):
         spec["migration"] = mig
 
     validate_network(spec_in, spec, errors, stored)
+    validate_exposure(spec_in, spec, errors)
+    validate_management(spec_in, spec, errors, stored)
 
     mig_action = check_migration(spec, stored, runtime_ok, errors)
 
@@ -614,6 +616,113 @@ def validate_network(spec_in, spec, errors, stored):
     spec["network"] = net
 
 
+EXPOSURE_TYPES = {"Gateway": ("hostname", "annotations"),
+                  "DirectPort": ("port", "directPort"),
+                  "Balancer": ("port",)}
+DEFAULT_PORT = 11222
+MANAGEMENT_PORT = 9990
+
+
+def _port_ok(v):
+    return is_int(v) and 1 <= v <= 65535
+
+
+def validate_exposure(spec_in, spec, errors):
+    if "exposure" not in spec_in:
+        return
+    exp_in = spec_in.get("exposure")
+    if exp_in is None:
+        spec.pop("exposure", None)
+        return
+    base = "spec.exposure"
+    if not isinstance(exp_in, dict):
+        errors.append(err(base, "spec.exposure must be an object", "invalid"))
+        return
+    exp = {k: copy.deepcopy(v) for k, v in exp_in.items() if v is not None}
+    etype = exp_in.get("type")
+    if etype is None or (isinstance(etype, str) and etype.strip() == ""):
+        errors.append(err(base + ".type", "spec.exposure.type is required", "required"))
+        exp.pop("type", None)
+        spec["exposure"] = exp
+        return
+    if not isinstance(etype, str) or etype not in EXPOSURE_TYPES:
+        errors.append(err(base + ".type", "spec.exposure.type must be one of \"Gateway\", "
+                          "\"DirectPort\", \"Balancer\", got %r" % (etype,), "invalid"))
+        spec["exposure"] = exp
+        return
+    allowed = EXPOSURE_TYPES[etype]
+    for k in sorted(exp):
+        if k == "type" or k in allowed:
+            continue
+        errors.append(err("%s.%s" % (base, k), "field '%s.%s' is forbidden when spec.exposure.type is %r"
+                          % (base, k, etype), "forbidden"))
+    if "hostname" in allowed and "hostname" in exp:
+        h = exp["hostname"]
+        if not isinstance(h, str) or h.strip() == "":
+            errors.append(err(base + ".hostname", "spec.exposure.hostname must be a non-empty string",
+                              "invalid"))
+    if "annotations" in allowed and "annotations" in exp:
+        a = exp["annotations"]
+        if not isinstance(a, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                              for k, v in a.items()):
+            errors.append(err(base + ".annotations",
+                              "spec.exposure.annotations must be a map of string to string", "invalid"))
+    if "port" in allowed:
+        if "port" not in exp:
+            exp["port"] = DEFAULT_PORT
+        elif not _port_ok(exp["port"]):
+            errors.append(err(base + ".port", "spec.exposure.port must be an integer between 1 and 65535, "
+                              "got %r" % (exp["port"],), "invalid"))
+    if "directPort" in allowed and "directPort" in exp and not _port_ok(exp["directPort"]):
+        errors.append(err(base + ".directPort", "spec.exposure.directPort must be an integer between 1 "
+                          "and 65535, got %r" % (exp["directPort"],), "invalid"))
+    spec["exposure"] = exp
+
+
+def validate_management(spec_in, spec, errors, stored):
+    base = "spec.management"
+    m_in = spec_in.get("management")
+    if m_in is not None and not isinstance(m_in, dict):
+        errors.append(err(base, "spec.management must be an object", "invalid"))
+        return
+    m = dict(m_in or {})
+    en = m.get("enabled")
+    if en is None:
+        en = m["enabled"] = False
+    elif not isinstance(en, bool):
+        errors.append(err(base + ".enabled", "spec.management.enabled must be a boolean", "invalid"))
+        spec["management"] = m
+        return
+    if stored is not None:
+        old = ((stored.get("spec") or {}).get("management") or {})
+        old_en = old.get("enabled", False) if isinstance(old, dict) else False
+        if bool(old_en) != en:
+            errors.append(err(base + ".enabled",
+                              "field 'spec.management.enabled' is immutable after creation", "immutable"))
+    spec["management"] = m
+
+
+def connection_details(name, spec):
+    exp = spec.get("exposure")
+    if not isinstance(exp, dict):
+        return None
+    t = exp.get("type")
+    if t == "Gateway":
+        host = exp.get("hostname") or "%s-gateway" % name
+        port = 443
+    elif t == "DirectPort":
+        host = name
+        port = exp.get("directPort")
+        if port is None:
+            port = exp.get("port", DEFAULT_PORT)
+    elif t == "Balancer":
+        host = "%s-external" % name
+        port = exp.get("port", DEFAULT_PORT)
+    else:
+        return None
+    return {"host": host, "port": port, "protocol": "https"}
+
+
 def deep_merge(base, upd):
     if not isinstance(base, dict) or not isinstance(upd, dict):
         return copy.deepcopy(upd)
@@ -653,6 +762,19 @@ def adjust_access_merge(merged_spec, spec_upd):
 def render(resource):
     r = copy.deepcopy(resource)
     r.pop("_transient", None)
+    spec = r.get("spec") or {}
+    name = (r.get("metadata") or {}).get("name")
+    status = r.get("status")
+    if isinstance(status, dict):
+        status.pop("connectionDetails", None)
+        status.pop("managementConnectionDetails", None)
+        cd = connection_details(name, spec)
+        if cd is not None:
+            status["connectionDetails"] = cd
+        mg = spec.get("management")
+        if isinstance(mg, dict) and mg.get("enabled") is True:
+            status["managementConnectionDetails"] = {"host": "%s-admin" % name, "port": MANAGEMENT_PORT,
+                                                     "protocol": "https"}
     st = ((r.get("spec") or {}).get("network") or {}).get("storage")
     if isinstance(st, dict) and st.get("ephemeral") is True:
         for k in list(st.keys()):
@@ -747,6 +869,21 @@ def cmd_update(args):
         else:
             merged_spec["instances"] = (stored.get("spec") or {}).get("instances", 1)
     adjust_access_merge(merged_spec, spec_upd)
+    if "exposure" in spec_upd:
+        ue = spec_upd.get("exposure")
+        oe = (stored.get("spec") or {}).get("exposure")
+        if ue is None:
+            merged_spec.pop("exposure", None)
+        elif isinstance(ue, dict) and isinstance(oe, dict) and "type" in ue \
+                and ue.get("type") != oe.get("type"):
+            merged_spec["exposure"] = copy.deepcopy(ue)
+        elif isinstance(ue, dict) and isinstance(oe, dict):
+            # explicit nulls remove sub-fields
+            for k, v in ue.items():
+                if v is None:
+                    merged_spec["exposure"].pop(k, None)
+                    if k == "type":
+                        merged_spec["exposure"]["type"] = None
     merged_md = deep_merge(stored.get("metadata") or {}, md)
     merged_md["name"] = name
     # build() validates everything and exits with all errors on failure
@@ -855,6 +992,20 @@ def cmd_describe(args):
     if settle(resource):
         save_state(state)
     out(render(resource))
+
+
+def cmd_shell(args):
+    name = need_name(args)
+    state = load_state()
+    if name not in state:
+        fail([err("metadata.name", "mesh %r not found" % name, "not_found")])
+    resource = state[name]
+    if settle(resource):
+        save_state(state)
+    cd = connection_details(name, resource.get("spec") or {})
+    if cd is None:
+        fail([err("spec.exposure", "mesh '%s' has no exposure configured" % name, "invalid")])
+    out(cd)
 
 
 def cmd_delete(args):
@@ -1038,7 +1189,7 @@ def vault_delete(args):
 def main(argv):
     if len(argv) < 2 or argv[0] not in ("mesh", "vault") + tuple(ONESHOT_KINDS):
         fail([err("", "usage: meshctl.py <mesh|vault|task|snapshot|recovery> "
-                  "<create|update|list|describe|delete|run|migrate> [arguments]", "invalid")])
+                  "<create|update|list|describe|delete|run|migrate|shell> [arguments]", "invalid")])
     op, rest = argv[1], argv[2:]
     if argv[0] in ONESHOT_KINDS:
         handlers = oneshot_handlers(argv[0])
@@ -1047,7 +1198,8 @@ def main(argv):
                     "describe": vault_describe, "delete": vault_delete}
     else:
         handlers = {"create": cmd_create, "update": cmd_update, "list": cmd_list,
-                    "describe": cmd_describe, "delete": cmd_delete, "migrate": cmd_migrate}
+                    "describe": cmd_describe, "delete": cmd_delete, "migrate": cmd_migrate,
+                    "shell": cmd_shell}
     if op not in handlers:
         fail([err("", "unknown operation %r" % op, "invalid")])
     handlers[op](rest)
