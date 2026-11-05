@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tiny local runner HTTP API: POST /v1/execute, GET /v1/stats/execution."""
 import argparse
+import copy
+import hashlib
 import bz2
 import csv
 import glob
@@ -57,6 +59,16 @@ class Stats:
         self._durations = []
         self._cmd_durations = []
         self._cmd_total = 0
+        self._hits = 0
+        self._misses = 0
+
+    def record_hit(self):
+        with self._lock:
+            self._hits += 1
+
+    def record_miss(self):
+        with self._lock:
+            self._misses += 1
 
     def record(self, duration, cmd_durations=None, cmd_total=None):
         with self._lock:
@@ -73,7 +85,15 @@ class Stats:
             d = list(self._durations)
             cd = list(self._cmd_durations)
             total = self._cmd_total
+            hits = self._hits
+            misses = self._misses
         n = len(d)
+        lookups = hits + misses
+        if lookups:
+            cache = {"hits": hits, "misses": misses,
+                     "hit_rate": round(hits / lookups, 3)}
+        else:
+            cache = {"hits": None, "misses": None, "hit_rate": None}
         return {
             "ran": n,
             "commands": {
@@ -84,10 +104,45 @@ class Stats:
                 "duration": _summary(cd),
             },
             "duration": _summary(d),
+            "cache": cache,
         }
 
 
 STATS = Stats()
+
+
+class ResultCache:
+    """In-memory cache of execution results keyed by the normalized request."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = {}
+
+    @staticmethod
+    def key(command, env, files, stdin, timeout, track, continue_on_error):
+        material = {
+            "command": command,
+            "env": sorted(env.items()),
+            "files": sorted((k, v.hex()) for k, v in files.items()),
+            "stdin": stdin,
+            "timeout": timeout,
+            "track": list(track) if track else [],
+            "continue_on_error": continue_on_error,
+        }
+        blob = json.dumps(material, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def get(self, key):
+        with self._lock:
+            v = self._data.get(key)
+            return copy.deepcopy(v) if v is not None else None
+
+    def put(self, key, result):
+        with self._lock:
+            self._data[key] = copy.deepcopy(result)
+
+
+CACHE = ResultCache()
 
 
 def validate(body):
@@ -182,6 +237,12 @@ def validate(body):
             steps.append({"cmd": cmd, "timeout": float(t), "required": req})
         command = steps
 
+    force = body.get("force", False)
+    if force is None:
+        force = False
+    if not isinstance(force, bool):
+        raise ApiError(400, "INVALID_FIELD", "'force' must be a boolean")
+
     track = body.get("track")
     if track is not None:
         if not isinstance(track, list):
@@ -195,7 +256,7 @@ def validate(body):
         if not track:
             track = None
 
-    return command, env, files, stdin, float(timeout), track, continue_on_error
+    return (command, env, files, stdin, float(timeout), track, continue_on_error), force
 
 
 def _split_exts(path):
@@ -515,9 +576,22 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, ValueError):
                 raise ApiError(400, "INVALID_JSON", "request body is not valid JSON")
-            args = validate(body)
+            args, force = validate(body)
+            key = ResultCache.key(*args)
+            if not force:
+                cached = CACHE.get(key)
+                if cached is not None:
+                    STATS.record_hit()
+                    cached["id"] = str(uuid.uuid4())
+                    cached["cached"] = True
+                    self._send(201, cached)
+                    return
             result, duration, cmd_durations, cmd_total = execute(*args)
             STATS.record(round(duration, 3), [round(x, 3) for x in cmd_durations], cmd_total)
+            STATS.record_miss()
+            CACHE.put(key, result)
+            result = dict(result)
+            result["cached"] = False
             self._send(201, result)
         except ApiError as e:
             self._error(e.status, e.code, e.message)
