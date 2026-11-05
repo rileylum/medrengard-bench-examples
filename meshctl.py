@@ -6,11 +6,50 @@ import re
 import sys
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
-RUNTIME_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 MEM_RE = re.compile(r"^([0-9]+)(Ki|Mi|Gi|Ti)?$")
 CPU_RE = re.compile(r"^([0-9]+)(m)?$")
 MEM_MULT = {None: 1, "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4}
 CPU_MULT = {None: 1000, "m": 1}
+
+# runtime catalog: version -> status (supported | deprecated | skipped)
+RUNTIME_CATALOG = {
+    "3.0.0": "deprecated",
+    "3.1.0": "skipped",
+    "3.1.1": "supported",
+    "4.0.0": "supported",
+    "4.0.1": "supported",
+    "4.0.2": "supported",
+    "4.1.0": "supported",
+    "4.1.1": "supported",
+    "4.2.0": "supported",
+    "5.0.0": "supported",
+    "5.0.1": "supported",
+    "5.1.0": "supported",
+}
+STRATEGIES = ("FullStop", "LiveMigration", "RollingPatch")
+STAGES = {
+    "FullStop": ["Migrate"],
+    "RollingPatch": ["Migrate"],
+    "LiveMigration": ["Prepare", "Migrate", "Cleanup"],
+}
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def runtime_warnings(spec):
+    rt = spec.get("runtime")
+    if isinstance(rt, str) and RUNTIME_CATALOG.get(rt) == "deprecated":
+        return [{"field": "spec.runtime",
+                 "message": "runtime version '%s' is deprecated" % rt}]
+    return []
+
+
+def with_warnings(rendered, warnings):
+    if warnings:
+        rendered["warnings"] = sorted(warnings, key=lambda w: (w["field"], w["message"]))
+    return rendered
 
 
 def out(obj):
@@ -344,8 +383,16 @@ def validate(doc, update=False):
     # runtime
     if "runtime" in spec_in and spec_in["runtime"] is not None:
         rt = spec_in["runtime"]
-        if not isinstance(rt, str) or not RUNTIME_RE.match(rt):
-            errors.append(err("spec.runtime", "runtime must be a semantic version major.minor.patch", "invalid"))
+        if not isinstance(rt, str) or rt not in RUNTIME_CATALOG:
+            errors.append(err("spec.runtime",
+                              "runtime version %s is not supported; must be one of %s"
+                              % ("'%s'" % rt if isinstance(rt, str) else repr(rt),
+                                 ", ".join(sorted(RUNTIME_CATALOG, key=version_tuple))),
+                              "invalid"))
+        elif RUNTIME_CATALOG[rt] == "skipped":
+            errors.append(err("spec.runtime",
+                              "runtime version '%s' is skipped and cannot be targeted" % rt,
+                              "invalid"))
         else:
             spec["runtime"] = rt
 
@@ -385,9 +432,22 @@ def validate(doc, update=False):
     else:
         st = mig_in.get("strategy")
         if st is not None:
-            if st != "FullStop":
-                errors.append(err("spec.migration.strategy", 'strategy must be "FullStop"', "invalid"))
+            if st not in STRATEGIES:
+                errors.append(err("spec.migration.strategy",
+                                  "strategy must be one of %s, got %r"
+                                  % (", ".join(STRATEGIES), st), "invalid"))
+            else:
+                strategy = st
     spec["migration"] = {"strategy": strategy}
+
+    # regions (multi-region topology)
+    regions = spec_in.get("regions")
+    if regions is not None:
+        spec["regions"] = regions
+        if strategy == "LiveMigration" and regions not in ([], {}, ""):
+            errors.append(err("spec.migration.strategy",
+                              "LiveMigration strategy is not supported with multi-region topology",
+                              "invalid"))
 
     # network
     net_in = spec_in.get("network")
@@ -466,6 +526,25 @@ def has_condition(status, ctype):
     return any(c.get("type") == ctype for c in status.get("conditions", []))
 
 
+def cond_status(status, ctype):
+    for c in status.get("conditions", []):
+        if c.get("type") == ctype:
+            return c.get("status")
+    return None
+
+
+def compute_stable(status):
+    return (cond_status(status, "Healthy") == "True"
+            and cond_status(status, "PrechecksPassed") == "True"
+            and cond_status(status, "GracefulShutdown") in (None, "False")
+            and cond_status(status, "Scaling") in (None, "False")
+            and cond_status(status, "Migration") in (None, "False"))
+
+
+def migration_active(status):
+    return cond_status(status, "Migration") == "True" and isinstance(status.get("migration"), dict)
+
+
 def settle(resource):
     """Complete transient transitions. Returns True if anything changed."""
     st = resource.get("status", {})
@@ -478,8 +557,9 @@ def settle(resource):
     if n > 0 and (inst.get("starting", 0) != 0 or inst.get("ready") != n):
         st["instances"] = {"ready": n, "starting": 0, "stopped": 0}
         changed = True
-    if not st.get("stable", True) or "stable" not in st:
-        st["stable"] = True
+    stable = compute_stable(st)
+    if st.get("stable") != stable or "stable" not in st:
+        st["stable"] = stable
         changed = True
     resource["status"] = st
     return changed
@@ -491,11 +571,14 @@ def render(resource):
     if isinstance(sto, dict) and sto.get("ephemeral"):
         r["spec"]["network"]["storage"] = {"ephemeral": True}
     st = r.get("status", {})
-    order = ["state", "stable", "instances", "conditions", "desiredInstancesOnResume"]
+    order = ["state", "stable", "instances", "conditions", "migration", "desiredInstancesOnResume"]
     if "conditions" in st:
         st["conditions"] = [{"type": c.get("type"), "status": c.get("status"),
                              "message": c.get("message", "")}
                             for c in sorted(st["conditions"], key=lambda c: c.get("type", ""))]
+    if isinstance(st.get("migration"), dict):
+        m = st["migration"]
+        st["migration"] = {k: m[k] for k in ("sourceRuntime", "stage", "targetRuntime") if k in m}
     r["status"] = {k: st[k] for k in order if k in st}
     return r
 
@@ -598,10 +681,11 @@ def cmd_create(args):
     }
     set_condition(status, "Healthy")
     set_condition(status, "PrechecksPassed")
+    status["stable"] = compute_stable(status)
     resource["status"] = status
     store[name] = resource
     save_store(store)
-    out(render(resource))
+    out(with_warnings(render(resource), runtime_warnings(resource["spec"])))
     return 0
 
 
@@ -664,6 +748,48 @@ def cmd_update(args):
                               "immutable"))
         elif nv is not None:
             resource["spec"]["network"]["storage"]["size"] = old_size
+
+    # runtime version changes / migrations
+    status0 = stored["status"]
+    old_rt = stored["spec"].get("runtime")
+    new_rt = resource["spec"].get("runtime")
+    old_strat = stored["spec"].get("migration", {}).get("strategy", "FullStop")
+    strat_err = any(e["field"] == "spec.migration.strategy" and e["type"] == "invalid"
+                    and "must be one of" in e["message"] for e in errors)
+    rt_err = any(e["field"] == "spec.runtime" for e in errors)
+    new_strat = resource["spec"]["migration"]["strategy"]
+    mig_action = None  # None | "start" | "rollback"
+    if migration_active(status0):
+        mig = status0["migration"]
+        if not strat_err and new_strat != old_strat:
+            errors.append(err("spec.migration.strategy",
+                              "cannot change migration strategy while a migration is in progress",
+                              "invalid"))
+        if not rt_err and new_rt != old_rt:
+            if old_strat == "LiveMigration" and new_rt == mig.get("sourceRuntime"):
+                mig_action = "rollback"
+            else:
+                errors.append(err("spec.runtime",
+                                  "cannot change runtime version while a migration is in progress",
+                                  "invalid"))
+    elif (not rt_err and old_rt in RUNTIME_CATALOG and new_rt is not None
+          and new_rt != old_rt):
+        ov, nv_ = version_tuple(old_rt), version_tuple(new_rt)
+        if nv_ < ov:
+            errors.append(err("spec.runtime",
+                              "version downgrade from '%s' to '%s' is not allowed" % (old_rt, new_rt),
+                              "invalid"))
+        if not strat_err and new_strat == "RollingPatch":
+            if nv_[:2] != ov[:2]:
+                errors.append(err("spec.runtime",
+                                  "RollingPatch strategy requires source and target to share the "
+                                  "same major and minor version, got '%s' to '%s'" % (old_rt, new_rt),
+                                  "invalid"))
+            if nv_[0] < 4:
+                errors.append(err("spec.runtime",
+                                  "RollingPatch strategy requires target major version 4 or "
+                                  "later, got '%s'" % new_rt, "invalid"))
+        mig_action = "start"
     if errors:
         return fail(errors)
 
@@ -695,10 +821,49 @@ def cmd_update(args):
         status["stable"] = False
     else:
         status["state"] = "Running" if new_n > 0 else "Stopped"
+    if mig_action == "start":
+        set_condition(status, "Migration", "True", "")
+        status["migration"] = {"sourceRuntime": old_rt,
+                               "stage": STAGES[new_strat][0],
+                               "targetRuntime": new_rt}
+    elif mig_action == "rollback":
+        clear_condition(status, "Migration")
+        status.pop("migration", None)
+    status["stable"] = bool(status.get("stable", True)) and compute_stable(status)
     resource["status"] = status
     store[raw_name] = resource
     save_store(store)
-    out(render(resource))
+    out(with_warnings(render(resource), runtime_warnings(resource["spec"])))
+    return 0
+
+
+def cmd_migrate(args):
+    name = get_name(args)
+    if not name:
+        return fail([err("metadata.name", "name is required", "required")])
+    store = load_store()
+    if name not in store:
+        return fail([err("metadata.name", "mesh %r not found" % name, "not_found")])
+    r = store[name]
+    settle(r)
+    st = r["status"]
+    if not migration_active(st):
+        return fail([err("status.migration", "no active migration for mesh '%s'" % name, "invalid")])
+    mig = st["migration"]
+    strat = r["spec"].get("migration", {}).get("strategy", "FullStop")
+    stages = STAGES.get(strat, ["Migrate"])
+    try:
+        idx = stages.index(mig.get("stage"))
+    except ValueError:
+        idx = len(stages) - 1
+    if idx + 1 < len(stages):
+        mig["stage"] = stages[idx + 1]
+    else:
+        clear_condition(st, "Migration")
+        st.pop("migration", None)
+    st["stable"] = compute_stable(st)
+    save_store(store)
+    out(render(r))
     return 0
 
 
@@ -1323,6 +1488,7 @@ COMMANDS = {
     "get": cmd_describe,
     "delete": cmd_delete,
     "update": cmd_update,
+    "migrate": cmd_migrate,
 }
 
 
