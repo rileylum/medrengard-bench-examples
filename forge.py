@@ -13,10 +13,43 @@ RS_KEYS = ("resource_type", "resource_count", "capabilities")
 
 
 class ForgeError(Exception):
-    def __init__(self, error, detail):
+    def __init__(self, error, detail, extra=None):
         super().__init__(detail)
         self.error = error
         self.detail = detail
+        self.extra = extra or {}
+
+
+MIN_REVISION = (1, 0)
+MAX_REVISION = (1, 2)
+REVISION = MIN_REVISION
+REVISION_RE = re.compile(r"^[0-9]+\.[0-9]+$")
+
+
+def fmt_rev(r):
+    return "%d.%d" % r
+
+
+def parse_revision(value):
+    if value == "latest":
+        return MAX_REVISION
+    if not isinstance(value, str) or not REVISION_RE.match(value):
+        raise ForgeError("parse_error", "invalid revision '%s': expected <major>.<minor>" % value)
+    major, minor = value.split(".")
+    rev = (int(major), int(minor))
+    if not (MIN_REVISION <= rev <= MAX_REVISION) or rev[0] != 1:
+        raise ForgeError("unsupported_revision",
+                         "revision %s is not supported (supported: %s through %s)"
+                         % (fmt_rev(rev), fmt_rev(MIN_REVISION), fmt_rev(MAX_REVISION)))
+    return rev
+
+
+def require_revision(minimum, feature):
+    if REVISION < minimum:
+        raise ForgeError("revision_too_low",
+                         "%s requires revision %s or higher (negotiated %s)"
+                         % (feature, fmt_rev(minimum), fmt_rev(REVISION)),
+                         {"feature": feature, "min_revision": fmt_rev(minimum)})
 
 
 def emit(obj, code=0):
@@ -178,12 +211,18 @@ def cmd_list(data_dir, args):
 
 def cmd_get(data_dir, args):
     if len(args) != 1:
-        raise ForgeError("validation_error", "get requires exactly one argument: <uuid>")
+        raise ForgeError("validation_error", "get requires exactly one argument: <identifier>")
     ident = args[0]
+    if UUID_RE.match(ident):
+        for bp in load(data_dir):
+            if bp.get("uuid") == ident:
+                return bp
+        raise ForgeError("not_found", "blueprint '%s' not found" % ident)
+    require_revision((1, 2), "blueprint get-by-name")
     for bp in load(data_dir):
-        if bp.get("uuid") == ident:
+        if bp.get("name") == ident:
             return bp
-    raise ForgeError("not_found", "blueprint '%s' not found" % ident)
+    raise ForgeError("not_found", "blueprint with name '%s' not found" % ident)
 
 
 def cmd_delete(data_dir, args):
@@ -273,6 +312,13 @@ def save_allocs(data_dir, allocs):
         raise
 
 
+def alloc_view(a):
+    out = {k: v for k, v in a.items() if k != "tenant_id"}
+    if REVISION >= (1, 1):
+        out["tenant_id"] = a.get("tenant_id")
+    return out
+
+
 def alloc_sort_key(a):
     return (a.get("created_at", ""), a.get("uuid", ""))
 
@@ -322,7 +368,7 @@ def cmd_alloc_create(data_dir, args):
     allocs = load_allocs(data_dir)
     allocs.extend(created)
     save_allocs(data_dir, allocs)
-    return created
+    return [alloc_view(a) for a in created]
 
 
 def _take_opt(args, i, flag):
@@ -353,7 +399,7 @@ def cmd_alloc_list(data_dir, args):
         if status is not None and al.get("binding_status") != status:
             continue
         out.append(al)
-    return sorted(out, key=alloc_sort_key)
+    return [alloc_view(a) for a in sorted(out, key=alloc_sort_key)]
 
 
 def cmd_alloc_get(data_dir, args):
@@ -362,7 +408,7 @@ def cmd_alloc_get(data_dir, args):
     ident = args[0]
     for al in load_allocs(data_dir):
         if al.get("uuid") == ident:
-            return al
+            return alloc_view(al)
     raise ForgeError("not_found", "allocation '%s' not found" % ident)
 
 
@@ -393,6 +439,8 @@ def cmd_alloc_bind(data_dir, args):
     if not isinstance(doc, dict):
         raise ForgeError("validation_error",
                          "input must be a JSON object, got %s" % type_name(doc))
+    if "tenant_id" in doc:
+        require_revision((1, 1), "tenant_id in allocation bind")
     errors = []
     if "assignment_id" not in doc or doc["assignment_id"] is None:
         errors.append("assignment_id: is required")
@@ -408,6 +456,9 @@ def cmd_alloc_bind(data_dir, args):
                       % type_name(doc["allocations"]))
     elif len(doc["allocations"]) == 0:
         errors.append("allocations: must contain at least one entry")
+    if "tenant_id" in doc and doc["tenant_id"] is not None \
+            and not isinstance(doc["tenant_id"], str):
+        errors.append("tenant_id: must be a string, got %s" % type_name(doc["tenant_id"]))
     if errors:
         raise ForgeError("validation_error", "; ".join(errors))
 
@@ -435,6 +486,9 @@ def cmd_alloc_bind(data_dir, args):
     changed = False
     for k, v in ops.items():
         al = by_id[k]
+        if "tenant_id" in doc and al.get("tenant_id") != doc["tenant_id"]:
+            al["tenant_id"] = doc["tenant_id"]
+            changed = True
         if v == "add":
             al["binding_status"] = "bound"
             al["assignment_id"] = assignment
@@ -947,6 +1001,43 @@ GROUPS = {
 UNKNOWN_COMMAND_GROUPS = ("module", "tag")
 
 
+COLLECTION_KEYS = {
+    cmd_list: "blueprints",
+    cmd_alloc_create: "allocations",
+    cmd_alloc_list: "allocations",
+    cmd_unit_list: "units",
+    cmd_ledger_capabilities: "capabilities",
+    cmd_module_list: "modules",
+    cmd_tag_list: "tags",
+}
+
+
+def extract_revision(argv):
+    """Remove --revision options from argv; return (raw_value_or_None, remaining)."""
+    raw = None
+    seen = False
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--revision":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                raise ForgeError("parse_error", "--revision requires a value")
+            val = argv[i + 1]
+            i += 2
+        elif a.startswith("--revision="):
+            val = a[len("--revision="):]
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+            continue
+        if not seen:
+            raw = val
+            seen = True
+    return raw, rest
+
+
 def parse_argv(argv):
     data_dir = None
     rest = []
@@ -965,11 +1056,15 @@ def parse_argv(argv):
             continue
         rest.append(a)
         i += 1
+    if rest and rest[0] == "version":
+        if len(rest) > 1:
+            raise ForgeError("validation_error", "version takes no arguments")
+        return data_dir, None, []
     if not data_dir:
         raise ForgeError("validation_error", "--data-dir is required")
     if not rest or rest[0] not in GROUPS:
         raise ForgeError("validation_error",
-                         "usage: forge.py --data-dir <path> {blueprint|allocation|unit|ledger|module|tag} <command> [args]")
+                         "usage: forge.py --data-dir <path> {version|blueprint|allocation|unit|ledger|module|tag} <command> [args]")
     group = rest[0]
     if len(rest) < 2:
         raise ForgeError("unknown_command" if group in UNKNOWN_COMMAND_GROUPS
@@ -982,11 +1077,35 @@ def parse_argv(argv):
 
 
 def main(argv):
+    global REVISION
+    REVISION = MIN_REVISION
+    try:
+        raw, argv = extract_revision(argv)
+        if raw is not None:
+            REVISION = parse_revision(raw)
+    except ForgeError as e:
+        REVISION = MIN_REVISION
+        out = {"error": e.error, "detail": e.detail}
+        out.update(e.extra)
+        out["revision"] = fmt_rev(MIN_REVISION)
+        emit(out, 1)
     try:
         data_dir, func, args = parse_argv(argv)
+        if func is None:
+            emit({"max_revision": fmt_rev(MAX_REVISION),
+                  "min_revision": fmt_rev(MIN_REVISION)}, 0)
         result = func(data_dir, args)
     except ForgeError as e:
-        emit({"error": e.error, "detail": e.detail}, 1)
+        out = {"error": e.error, "detail": e.detail}
+        out.update(e.extra)
+        out["revision"] = fmt_rev(REVISION)
+        emit(out, 1)
+    rev = fmt_rev(REVISION)
+    if func in COLLECTION_KEYS:
+        result = {"revision": rev, COLLECTION_KEYS[func]: result}
+    elif isinstance(result, dict):
+        result = dict(result)
+        result["revision"] = rev
     emit(result, 0)
 
 
