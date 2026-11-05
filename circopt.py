@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""circopt - circuit tool (Part 1: CLI basics and `check`)."""
+"""circopt - circuit tool (Part 1: CLI basics and `check`; Part 2: `eval`)."""
 
 import json
 import os
@@ -14,6 +14,8 @@ usage: circopt.py [--help] [--version] [--json] <command> [args]
 Commands:
   check <file.circ>    Parse and validate a .circ circuit file and report
                        its interface.
+  eval <file.circ> [--set name=value ...] [--default 0|1] [--allow-extra]
+                       Evaluate the circuit (2-valued) and print outputs.
 
 Global flags:
   --help               Show this help and exit.
@@ -72,6 +74,9 @@ InputAssignmentError = _mk("InputAssignmentError", 3)
 MultipleAssignmentError = _mk("MultipleAssignmentError", 3)
 ArityError = _mk("ArityError", 3)
 CycleError = _mk("CycleError", 3)
+MissingInputError = _mk("MissingInputError", 1)
+UnknownInputError = _mk("UnknownInputError", 1)
+InputValueParseError = _mk("InputValueParseError", 2)
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +441,132 @@ def cmd_check(args):
     return result, text
 
 
-COMMANDS = {"check": cmd_check}
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def parse_bit(text, what):
+    v = text.strip()
+    if v in ("0", "1"):
+        return int(v)
+    raise InputValueParseError("invalid value %r for %s (expected 0 or 1)" % (text, what))
+
+
+def eval_expr(e, env):
+    if isinstance(e, Const):
+        return e.value
+    if isinstance(e, Ident):
+        return env[e.name]
+    vals = [eval_expr(a, env) for a in e.args]
+    op = e.op
+    if op == "BUF":
+        return vals[0]
+    if op == "NOT":
+        return 1 - vals[0]
+    if op in ("AND", "NAND"):
+        r = 1 if all(vals) else 0
+        return r if op == "AND" else 1 - r
+    if op in ("OR", "NOR"):
+        r = 1 if any(vals) else 0
+        return r if op == "OR" else 1 - r
+    if op in ("XOR", "XNOR"):
+        r = 0
+        for v in vals:
+            r ^= v
+        return r if op == "XOR" else 1 - r
+    raise CircoptError("unknown operator %s" % op)
+
+
+def topo_order(c):
+    order = []
+    state = {}
+    for start in c.order:
+        if start in state:
+            continue
+        stack = [(start, None)]
+        while stack:
+            node, it = stack.pop()
+            if it is None:
+                if node in state:
+                    continue
+                state[node] = 1
+                refs = []
+                expr_refs(c.assigns[node], refs)
+                it = iter([r.name for r in refs if r.name in c.assigns])
+            nxt = None
+            for d in it:
+                if d not in state:
+                    nxt = d
+                    break
+            if nxt is not None:
+                stack.append((node, it))
+                stack.append((nxt, None))
+            else:
+                state[node] = 2
+                order.append(node)
+    return order
+
+
+def evaluate(c, inputs):
+    env = dict(inputs)
+    for name in topo_order(c):
+        env[name] = eval_expr(c.assigns[name], env)
+    return env
+
+
+def cmd_eval(args, opts):
+    if len(args) != 1:
+        raise CliUsageError("eval requires exactly one file argument")
+    sets = []
+    for s in opts.get("--set", []):
+        if "=" not in s:
+            raise InputValueParseError("invalid --set %r (expected name=value)" % s)
+        name, val = s.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise InputValueParseError("invalid --set %r (empty name)" % s)
+        sets.append((name, parse_bit(val, name)))
+    default = None
+    if opts.get("--default"):
+        default = parse_bit(opts["--default"][-1], "--default")
+    allow_extra = bool(opts.get("--allow-extra"))
+
+    c = load_circ(args[0])
+    inputs = {}
+    input_set = set(c.inputs)
+    for name, v in sets:
+        if name not in input_set:
+            if allow_extra:
+                continue
+            raise UnknownInputError("unknown input %r" % name)
+        inputs[name] = v
+    missing = [n for n in sorted(c.inputs) if n not in inputs]
+    if missing:
+        if default is None:
+            raise MissingInputError("missing value for input(s): %s"
+                                    % ", ".join(missing))
+        for n in missing:
+            inputs[n] = default
+    env = evaluate(c, inputs)
+    outs = sorted(c.outputs)
+    result = {
+        "mode": "2val",
+        "radix": "bin",
+        "outputs": [{"name": n, "msb": 0, "lsb": 0, "value": str(env[n])}
+                    for n in outs],
+    }
+    text = "\n".join("%s=%d" % (n, env[n]) for n in outs)
+    return result, text
+
+
+COMMANDS = {"check": cmd_check, "eval": cmd_eval}
+# command -> {flag: takes_value}
+COMMAND_FLAGS = {
+    "check": {},
+    "eval": {"--set": True, "--default": True, "--allow-extra": False},
+}
+ALL_VALUE_FLAGS = {f for d in COMMAND_FLAGS.values() for f, v in d.items() if v}
+ALL_CMD_FLAGS = {f for d in COMMAND_FLAGS.values() for f in d}
 
 
 # ---------------------------------------------------------------------------
@@ -453,8 +583,13 @@ def main(argv):
     want_version = False
     positional = []
     bad_flag = None
+    missing_value = None
     after_dd = False
-    for a in argv:
+    opts = {}  # flag -> list of values (or True markers)
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        i += 1
         if after_dd:
             positional.append(a)
         elif a == "--":
@@ -466,7 +601,24 @@ def main(argv):
         elif a == "--version":
             want_version = True
         elif a.startswith("-") and a != "-":
-            if bad_flag is None:
+            flag, eq, val = a.partition("=")
+            if flag in ALL_CMD_FLAGS:
+                if flag in ALL_VALUE_FLAGS:
+                    if not eq:
+                        if i < len(argv):
+                            val = argv[i]
+                            i += 1
+                        else:
+                            if missing_value is None:
+                                missing_value = flag
+                            continue
+                    opts.setdefault(flag, []).append(val)
+                elif eq:
+                    if bad_flag is None:
+                        bad_flag = a
+                else:
+                    opts.setdefault(flag, []).append(True)
+            elif bad_flag is None:
                 bad_flag = a
         else:
             positional.append(a)
@@ -495,7 +647,16 @@ def main(argv):
                 raise CliUsageError("no command given (try --help)")
             if positional[0] not in COMMANDS:
                 raise CliUsageError("unknown command: %s" % positional[0])
-            result, text = COMMANDS[command](positional[1:])
+            allowed = COMMAND_FLAGS[command]
+            for f in opts:
+                if f not in allowed:
+                    raise CliUsageError("flag %s is not valid for %s" % (f, command))
+            if missing_value is not None:
+                raise CliUsageError("flag %s requires a value" % missing_value)
+            if command == "check":
+                result, text = cmd_check(positional[1:])
+            else:
+                result, text = COMMANDS[command](positional[1:], opts)
         except CircoptError:
             raise
         except RecursionError:
@@ -533,7 +694,8 @@ def main(argv):
         out.update(result)
         emit_json(out)
     else:
-        sys.stdout.write(text + "\n")
+        if text:
+            sys.stdout.write(text + "\n")
     return 0
 
 
