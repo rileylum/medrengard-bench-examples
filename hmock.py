@@ -3451,7 +3451,16 @@ def _walk_files(root):
             yield full
 
 
-def load_mocks(templates_dir):
+def _parse_mock_docs(docs):
+    items = []
+    for doc in docs:
+        if doc is None:
+            continue
+        items.extend(doc if isinstance(doc, list) else [doc])
+    return items
+
+
+def read_fs_items(templates_dir):
     raw = []
     if not os.path.isdir(templates_dir):
         LOG.warn("templates directory not found", dir=templates_dir)
@@ -3463,18 +3472,28 @@ def load_mocks(templates_dir):
         except Exception as e:  # noqa: BLE001
             LOG.error("failed to parse mock file", file=path, err=str(e))
             continue
-        count = 0
-        for doc in docs:
-            if doc is None:
-                continue
-            items = doc if isinstance(doc, list) else [doc]
-            for item in items:
-                raw.append((item, path))
-                count += 1
-        LOG.debug("loaded mock file", file=path, count=count)
+        items = _parse_mock_docs(docs)
+        for item in items:
+            raw.append((item, path))
+        LOG.debug("loaded mock file", file=path, count=len(items))
+    return raw
 
+
+def load_mocks(templates_dir):
+    behaviors, _, _, templates = build_mocks(read_fs_items(templates_dir), templates_dir)
+    set_named_templates(templates)
+    return behaviors
+
+
+def build_mocks(raw, templates_dir):
+    """Validate, de-duplicate (last wins), resolve extends and compile mocks.
+
+    raw is a list of (item, source). Returns (behaviors, active_items,
+    errors, templates) where errors is a list of (source, key, message)."""
+    errors = []
     # first pass: per-item structural validation, split templates/behaviors
     templates = {}
+    template_items = {}
     entries = []  # (item, path) of Behavior / AbstractBehavior
     for item, path in raw:
         try:
@@ -3502,7 +3521,9 @@ def load_mocks(templates_dir):
                     raise ValidationError("invalid template: %s" % e)
                 if key in templates:
                     LOG.warn("duplicate template key; overriding previous definition", key=key)
+                templates.pop(key, None)
                 templates[key] = src
+                template_items[key] = (item, path)
                 continue
             ext = item.get("extend")
             if ext is not None and not isinstance(ext, str):
@@ -3516,9 +3537,9 @@ def load_mocks(templates_dir):
         except ValidationError as e:
             key = item.get("key") if isinstance(item, dict) else None
             LOG.error("invalid mock rejected", file=path, key=_to_text(key), err=str(e))
+            errors.append((path, _to_text(key), str(e)))
             continue
         entries.append((item, path))
-    set_named_templates(templates)
 
     # duplicate keys: the last loaded mock wins
     last_index = {}
@@ -3553,16 +3574,21 @@ def load_mocks(templates_dir):
         return merged
 
     result = []
+    active = [it for it, _ in template_items.values()]
     for item, path in entries:
         merged = resolve(item["key"], frozenset())
         try:
             b = Behavior(merged, path, templates_dir)
         except ValidationError as e:
             LOG.error("invalid mock rejected", file=path, key=_to_text(item.get("key")), err=str(e))
+            errors.append((path, _to_text(item.get("key")), str(e)))
             continue
         result.append(b)
+        active.append(item)
+    keep = {id(it) for it in active}
+    active = [it for it, _ in raw if id(it) in keep]
     LOG.info("mocks loaded", count=len(result), dir=templates_dir)
-    return result
+    return result, active, errors, templates
 
 
 # ---------------------------------------------------------------------------
@@ -4121,9 +4147,28 @@ def _redis_result(v):
     return str(v)
 
 
+INTERNAL_PREFIX = "__hmock_internal:"
+INTERNAL_TEMPLATES_KEY = INTERNAL_PREFIX + "templates"
+INTERNAL_SETS_PREFIX = INTERNAL_PREFIX + "template_sets:"
+
+
+def _touches_internal(cmd, argv):
+    for a in argv:
+        if a.startswith("__hmock_internal"):
+            return True
+    return False
+
+
 def h_redis_do(command, *args):
     cmd = _redis_arg(command)
     argv = [_redis_arg(a) for a in args]
+    if _touches_internal(cmd, argv):
+        try:
+            LOG.error("redisDo blocked: reserved keyspace", command=cmd, args=" ".join(argv))
+        except NameError:
+            pass
+        raise TemplateError("redisDo: access to reserved keyspace %s* is not allowed"
+                            % INTERNAL_PREFIX)
     try:
         res = get_redis().do(cmd, *argv)
     except Exception as e:  # noqa: BLE001
@@ -4132,10 +4177,246 @@ def h_redis_do(command, *args):
         except NameError:
             pass
         return ""
+    if cmd.upper() in ("KEYS", "SCAN") and isinstance(res, list):
+        # never expose the internal keyspace
+        if cmd.upper() == "KEYS":
+            res = [k for k in res if not (isinstance(k, str) and k.startswith(INTERNAL_PREFIX))]
+        elif len(res) == 2 and isinstance(res[1], list):
+            res = [res[0], [k for k in res[1]
+                            if not (isinstance(k, str) and k.startswith(INTERNAL_PREFIX))]]
     return _redis_result(res)
 
 
 FUNCS["redisDo"] = h_redis_do
+
+
+# ---------------------------------------------------------------------------
+# Persistent store for API-added mocks and template sets
+# ---------------------------------------------------------------------------
+
+def _jsonable(v):
+    return json.loads(json.dumps(v, default=str))
+
+
+class FileStore:
+    """Store used with the embedded redis backend: persisted to a JSON file."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.base = []
+        self.sets = {}
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception as e:  # noqa: BLE001
+            LOG.error("failed to read persisted mocks", file=self.path, err=str(e))
+            return
+        base = data.get(INTERNAL_TEMPLATES_KEY) if isinstance(data, dict) else None
+        self.base = base if isinstance(base, list) else []
+        sets = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if k.startswith(INTERNAL_SETS_PREFIX) and isinstance(v, list):
+                    sets[k[len(INTERNAL_SETS_PREFIX):]] = v
+        self.sets = sets
+
+    def _save(self):
+        data = {INTERNAL_TEMPLATES_KEY: self.base}
+        for k, v in self.sets.items():
+            data[INTERNAL_SETS_PREFIX + k] = v
+        d = os.path.dirname(self.path) or "."
+        os.makedirs(d, exist_ok=True)
+        tmp = "%s.tmp.%d" % (self.path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, self.path)
+
+    def get_base(self):
+        return list(self.base)
+
+    def set_base(self, items):
+        self.base = list(items)
+        self._save()
+
+    def get_sets(self):
+        return {k: list(self.sets[k]) for k in sorted(self.sets)}
+
+    def set_set(self, key, items):
+        self.sets[key] = list(items)
+        self._save()
+
+    def del_set(self, key):
+        existed = self.sets.pop(key, None) is not None
+        self._save()
+        return existed
+
+
+class RedisStore:
+    """Store used with an external redis: persisted in the internal keyspace."""
+
+    def __init__(self, client):
+        self.client = client
+        self.lock = threading.Lock()
+
+    def _get_list(self, key):
+        v = self.client.do("GET", key)
+        if not v:
+            return []
+        try:
+            data = json.loads(v)
+        except ValueError:
+            LOG.error("corrupt persisted mocks", key=key)
+            return []
+        return data if isinstance(data, list) else []
+
+    def get_base(self):
+        return self._get_list(INTERNAL_TEMPLATES_KEY)
+
+    def set_base(self, items):
+        self.client.do("SET", INTERNAL_TEMPLATES_KEY, json.dumps(items))
+
+    def get_sets(self):
+        keys = self.client.do("KEYS", INTERNAL_SETS_PREFIX + "*") or []
+        out = {}
+        for k in sorted(keys):
+            if isinstance(k, str) and k.startswith(INTERNAL_SETS_PREFIX):
+                out[k[len(INTERNAL_SETS_PREFIX):]] = self._get_list(k)
+        return out
+
+    def set_set(self, key, items):
+        self.client.do("SET", INTERNAL_SETS_PREFIX + key, json.dumps(items))
+
+    def del_set(self, key):
+        return bool(self.client.do("DEL", INTERNAL_SETS_PREFIX + key))
+
+
+def _default_store_path(templates_dir):
+    p = os.environ.get("HM_STORE_FILE")
+    if p:
+        return p
+    absdir = os.path.abspath(templates_dir)
+    if os.path.isdir(absdir) and os.access(absdir, os.W_OK):
+        return os.path.join(absdir, ".hmock_store.json")
+    import tempfile
+    h = hashlib.sha256(absdir.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+    return os.path.join(tempfile.gettempdir(), "hmock-store-%s.json" % h)
+
+
+def make_store(templates_dir):
+    if isinstance(REDIS, RespRedis):
+        return RedisStore(REDIS)
+    return FileStore(_default_store_path(templates_dir))
+
+
+class MockRegistry:
+    """Holds the active mock set: filesystem + persisted API mocks + sets."""
+
+    def __init__(self, templates_dir, store):
+        self.templates_dir = templates_dir
+        self.store = store
+        self.lock = threading.RLock()
+        self.active = []
+        self.fingerprint = None
+
+    def _gather(self, base=None, sets=None, extra=None):
+        raw = list(read_fs_items(self.templates_dir))
+        if base is None:
+            base = self.store.get_base()
+        if sets is None:
+            sets = self.store.get_sets()
+        for item in base:
+            raw.append((item, "api"))
+        for k in sorted(sets):
+            for item in sets[k]:
+                raw.append((item, "template_set:" + k))
+        if extra:
+            raw.extend(extra)
+        return raw, base, sets
+
+    def reload(self, base=None, sets=None):
+        with self.lock:
+            try:
+                raw, base, sets = self._gather(base, sets)
+            except Exception as e:  # noqa: BLE001
+                LOG.error("failed to read persisted mocks", err=str(e))
+                raw, base, sets = self._gather([], {})
+            behaviors, active, _, templates = build_mocks(raw, self.templates_dir)
+            set_named_templates(templates)
+            MockHandler.behaviors = [b for b in behaviors if b.is_http]
+            self.active = active
+            self.fingerprint = json.dumps([base, sets], sort_keys=True, default=str)
+
+    def validate(self, items, base, sets, precheck=False):
+        """Validate items as part of the full mock set; returns error list."""
+        errs = []
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                errs.append("mock #%d: mock must be a mapping" % i)
+            elif not isinstance(it.get("key"), str) or it.get("key") == "":
+                errs.append("mock #%d: key is required and must be a non-empty string" % i)
+        if errs or precheck:
+            return errs
+        marker = "__submitted__"
+        raw, _, _ = self._gather(base, sets)
+        raw = [(it, src) for it, src in raw]
+        ids = {id(it) for it in items}
+        # tag submitted items with a marker source
+        raw = [(it, marker if id(it) in ids else src) for it, src in raw]
+        _, _, errors, _ = build_mocks(raw, self.templates_dir)
+        for src, key, msg in errors:
+            if src == marker:
+                errs.append("mock %r: %s" % (key, msg))
+        return errs
+
+    def poll(self):
+        try:
+            fp = json.dumps([self.store.get_base(), self.store.get_sets()],
+                            sort_keys=True, default=str)
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("store poll failed", err=str(e))
+            return
+        if fp != self.fingerprint:
+            LOG.info("persisted mocks changed; reloading")
+            self.reload()
+
+
+REGISTRY = None
+
+
+def parse_mock_body(body):
+    """Parse an admin request body (JSON or YAML) into a list of mocks."""
+    text = _dec(body).strip()
+    if not text:
+        raise ValidationError("request body is empty")
+    try:
+        data = json.loads(text)
+        docs = [data]
+    except ValueError:
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except Exception as e:  # noqa: BLE001
+            raise ValidationError("invalid request body: %s" % e)
+    items = []
+    for doc in docs:
+        if doc is None:
+            continue
+        items.extend(doc if isinstance(doc, list) else [doc])
+    try:
+        items = _jsonable(items)
+    except (TypeError, ValueError) as e:
+        raise ValidationError("invalid request body: %s" % e)
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -4354,6 +4635,179 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 128
 
 
+class AdminHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "hmock-admin"
+    sys_version = ""
+
+    def version_string(self):
+        return self.server_version
+
+    def log_message(self, fmt, *args):
+        LOG.debug("admin http server: " + (fmt % args))
+
+    _read_body = MockHandler._read_body
+
+    def _reply(self, status, obj=None):
+        if obj is None or status == 204:
+            data = b""
+        else:
+            data = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        if status != 204:
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if data and self.command != "HEAD":
+            self.wfile.write(data)
+        self.wfile.flush()
+
+    def _error(self, status, msg):
+        self._reply(status, {"error": msg})
+
+    def do_GET(self):
+        self._dispatch("GET")
+
+    def do_HEAD(self):
+        self._dispatch("GET")
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    def do_PUT(self):
+        self._dispatch("PUT")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
+
+    def do_PATCH(self):
+        self._dispatch("PATCH")
+
+    def _dispatch(self, method):
+        body = self._read_body()
+        path = urllib.parse.urlsplit(self.path).path
+        if len(path) > 1:
+            path = path.rstrip("/")
+        parts = [urllib.parse.unquote(x) for x in path.split("/")[1:]]
+        status = None
+        try:
+            if parts[:2] != ["api", "v1"] or len(parts) < 3:
+                return self._error(404, "not found")
+            res = parts[2]
+            rest = parts[3:]
+            if res == "health" and not rest:
+                if method != "GET":
+                    return self._error(405, "method not allowed")
+                return self._reply(200, {"status": "OK"})
+            if res == "templates" and not rest:
+                if method == "GET":
+                    with REGISTRY.lock:
+                        return self._reply(200, list(REGISTRY.active))
+                if method == "POST":
+                    return self._post_templates(body)
+                if method == "DELETE":
+                    with REGISTRY.lock:
+                        REGISTRY.store.set_base([])
+                        REGISTRY.reload()
+                    return self._reply(204)
+                return self._error(405, "method not allowed")
+            if res == "templates" and len(rest) == 1:
+                if method != "DELETE":
+                    return self._error(405, "method not allowed")
+                key = rest[0]
+                with REGISTRY.lock:
+                    base = REGISTRY.store.get_base()
+                    keep = [m for m in base if not (isinstance(m, dict) and m.get("key") == key)]
+                    if len(keep) == len(base):
+                        return self._error(404, "template %r not found" % key)
+                    REGISTRY.store.set_base(keep)
+                    REGISTRY.reload()
+                return self._reply(204)
+            if res == "template_sets" and len(rest) == 1 and rest[0] != "":
+                set_key = rest[0]
+                if method == "POST":
+                    return self._post_set(set_key, body)
+                if method == "DELETE":
+                    with REGISTRY.lock:
+                        REGISTRY.store.del_set(set_key)
+                        REGISTRY.reload()
+                    return self._reply(204)
+                return self._error(405, "method not allowed")
+            return self._error(404, "not found")
+        except Exception as e:  # noqa: BLE001
+            LOG.error("admin request failed", path=_log_str(self.path), err=str(e))
+            try:
+                return self._error(500, str(e))
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            LOG.info("admin request", http_path=_log_str(self.path), http_method=method)
+
+    def _parse(self, body):
+        try:
+            return parse_mock_body(body), None
+        except ValidationError as e:
+            return None, str(e)
+
+    def _post_templates(self, body):
+        items, err = self._parse(body)
+        if err:
+            return self._error(400, err)
+        with REGISTRY.lock:
+            base = REGISTRY.store.get_base()
+            sets = REGISTRY.store.get_sets()
+            errs = REGISTRY.validate(items, base, sets, precheck=True)
+            if errs:
+                return self._error(400, "; ".join(errs))
+            # add or update by key (last submitted wins)
+            merged = [m for m in base if isinstance(m, dict)]
+            index = {m.get("key"): i for i, m in enumerate(merged)}
+            for it in items:
+                k = it["key"]
+                if k in index:
+                    merged[index[k]] = it
+                else:
+                    index[k] = len(merged)
+                    merged.append(it)
+            errs = REGISTRY.validate(items, merged, sets)
+            if errs:
+                return self._error(400, "; ".join(errs))
+            REGISTRY.store.set_base(merged)
+            REGISTRY.reload()
+        return self._reply(200, items)
+
+    def _post_set(self, set_key, body):
+        items, err = self._parse(body)
+        if err:
+            return self._error(400, err)
+        with REGISTRY.lock:
+            base = REGISTRY.store.get_base()
+            sets = REGISTRY.store.get_sets()
+            sets[set_key] = items
+            errs = REGISTRY.validate(items, base, sets)
+            if errs:
+                return self._error(400, "; ".join(errs))
+            REGISTRY.store.set_set(set_key, items)
+            REGISTRY.reload()
+        return self._reply(200, items)
+
+
+def _env_bool(name, default):
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
+
+def _reload_loop(interval):
+    while True:
+        time.sleep(interval)
+        try:
+            REGISTRY.poll()
+        except Exception as e:  # noqa: BLE001
+            LOG.error("reload failed", err=str(e))
+
+
 def main():
     global LOG
     LOG = Logger(os.environ.get("HM_LOG_LEVEL", "info"))
@@ -4376,14 +4830,38 @@ def main():
         REDIS = MemoryRedis()
     LOG.info("redis backend", type=(os.environ.get("HM_REDIS_TYPE") or "memory"))
 
-    behaviors = load_mocks(templates_dir)
-    MockHandler.behaviors = [b for b in behaviors if b.is_http]
+    global REGISTRY
+    try:
+        store = make_store(templates_dir)
+    except Exception as e:  # noqa: BLE001
+        LOG.error("failed to configure persistent store", err=str(e))
+        store = FileStore(_default_store_path(templates_dir))
+    REGISTRY = MockRegistry(templates_dir, store)
+    REGISTRY.reload()
 
     try:
         httpd = Server((host, port), MockHandler)
     except OSError as e:
         LOG.error("failed to start http server", err=str(e), host=host, port=port)
         sys.exit(1)
+
+    if _env_bool("HM_ADMIN_HTTP_ENABLED", True):
+        ahost = os.environ.get("HM_ADMIN_HTTP_HOST") or "0.0.0.0"
+        aport_s = os.environ.get("HM_ADMIN_HTTP_PORT") or "9998"
+        try:
+            aport = int(aport_s)
+        except ValueError:
+            LOG.error("invalid HM_ADMIN_HTTP_PORT", value=aport_s)
+            sys.exit(1)
+        try:
+            admin = Server((ahost, aport), AdminHandler)
+        except OSError as e:
+            LOG.error("failed to start admin http server", err=str(e), host=ahost, port=aport)
+            sys.exit(1)
+        LOG.info("starting admin http server", host=ahost, port=aport)
+        threading.Thread(target=admin.serve_forever, daemon=True).start()
+
+    threading.Thread(target=_reload_loop, args=(1.0,), daemon=True).start()
     LOG.info("starting http server", host=host, port=port)
     try:
         httpd.serve_forever()
