@@ -350,7 +350,7 @@ SHIP_TYPES = {
 }
 
 
-def load_config(path, ship_name):
+def load_config_data(path):
     data = load_yaml(path, "config")
     if not isinstance(data, dict):
         raise ConfigError("config must be a mapping")
@@ -360,16 +360,15 @@ def load_config(path, ship_name):
     times = data.get("times")
     if not isinstance(times, dict):
         raise ConfigError("config has no 'times'")
-    key = None
-    if ship_name in ships:
-        key = ship_name
-    else:
-        for k in ships:
-            if str(k).lower() == ship_name.lower():
-                key = k
-                break
-    if key is None:
-        raise ConfigError(f"unknown ship '{ship_name}'")
+    return data
+
+
+DEFAULT_EHP = {"Deep Space Transport": 60_000.0, "Freighter": 300_000.0}
+
+
+def build_ship(data, key):
+    ships = data["ships"]
+    times = data["times"]
     sd = ships[key]
     where = f"ship '{key}'"
     if not isinstance(sd, dict):
@@ -389,8 +388,28 @@ def load_config(path, ship_name):
         "gate": _num(times, "gate", "times", lambda f: f > 0, "> 0"),
         "move_cargo": _num(times, "move_cargo", "times", lambda f: f > 0, "> 0"),
     }
+    ehp = _num(sd, "ehp", where, lambda f: f >= 0, ">= 0", required=False)
+    if ehp is None:
+        ehp = DEFAULT_EHP.get(stype, math.inf)
+    ship["ehp"] = ehp
     ship["align"] = float(math.ceil(ship["align"]))
     return ship
+
+
+def load_config(path, ship_name):
+    data = load_config_data(path)
+    ships = data["ships"]
+    key = None
+    if ship_name in ships:
+        key = ship_name
+    else:
+        for k in ships:
+            if str(k).lower() == ship_name.lower():
+                key = k
+                break
+    if key is None:
+        raise ConfigError(f"unknown ship '{ship_name}'")
+    return build_ship(data, key)
 
 
 def load_manifest(path):
@@ -609,8 +628,9 @@ def non_negative(v):
     return f
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description="Plan a hauling route in New Eden.")
+def main_plan(argv):
+    p = argparse.ArgumentParser(prog="hauling.py plan",
+                                description="Plan a hauling route in New Eden.")
     p.add_argument("start")
     p.add_argument("end")
     p.add_argument("--manifest")
@@ -672,6 +692,664 @@ def main(argv=None):
         return 1
     print("\n".join(lines))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Contracts mode
+# ---------------------------------------------------------------------------
+
+from decimal import Decimal, ROUND_HALF_EVEN  # noqa: E402
+import json  # noqa: E402
+
+
+def multi_leg(u, start_loc, targets, ship, allowed=None):
+    """Single-source search to many target places.
+
+    Returns {target: (time, jumps)} for every reachable target.
+    """
+    align = ship["align"]
+    top_speed = ship["top_speed"]
+    warp_speed = ship["warp_speed"]
+    dock = ship["dock"]
+    gate = ship["gate"]
+    zarzakh = u.name_to_sys.get(ZARZAKH)
+    start_sys = loc_sys(u, start_loc)
+    out = {}
+    want_st = {}
+    want_sys = {}
+    for tg in targets:
+        if tg[0] == "S":
+            if start_loc == ("S", tg[1]):
+                out[tg] = (0.0, 0)
+            else:
+                want_st[tg[1]] = tg
+        else:
+            if start_sys == tg[1]:
+                out[tg] = (0.0, 0)
+            else:
+                want_sys[tg[1]] = tg
+    if not want_st and not want_sys:
+        return out
+
+    def dist_to(pos, p2):
+        if pos is None:
+            return 1.0
+        return distance(pos, p2)
+
+    start_state = (start_loc, None)
+    best = {start_state: 0.0}
+    jumps = {start_state: 0}
+    heap = [(0.0, 0, start_state)]
+    counter = 1
+    while heap and (want_st or want_sys):
+        t, _, state = heapq.heappop(heap)
+        if best.get(state, math.inf) < t:
+            continue
+        loc, lock = state
+        s = loc_sys(u, loc)
+        if loc[0] == "S" and loc[1] in want_st:
+            out[want_st.pop(loc[1])] = (t, jumps[state])
+        if loc[0] == "G" and s in want_sys:
+            out[want_sys.pop(s)] = (t, jumps[state])
+        pos = loc_pos(u, loc)
+        pre = dock if loc[0] == "S" else 0.0
+        cj = jumps[state]
+        for g in u.sys_gates.get(s, []):
+            dest = u.gates[g][1]
+            if allowed is not None and not allowed(dest):
+                continue
+            if loc == ("G", g):
+                travel = 0.0
+            else:
+                travel = pre + align + warp_time(dist_to(pos, u.gates[g][2]),
+                                                 warp_speed, top_speed)
+            jump_start = t + travel
+            if s == zarzakh and lock is not None and dest != lock[0]:
+                jump_start = max(jump_start, lock[1] + ZARZAKH_LOCK)
+            nt = jump_start + gate
+            arr_gate = u.gate_to.get((dest, s))
+            if arr_gate is None:
+                continue
+            nlock = (s, nt) if dest == zarzakh else None
+            ns = (("G", arr_gate), nlock)
+            if nt < best.get(ns, math.inf):
+                best[ns] = nt
+                jumps[ns] = cj + 1
+                heapq.heappush(heap, (nt, counter, ns))
+                counter += 1
+        for st in u.sys_stations.get(s, []):
+            if loc == ("S", st):
+                continue
+            nt = t + pre + align + warp_time(dist_to(pos, u.stations[st][2]),
+                                             warp_speed, top_speed) + dock
+            ns = (("S", st), lock)
+            if nt < best.get(ns, math.inf):
+                best[ns] = nt
+                jumps[ns] = cj
+                heapq.heappush(heap, (nt, counter, ns))
+                counter += 1
+    return out
+
+
+def route_multi(u, start_loc, targets, ship):
+    if ship.get("type") != "Freighter":
+        return multi_leg(u, start_loc, targets, ship)
+    out = multi_leg(u, start_loc, targets, ship,
+                    lambda s: sec_class(u.sys_sec.get(s, -1.0)) == "high")
+    rest = [t for t in targets if t not in out]
+    if rest:
+        out.update(multi_leg(u, start_loc, rest, ship,
+                             lambda s: sec_class(u.sys_sec.get(s, -1.0)) != "null"))
+    return out
+
+
+def to_dec(v):
+    if isinstance(v, Decimal):
+        return v
+    if isinstance(v, int):
+        return Decimal(v)
+    return Decimal(repr(float(v)))
+
+
+def bround(v, places=2):
+    q = Decimal(1).scaleb(-places)
+    r = to_dec(v).quantize(q, rounding=ROUND_HALF_EVEN)
+    if r == 0:
+        r = abs(r)
+    return f"{r:.{places}f}"
+
+
+def fmt_m(v):
+    """ISK amount in millions with bankers rounding."""
+    return bround(to_dec(v) / Decimal(1_000_000)) + "M"
+
+
+def _cnum(d, key, where, required=True, default=None):
+    if key not in d or d[key] is None:
+        if required:
+            raise ConfigError(f"missing '{key}' in {where}")
+        return default
+    v = d[key]
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise ConfigError(f"'{key}' in {where} must be a number")
+    try:
+        dv = Decimal(str(v).strip()) if isinstance(v, str) else to_dec(v)
+    except Exception:
+        raise ConfigError(f"'{key}' in {where} must be a number")
+    if not dv.is_finite() or dv < 0:
+        raise ConfigError(f"'{key}' in {where} must be a non-negative number")
+    return dv
+
+
+def load_contracts(path):
+    try:
+        fh = open(path, "r", encoding="utf-8")
+    except OSError as e:
+        raise ConfigError(f"could not read contracts '{path}': {e}")
+    out = []
+    with fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            where = f"contract on line {lineno}"
+            try:
+                d = json.loads(line)
+            except ValueError as e:
+                raise ConfigError(f"invalid JSON in {where}: {e}")
+            if not isinstance(d, dict):
+                raise ConfigError(f"{where} must be an object")
+            for k in ("start", "end"):
+                if not isinstance(d.get(k), str) or not d[k].strip():
+                    raise ConfigError(f"missing '{k}' in {where}")
+            m3 = _cnum(d, "m3", where)
+            reward = _cnum(d, "reward", where)
+            collateral = _cnum(d, "collateral", where, required=False,
+                               default=Decimal(0))
+            value = _cnum(d, "actual_value", where, required=False)
+            if value is None:
+                value = collateral
+            issuer = d.get("issuer")
+            issuer = "" if issuer is None else str(issuer)
+            out.append({
+                "id": len(out) + 1,
+                "start_name": d["start"].strip(),
+                "end_name": d["end"].strip(),
+                "m3": float(m3),
+                "m3_dec": m3,
+                "reward": reward,
+                "collateral": collateral,
+                "value": float(value),
+                "issuer": issuer,
+            })
+    return out
+
+
+class ContractPlanner:
+    """Selects and orders contracts for a single ship."""
+
+    def __init__(self, u, ship, base, contracts, limits):
+        self.u = u
+        self.ship = ship
+        self.base = base
+        self.contracts = contracts
+        self.max_time = limits["max_time"]
+        self.min_ipj = limits["min_isk_per_jump"]
+        self.max_ipe = limits["max_isk_per_ehp"]
+        self.target_iph = limits["target_iph"]
+        self.mc = ship["move_cargo"]
+        self.cap = ship["cargo_size"]
+        if ship["type"] == "Blockade Runner" or self.max_ipe is None:
+            self.max_value = math.inf
+        else:
+            self.max_value = float(self.max_ipe) * ship["ehp"]
+        self.iph_each_step = False
+        self.matrix = {}
+        self._build_matrix()
+
+    def _build_matrix(self):
+        u = self.u
+        places = [self.base]
+        for c in self.contracts:
+            places.append(c["start"])
+            places.append(c["end"])
+        uniq = list(dict.fromkeys(places))
+        for p in uniq:
+            loc = initial_loc(u, p)
+            self.matrix[p] = route_multi(u, loc, uniq, self.ship)
+
+    def leg(self, a, b):
+        return self.matrix[a].get(b)
+
+    def evaluate(self, route):
+        """route: list of (contract index, is_pickup).
+
+        Returns (last_event_time, total_time, total_jumps) or None.
+        """
+        cur = self.base
+        t = 0.0
+        jumps = 0
+        cargo = 0.0
+        value = 0.0
+        cs = self.contracts
+        for ci, pick in route:
+            c = cs[ci]
+            node = c["start"] if pick else c["end"]
+            lg = self.matrix[cur].get(node)
+            if lg is None:
+                return None
+            t += lg[0] + self.mc
+            jumps += lg[1]
+            cur = node
+            if pick:
+                cargo += c["m3"]
+                value += c["value"]
+                if cargo > self.cap + EPS or value > self.max_value * (1 + 1e-12) + EPS:
+                    return None
+            else:
+                cargo -= c["m3"]
+                value -= c["value"]
+        last = t
+        lg = self.matrix[cur].get(self.base)
+        if lg is None:
+            return None
+        if self.max_time is not None and last > self.max_time + EPS:
+            return None
+        return last, t + lg[0], jumps + lg[1]
+
+    def profit(self, route):
+        return sum((self.contracts[ci]["reward"] for ci, p in route if p), Decimal(0))
+
+    def iph(self, route, ev):
+        if ev[1] <= 0:
+            return math.inf
+        return float(self.profit(route)) / (ev[1] / 3600.0)
+
+    def iph_ok(self, route, ev):
+        if self.target_iph is None:
+            return True
+        return self.iph(route, ev) >= float(self.target_iph) * 1e6 - 1e-6
+
+    def min_ipj_ok(self, route, ev):
+        """Every contract still pays at least min_isk_per_jump for its jumps."""
+        if self.min_ipj is None:
+            return True
+        for ci in {ci for ci, _ in route}:
+            rest = [e for e in route if e[0] != ci]
+            rj = self.evaluate(rest)[2] if rest else 0
+            added = ev[2] - rj
+            if added > 0 and self.contracts[ci]["reward"] < self.min_ipj * added:
+                return False
+        return True
+
+    def prune(self, route, ev):
+        """Drop contracts until the plan meets the ISK/hour target."""
+        while route and not self.iph_ok(route, ev):
+            best = None
+            for ci in sorted({ci for ci, _ in route}):
+                rest = [e for e in route if e[0] != ci]
+                if not rest:
+                    continue
+                rev = self.evaluate(rest)
+                if rev is None:
+                    continue
+                key = (-self.iph(rest, rev), -self.profit(rest), ci)
+                if best is None or key < best[0]:
+                    best = (key, rest, rev)
+            if best is None:
+                return [], None
+            route, ev = best[1], best[2]
+            route, ev = self.improve(route, ev)
+        if not route or not self.iph_ok(route, ev):
+            return [], None
+        return route, ev
+
+    def try_insert(self, route, base_ev, ci):
+        """Best feasible insertion of contract ci into route (incremental)."""
+        c = self.contracts[ci]
+        cs = self.contracts
+        mat = self.matrix
+        base = self.base
+        inf = math.inf
+
+        def L(a, b):
+            r = mat[a].get(b)
+            return r if r is not None else (inf, 0)
+
+        n = len(route)
+        nodes = [cs[k]["start"] if pk else cs[k]["end"] for k, pk in route]
+        if n:
+            T, J = base_ev[1], base_ev[2]
+        else:
+            T, J = 0.0, 0
+        # prev(k)/next(k) node around insertion position k (0..n)
+        prev = [base] + nodes
+        nxt = nodes + [base]
+        # cargo/value carried while sitting at position k (after event k-1)
+        load = [0.0] * (n + 1)
+        val = [0.0] * (n + 1)
+        cl = cv = 0.0
+        for k, (kk, pk) in enumerate(route):
+            if pk:
+                cl += cs[kk]["m3"]
+                cv += cs[kk]["value"]
+            else:
+                cl -= cs[kk]["m3"]
+                cv -= cs[kk]["value"]
+            load[k + 1] = cl
+            val[k + 1] = cv
+        ret_old = L(nodes[-1], base) if n else (0.0, 0)
+        p, d = c["start"], c["end"]
+        m3, v = c["m3"], c["value"]
+        cap = self.cap + EPS
+        maxv = self.max_value * (1 + 1e-12) + EPS
+        mc2 = 2 * self.mc
+        reward = c["reward"]
+        prof = float(self.profit(route) + reward)
+        tgt = None
+        if self.target_iph is not None and self.iph_each_step:
+            tgt = float(self.target_iph) * 1e6 - 1e-6
+        min_ipj = self.min_ipj
+        max_time = self.max_time
+
+        # Detour costs for inserting a single node at each position
+        def detour(node, k):
+            a = L(prev[k], node)
+            b = L(node, nxt[k])
+            o = L(prev[k], nxt[k]) if n else (0.0, 0)
+            return a[0] + b[0] - o[0], a[1] + b[1] - o[1]
+
+        dd = [detour(d, k) for k in range(n + 1)]
+        best = None
+        for i in range(n + 1):
+            if load[i] + m3 > cap or val[i] + v > maxv:
+                continue
+            pi = detour(p, i)
+            if pi[0] == inf:
+                continue
+            ml, mv = load[i], val[i]
+            for j in range(i, n + 1):
+                if j > i:
+                    ml = max(ml, load[j])
+                    mv = max(mv, val[j])
+                    if ml + m3 > cap or mv + v > maxv:
+                        break
+                    dt = pi[0] + dd[j][0]
+                    dj = pi[1] + dd[j][1]
+                else:
+                    a = L(prev[i], p)
+                    b = L(p, d)
+                    e = L(d, nxt[i])
+                    o = L(prev[i], nxt[i]) if n else (0.0, 0)
+                    dt = a[0] + b[0] + e[0] - o[0]
+                    dj = a[1] + b[1] + e[1] - o[1]
+                if dt == inf:
+                    continue
+                total = T + dt + mc2
+                jumps = J + dj
+                if j == n:
+                    ret = L(d, base)
+                else:
+                    ret = ret_old
+                last = total - ret[0]
+                if max_time is not None and last > max_time + EPS:
+                    continue
+                if min_ipj is not None and dj > 0 and reward < min_ipj * dj:
+                    continue
+                if tgt is not None and total > 0 and prof / (total / 3600.0) < tgt:
+                    continue
+                key = (total, jumps, -i, j)
+                if best is None or key < best:
+                    best = key
+        if best is None:
+            return None
+        _, _, i, j = best
+        i = -i
+        r = route[:i] + [(ci, True)] + route[i:j] + [(ci, False)] + route[j:]
+        ev = self.evaluate(r)
+        if ev is None:
+            return None
+        return r, ev
+
+    def greedy(self, order):
+        route = []
+        ev = None
+        pending = list(order)
+        changed = True
+        while changed and pending:
+            changed = False
+            left = []
+            for ci in pending:
+                res = self.try_insert(route, ev, ci)
+                if res is None:
+                    left.append(ci)
+                    continue
+                route, ev = res
+                changed = True
+            pending = left
+        return route, ev
+
+    def improve(self, route, ev):
+        """Re-insert contracts one by one while it shortens the route."""
+        for _ in range(3):
+            better = False
+            for ci in sorted({ci for ci, _ in route}):
+                rest = [e for e in route if e[0] != ci]
+                rest_ev = self.evaluate(rest) if rest else None
+                if rest and rest_ev is None:
+                    continue
+                res = self.try_insert(rest, rest_ev, ci)
+                if res is None:
+                    continue
+                if res[1][1] < ev[1] - EPS:
+                    route, ev = res
+                    better = True
+            if not better:
+                break
+        return route, ev
+
+    def solve(self):
+        cs = self.contracts
+        usable = []
+        for i, c in enumerate(cs):
+            if c["m3"] > self.cap + EPS or c["value"] > self.max_value + EPS:
+                continue
+            if self.leg(self.base, c["start"]) is None:
+                continue
+            usable.append(i)
+        if not usable:
+            return None
+
+        def by_reward(i):
+            return (-cs[i]["reward"], cs[i]["issuer"], cs[i]["id"])
+
+        def by_density(i):
+            m = cs[i]["m3_dec"]
+            dens = cs[i]["reward"] / m if m > 0 else Decimal("Infinity")
+            return (-dens, cs[i]["issuer"], cs[i]["id"])
+
+        def by_rate(i):
+            c = cs[i]
+            a = self.leg(self.base, c["start"])
+            b = self.leg(c["start"], c["end"])
+            tm = a[0] + (b[0] if b else math.inf) + 2 * self.mc
+            return (-float(c["reward"]) / tm if tm > 0 else -math.inf,
+                    c["issuer"], c["id"])
+
+        orders = [sorted(usable, key=by_reward)]
+        if self.max_time is not None or self.target_iph is not None \
+                or self.min_ipj is not None:
+            orders.append(sorted(usable, key=by_density))
+            orders.append(sorted(usable, key=by_rate))
+        best = None
+        seen = set()
+        modes = [False] if self.target_iph is None else [False, True]
+        for order in orders:
+            if tuple(order) in seen:
+                continue
+            seen.add(tuple(order))
+            for mode in modes:
+                self.iph_each_step = mode
+                route, ev = self.greedy(order)
+                if not route:
+                    continue
+                route, ev = self.improve(route, ev)
+                route, ev = self.prune(route, ev)
+                if not route:
+                    continue
+                key = (-self.profit(route), ev[1], ev[2])
+                if best is None or key < best[0]:
+                    best = (key, route, ev)
+        self.iph_each_step = False
+        if best is None:
+            return None
+        return best[1], best[2]
+
+
+def run_contract_route(u, ship, base, base_name, contracts, route):
+    """Simulate the chosen route exactly and produce the output lines."""
+    hauler = Hauler(u, ship)
+    lines = [f"SHIP: {ship['name']}", f"START: {base_name}"]
+    state = (initial_loc(u, base), None)
+    t = 0.0
+    jumps = 0
+    load_jumps = {}
+    moved = 0.0
+    mc = ship["move_cargo"]
+
+    def travel(place, name):
+        nonlocal state, t, jumps
+        loc, lock = state
+        r = hauler.leg(loc, lock, t, place)
+        if r is None:
+            raise ConfigError(f"no route to '{name}'")
+        t, systems, state, _, mv = r
+        if mv:
+            if loc[0] == "S":
+                lines.append("UNDOCK")
+            if len(systems) > 1:
+                lines.append("GO: " + " -> ".join(
+                    f"{u.sys_name[s]} ({fmt_sec(u.sys_sec[s])})" for s in systems))
+                jumps += len(systems) - 1
+            if place[0] == "S":
+                lines.append(f"DOCK: {u.stations[place[1]][0]}")
+
+    for ci, pick in route:
+        c = contracts[ci]
+        if pick:
+            travel(c["start"], c["start_name"])
+            lines.append(f"LOAD {c['issuer']} (id={c['id']}): "
+                         f"{fmt_m(c['reward'])} ISK | {fmt_m3(c['m3'])}")
+            load_jumps[ci] = jumps
+        else:
+            travel(c["end"], c["end_name"])
+            lines.append(f"UNLOAD {c['issuer']} (id={c['id']}): "
+                         f"{jumps - load_jumps[ci]} Jumps | {fmt_m3(c['m3'])}")
+            moved += c["m3"]
+        t += mc
+    travel(base, base_name)
+    return lines, t, jumps, moved
+
+
+def plan_contracts(u, ships, base, base_name, contracts, limits):
+    candidates = []
+    for ship in ships:
+        planner = ContractPlanner(u, ship, base, contracts, limits)
+        res = planner.solve()
+        if res is None:
+            continue
+        route, _ = res
+        lines, t, jumps, moved = run_contract_route(u, ship, base, base_name,
+                                                    contracts, route)
+        profit = planner.profit(route)
+        key = (-profit, round(t, 6), -ship["ehp"], ship["name"])
+        candidates.append((key, ship, route, lines, t, jumps, moved, profit))
+    if not candidates:
+        return ["No Good Contracts"]
+    candidates.sort(key=lambda c: c[0])
+    _, ship, route, lines, t, jumps, moved, profit = candidates[0]
+    n = sum(1 for _, p in route if p)
+    total_m3 = sum((contracts[ci]["m3_dec"] for ci, p in route if p), Decimal(0))
+    lines.append(f"DONE: {fmt_time(t)}")
+    lines.append(f"MOVED: {fmt_m3(moved)}")
+    lines.append(f"NUM CONTRACTS: {n}")
+    lines.append(f"PROFIT: {fmt_m(profit)}")
+    lines.append(f"ISK/M3: {bround(profit / total_m3) if total_m3 > 0 else bround(0)}")
+    lines.append(f"ISK/Jump: {fmt_m(profit / jumps) if jumps > 0 else fmt_m(profit)}")
+    hours = to_dec(t) / Decimal(3600)
+    lines.append(f"ISK/Hour: {fmt_m(profit / hours) if hours > 0 else fmt_m(0)}")
+    return lines
+
+
+def main_contracts(argv):
+    p = argparse.ArgumentParser(prog="hauling.py contracts",
+                                description="Plan a contract hauling run.")
+    p.add_argument("start")
+    p.add_argument("contracts")
+    p.add_argument("--config", required=True)
+    p.add_argument("--sde", required=True)
+    p.add_argument("--target-iph", type=non_negative)
+    p.add_argument("--max-time", type=non_negative)
+    args = p.parse_args(argv)
+
+    try:
+        data = load_config_data(args.config)
+        ships = [build_ship(data, k) for k in data["ships"]]
+        limits = {
+            "min_isk_per_jump": _cnum(data, "min_isk_per_jump", "config",
+                                      required=False),
+            "max_isk_per_ehp": _cnum(data, "max_isk_per_ehp", "config",
+                                     required=False),
+            "max_time": args.max_time * 60.0 if args.max_time is not None else None,
+            "target_iph": args.target_iph,
+        }
+        contracts = load_contracts(args.contracts)
+    except ConfigError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        u = Universe(args.sde)
+    except (FileNotFoundError, OSError, KeyError) as e:
+        print(f"Error: could not load SDE: {e}", file=sys.stderr)
+        return 1
+
+    base = resolve(u, args.start)
+    if base is None:
+        print(f"Error: unknown start location '{args.start}'", file=sys.stderr)
+        return 1
+    base_name = u.stations[base[1]][0] if base[0] == "S" else u.sys_name[base[1]]
+
+    valid = []
+    for c in contracts:
+        a = resolve(u, c["start_name"])
+        b = resolve(u, c["end_name"])
+        if a is None or b is None:
+            bad = c["start_name"] if a is None else c["end_name"]
+            print(f"Warning: contract {c['id']} has unknown location '{bad}'",
+                  file=sys.stderr)
+            continue
+        c["start"], c["end"] = a, b
+        valid.append(c)
+
+    try:
+        lines = plan_contracts(u, ships, base, base_name, valid, limits)
+    except ConfigError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    print("\n".join(lines))
+    return 0
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = list(argv)
+    if argv and argv[0] == "contracts":
+        return main_contracts(argv[1:])
+    if argv and argv[0] == "plan":
+        argv = argv[1:]
+    return main_plan(argv)
 
 
 if __name__ == "__main__":
