@@ -64,6 +64,7 @@ def err(field, message, etype):
 
 
 def fail(errors):
+    errors = sorted(errors, key=lambda e: (str(e.get("field", "")), str(e.get("type", ""))))
     out({"errors": errors}, 1)
 
 
@@ -211,27 +212,7 @@ def build(doc, state, mode="create", stored=None):
         resources.pop("cpu", None)
     spec["resources"] = resources
 
-    # access.authentication.enabled
-    access_in = spec_in.get("access")
-    access = {}
-    if access_in is not None and not isinstance(access_in, dict):
-        errors.append(err("spec.access", "spec.access must be an object", "invalid"))
-    else:
-        access = dict(access_in or {})
-        auth_in = access.get("authentication")
-        if auth_in is not None and not isinstance(auth_in, dict):
-            errors.append(err("spec.access.authentication",
-                              "spec.access.authentication must be an object", "invalid"))
-        else:
-            auth = dict(auth_in or {})
-            enabled = auth.get("enabled")
-            if enabled is None:
-                auth["enabled"] = True
-            elif not isinstance(enabled, bool):
-                errors.append(err("spec.access.authentication.enabled",
-                                  "spec.access.authentication.enabled must be a boolean", "invalid"))
-            access["authentication"] = auth
-    spec["access"] = access
+    validate_access(spec_in, spec, errors)
 
     # migration.strategy
     mig_in = spec_in.get("migration")
@@ -267,6 +248,157 @@ def build(doc, state, mode="create", stored=None):
         "conditions": [cond("Healthy"), cond("PrechecksPassed")],
     }
     return {"metadata": md, "spec": spec, "status": status}
+
+
+DIGESTS = ("SHA-256", "SHA-384", "SHA-512")
+ENC_SOURCES = ("None", "Secret", "Service")
+CLIENT_MODES = ("None", "Authenticate", "Validate")
+
+
+def _sub_obj(parent, key, path, errors):
+    v = parent.get(key)
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        errors.append(err(path, "%s must be an object" % path, "invalid"))
+        return None
+    return dict(v)
+
+
+def validate_access(spec_in, spec, errors):
+    access_in = spec_in.get("access")
+    if access_in is not None and not isinstance(access_in, dict):
+        errors.append(err("spec.access", "spec.access must be an object", "invalid"))
+        return
+    access = dict(access_in or {})
+    base = "spec.access"
+
+    # authentication
+    auth = _sub_obj(access, "authentication", base + ".authentication", errors)
+    auth_enabled = True
+    if auth is not None:
+        enabled = auth.get("enabled")
+        if enabled is None:
+            auth["enabled"] = True
+        elif not isinstance(enabled, bool):
+            errors.append(err(base + ".authentication.enabled",
+                              "spec.access.authentication.enabled must be a boolean", "invalid"))
+        else:
+            auth_enabled = enabled
+        dg = auth.get("digestAlgorithm")
+        if auth_enabled:
+            if dg is None:
+                auth["digestAlgorithm"] = "SHA-256"
+            elif dg not in DIGESTS:
+                errors.append(err(base + ".authentication.digestAlgorithm",
+                                  "spec.access.authentication.digestAlgorithm must be one of "
+                                  "\"SHA-256\", \"SHA-384\", \"SHA-512\", got %r" % (dg,), "invalid"))
+        else:
+            if dg is not None:
+                errors.append(err(base + ".authentication.digestAlgorithm",
+                                  "spec.access.authentication.digestAlgorithm is forbidden when "
+                                  "authentication is disabled", "forbidden"))
+            auth = {"enabled": False}
+        access["authentication"] = auth
+    if "credentialRef" in access:
+        if access["credentialRef"] is None:
+            del access["credentialRef"]
+        elif not auth_enabled:
+            errors.append(err(base + ".credentialRef",
+                              "spec.access.credentialRef is forbidden when authentication is disabled",
+                              "forbidden"))
+
+    # permissions
+    perm = _sub_obj(access, "permissions", base + ".permissions", errors)
+    if perm is not None:
+        pb = base + ".permissions"
+        enabled = perm.get("enabled")
+        p_enabled = False
+        if enabled is None:
+            perm["enabled"] = False
+        elif not isinstance(enabled, bool):
+            errors.append(err(pb + ".enabled", "spec.access.permissions.enabled must be a boolean",
+                              "invalid"))
+        else:
+            p_enabled = enabled
+        if p_enabled:
+            roles = perm.get("roles")
+            if roles is None or (isinstance(roles, list) and len(roles) == 0):
+                errors.append(err(pb + ".roles",
+                                  "spec.access.permissions.roles is required when permissions are enabled",
+                                  "required"))
+            elif not isinstance(roles, list):
+                errors.append(err(pb + ".roles", "spec.access.permissions.roles must be an array",
+                                  "invalid"))
+            else:
+                seen = {}
+                dups = []
+                for i, role in enumerate(roles):
+                    rp = "%s.roles[%d]" % (pb, i)
+                    if not isinstance(role, dict):
+                        errors.append(err(rp, "role must be an object", "invalid"))
+                        continue
+                    nm = role.get("name")
+                    if is_empty(nm):
+                        errors.append(err(rp + ".name", "role name is required", "required"))
+                    elif not isinstance(nm, str):
+                        errors.append(err(rp + ".name", "role name must be a string", "invalid"))
+                    else:
+                        if nm in seen:
+                            if nm not in dups:
+                                dups.append(nm)
+                        else:
+                            seen[nm] = i
+                    ps = role.get("permissions")
+                    if ps is None or (isinstance(ps, list) and len(ps) == 0):
+                        errors.append(err(rp + ".permissions", "role permissions are required",
+                                          "required"))
+                    elif not isinstance(ps, list) or not all(isinstance(p, str) for p in ps):
+                        errors.append(err(rp + ".permissions",
+                                          "role permissions must be an array of strings", "invalid"))
+                for nm in dups:
+                    errors.append(err(pb + ".roles", "duplicate role name %r" % nm, "duplicate"))
+        else:
+            perm.pop("roles", None)
+        access["permissions"] = perm
+
+    # encryption
+    enc = _sub_obj(access, "encryption", base + ".encryption", errors)
+    if enc is not None:
+        eb = base + ".encryption"
+        for k in ("certRef", "certServiceRef"):
+            if k in enc and enc[k] is None:
+                del enc[k]
+        src = enc.get("source")
+        if src is None:
+            src = enc["source"] = "None"
+        cm = enc.get("clientMode")
+        if cm is None:
+            cm = enc["clientMode"] = "None"
+        src_ok = src in ENC_SOURCES
+        if not src_ok:
+            errors.append(err(eb + ".source", "spec.access.encryption.source must be one of "
+                              "\"None\", \"Secret\", \"Service\", got %r" % (src,), "invalid"))
+        if cm not in CLIENT_MODES:
+            errors.append(err(eb + ".clientMode", "spec.access.encryption.clientMode must be one of "
+                              "\"None\", \"Authenticate\", \"Validate\", got %r" % (cm,), "invalid"))
+        elif src == "None" and cm != "None":
+            errors.append(err(eb + ".clientMode",
+                              "spec.access.encryption.clientMode must be \"None\" when source is \"None\"",
+                              "invalid"))
+        if src_ok:
+            rules = {"None": (), "Secret": ("certRef",), "Service": ("certServiceRef",)}[src]
+            for k in ("certRef", "certServiceRef"):
+                present = k in enc
+                if k in rules:
+                    if not present or is_empty(enc[k]):
+                        errors.append(err("%s.%s" % (eb, k), "spec.access.encryption.%s is required "
+                                          "when source is %r" % (k, src), "required"))
+                elif present:
+                    errors.append(err("%s.%s" % (eb, k), "spec.access.encryption.%s is forbidden "
+                                      "when source is %r" % (k, src), "forbidden"))
+        access["encryption"] = enc
+    spec["access"] = access
 
 
 def cond(ctype, status="True", message=""):
@@ -369,6 +501,28 @@ def deep_merge(base, upd):
     return res
 
 
+def adjust_access_merge(merged_spec, spec_upd):
+    upd = spec_upd.get("access")
+    acc = merged_spec.get("access")
+    if not isinstance(upd, dict) or not isinstance(acc, dict):
+        return
+    ua = upd.get("authentication")
+    ma = acc.get("authentication")
+    if isinstance(ua, dict) and isinstance(ma, dict) and ua.get("enabled") is False:
+        if ua.get("digestAlgorithm") is None:
+            ma.pop("digestAlgorithm", None)
+        if upd.get("credentialRef") is None:
+            acc.pop("credentialRef", None)
+    ue = upd.get("encryption")
+    me = acc.get("encryption")
+    if isinstance(ue, dict) and isinstance(me, dict) and ue.get("source") is not None:
+        for k in ("certRef", "certServiceRef"):
+            if ue.get(k) is None:
+                me.pop(k, None)
+        if ue.get("clientMode") is None and ue.get("source") == "None":
+            me.pop("clientMode", None)
+
+
 def render(resource):
     r = copy.deepcopy(resource)
     r.pop("_transient", None)
@@ -463,6 +617,7 @@ def cmd_update(args):
             merged_spec["instances"] = status["desiredInstancesOnResume"]
         else:
             merged_spec["instances"] = (stored.get("spec") or {}).get("instances", 1)
+    adjust_access_merge(merged_spec, spec_upd)
     merged_md = deep_merge(stored.get("metadata") or {}, md)
     merged_md["name"] = name
     # build() validates everything and exits with all errors on failure
