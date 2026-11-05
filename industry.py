@@ -93,12 +93,198 @@ def fmt_plain(d):
     return s
 
 
+DECRYPTORS = [
+    ("None", 0, 0, 0, 0),
+    ("Accelerant Decryptor", 20, 1, 2, 10),
+    ("Attainment Decryptor", 80, 4, -1, 4),
+    ("Augmentation Decryptor", -40, 9, -2, 2),
+    ("Optimized Attainment Decryptor", 90, 2, 1, -2),
+    ("Optimized Augmentation Decryptor", -10, 7, 2, 0),
+    ("Parity Decryptor", 50, 3, 1, -2),
+    ("Process Decryptor", 10, 0, 3, 6),
+    ("Symmetry Decryptor", 0, 2, 1, 8),
+]
+RELICS = [("Intact", 0.26, 20), ("Malfunctioning", 0.21, 10), ("Wrecked", 0.14, 3)]
+INV_ACTS = (8, 7)
+
+
+def relic_info(name):
+    for i, (prefix, chance, runs) in enumerate(RELICS):
+        if name.startswith(prefix):
+            return i, chance, runs
+    return None
+
+
+def invention(args, name, sde, types, by_name, product_bps, bp_products,
+              times, header, is_pub):
+    skill = args.skill
+    # invention data: source -> list of (act, product blueprint, runs)
+    inv_out = {}   # target blueprint -> list of (act, source, runs)
+    for row in read_csv(sde, "industryActivityProducts.csv.bz2"):
+        act = to_int(row.get("activityID"))
+        if act not in INV_ACTS:
+            continue
+        src = to_int(row.get("typeID"))
+        tgt = to_int(row.get("productTypeID"))
+        inv_out.setdefault(tgt, []).append(
+            (act, src, to_int(row.get("quantity")) or 0))
+    probs = {}
+    for row in read_csv(sde, "industryActivityProbabilities.csv.bz2"):
+        act = to_int(row.get("activityID"))
+        if act not in INV_ACTS:
+            continue
+        try:
+            pv = float(row.get("probability"))
+        except (TypeError, ValueError):
+            continue
+        probs[(to_int(row.get("typeID")), act, to_int(row.get("productTypeID")))] = pv
+    imats = {}
+    for row in read_csv(sde, "industryActivityMaterials.csv.bz2"):
+        act = to_int(row.get("activityID"))
+        if act not in INV_ACTS:
+            continue
+        key = (to_int(row.get("typeID")), act)
+        imats.setdefault(key, []).append(
+            (to_int(row.get("materialTypeID")), to_int(row.get("quantity")) or 0))
+    iskills = {}
+    for row in read_csv(sde, "industryActivitySkills.csv.bz2"):
+        act = to_int(row.get("activityID"))
+        if act not in INV_ACTS:
+            continue
+        key = (to_int(row.get("typeID")), act)
+        sid = to_int(row.get("skillID"))
+        lst = iskills.setdefault(key, [])
+        if sid not in lst:
+            lst.append(sid)
+
+    ids = by_name.get(name, [])
+    if not ids:
+        print(f"Error: no published item named '{name}'", file=sys.stderr)
+        return 1
+
+    # Resolve to (product, product blueprint)
+    target = None
+    for tid in sorted(ids):
+        # product interpretation
+        bps = sorted({bp for act, bp, _ in product_bps.get(tid, [])
+                      if act == MANUFACTURING},
+                     key=lambda b: (0 if is_pub(b) else 1, b))
+        for bp in bps:
+            if bp in inv_out:
+                target = (tid, bp)
+                break
+        if target:
+            break
+        # blueprint interpretation
+        if tid in inv_out:
+            prods = sorted([x for x in bp_products.get(tid, [])
+                            if x[0] == MANUFACTURING],
+                           key=lambda x: (0 if is_pub(x[1]) else 1, x[1]))
+            if prods:
+                target = (prods[0][1], tid)
+                break
+    if target is None:
+        print(f"Error: no invention recipe for '{name}'", file=sys.stderr)
+        return 1
+    prod, tbp = target
+    item, cname, gname, market, tech = header(prod)
+
+    sources = inv_out[tbp]
+    relic_sources = [s for s in sources
+                     if s[1] in types and relic_info(types[s[1]]["name"])]
+    if tech not in ("Tech II", "Tech III"):
+        tech = "Tech III" if relic_sources and len(relic_sources) == len(sources) \
+            else "Tech II"
+    t3 = tech == "Tech III"
+
+    def tname(t):
+        return types[t]["name"] if t in types else str(t)
+
+    if t3:
+        srcs = relic_sources or sources
+        srcs = sorted(srcs, key=lambda s: (
+            (relic_info(tname(s[1])) or (9,))[0], tname(s[1]).lower(), s[1]))
+    else:
+        srcs = sorted(sources, key=lambda s: (
+            0 if is_pub(s[1]) else 1, 0 if s[0] == 8 else 1, s[1]))
+    act0, src0, runs0 = srcs[0]
+
+    mats = imats.get((src0, act0), [])
+    datacores = sorted({tname(m) for m, _ in mats}, key=lambda n: (n.lower(), n))
+    qtys = [q for _, q in mats]
+    per_run = qtys[0] if qtys else 0
+    skill_ids = iskills.get((src0, act0), [])
+    skill_names = sorted({tname(s) for s in skill_ids}, key=lambda n: (n.lower(), n))
+    n_enc = sum(1 for s in skill_ids if "Encryption Methods" in tname(s))
+    n_sci = len(skill_ids) - n_enc
+    secs = times.get((src0, act0), 0)
+    minutes = math.ceil(secs / 60) if secs else 0
+    skill_factor = 1.0
+    for _ in range(n_sci):
+        skill_factor += skill / 30
+    for _ in range(n_enc):
+        skill_factor += skill / 40
+
+    decs = sorted(DECRYPTORS, key=lambda d: (d[0] != "None", d[0].lower(), d[0]))
+
+    def prob(base, mult):
+        p = base * skill_factor * (1 + mult / 100)
+        p = max(0.0, min(1.0, p))
+        return f"{p * 100:.2f}"
+
+    out = [
+        f"ITEM: {item['name']} ({item['id']})",
+        f"Group: {cname} > {gname}",
+        f"Market Group: {market}",
+        f"Tech Level: {tech}",
+        "",
+        "Invention:",
+    ]
+    if not t3:
+        out.append(f"Base: {tname(src0)} ({src0})")
+    out += [
+        f"Datacores: {', '.join(datacores)}",
+        f"Required Per Run: {per_run}",
+        f"Skills: {', '.join(skill_names)}",
+        f"Time: {minutes}",
+        "Probabilities:",
+    ]
+    if t3:
+        out.append("| Invented From                | Decryptor                       "
+                   "| Probability | Runs | ME | TE |")
+        out.append("|------------------------------|---------------------------------"
+                   "|-------------|------|----|----|")
+        for act, src, sruns in srcs:
+            rn = tname(src)
+            ri = relic_info(rn)
+            if ri:
+                base, bruns = ri[1], ri[2]
+            else:
+                base, bruns = probs.get((src, act, tbp), 0.0), sruns
+            for dn, dm, dr, dme, dte in decs:
+                out.append(f"| {rn:<28} | {dn:<32}| {prob(base, dm):<11} "
+                           f"| {bruns + dr:<4} | {2 + dme:<2} | {4 + dte:<2} |")
+    else:
+        out.append("| Decryptor                       | Probability | Runs | ME | TE |")
+        out.append("|---------------------------------|-------------|------|----|----|")
+        base = probs.get((src0, act0, tbp), 0.0)
+        for dn, dm, dr, dme, dte in decs:
+            out.append(f"| {dn:<32}| {prob(base, dm):<11} "
+                       f"| {runs0 + dr:<4} | {2 + dme:<2} | {4 + dte:<2} |")
+    print("\n".join(out))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="EVE industry recipe planner")
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("recipe")
     r.add_argument("name", nargs="+")
     r.add_argument("--sde", required=True)
+    inv = sub.add_parser("invention")
+    inv.add_argument("name", nargs="+")
+    inv.add_argument("--sde", required=True)
+    inv.add_argument("--skill", type=int, default=5, choices=[1, 2, 3, 4, 5])
     args = p.parse_args(argv)
     name = " ".join(args.name)
     sde = args.sde
@@ -163,6 +349,29 @@ def main(argv=None):
 
     def is_pub(tid):
         return tid in types and types[tid]["published"]
+
+    def header(prod):
+        item = types.get(prod, {"id": prod, "name": str(prod), "group": None,
+                                "volume": None, "market": None})
+        gname, cid = groups.get(item["group"], ("Unknown", None))
+        cname = cats.get(cid, "Unknown")
+        path = []
+        seen = set()
+        mg = item["market"]
+        while mg is not None and mg in mgroups and mg not in seen:
+            seen.add(mg)
+            path.append(mgroups[mg][0])
+            mg = mgroups[mg][1]
+        market = " > ".join(reversed(path)) if path else "None"
+        mgname = metagroups.get(metatypes.get(prod), "")
+        tech = {"Tech I": "Tech I", "Tech II": "Tech II", "Tech III": "Tech III",
+                "Structure Tech I": "Tech I", "Structure Tech II": "Tech II"}.get(
+            mgname, "Tech I")
+        return item, cname, gname, market, tech
+
+    if args.cmd == "invention":
+        return invention(args, name, sde, types, by_name, product_bps,
+                         bp_products, times, header, is_pub)
 
     def score(bp, act):
         # prefer published blueprints, with materials, manufacturing first, lowest id
