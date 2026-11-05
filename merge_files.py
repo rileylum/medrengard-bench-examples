@@ -6,6 +6,11 @@ reconciles their schemas (explicit or inferred), casts every value to the
 resolved column type and writes a single CSV sorted globally by a composite
 key, using an external merge sort bounded by --memory-limit-mb.
 
+With --partition-by and/or --max-rows-per-file / --max-bytes-per-file the
+output is a directory of part-NNNNN.csv files (Hive-style col=value
+subdirectories for field partitions), written atomically via a sibling
+temporary directory.
+
 Exit codes:
   0  success
   1  generic / I/O error (e.g. missing input file)
@@ -31,6 +36,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import urllib.parse
 import zlib
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -835,6 +841,78 @@ def estimate_size(out, key):
     return s
 
 
+# --------------------------------------------------------------------------
+# Partitioned output
+# --------------------------------------------------------------------------
+
+def encode_segment(text):
+    """Percent-encode UTF-8 bytes outside [A-Za-z0-9._-]."""
+    return urllib.parse.quote(text, safe="").replace("~", "%7E")
+
+
+def partition_path(names, out, part_idx):
+    segs = []
+    for i in part_idx:
+        v = out[i]
+        val = "_null" if v is None else encode_segment(v)
+        segs.append(encode_segment(names[i]) + "=" + val)
+    return tuple(segs)
+
+
+class RowEncoder(object):
+    def __init__(self, wkw):
+        import io
+        self.buf = io.StringIO()
+        self.writer = csv.writer(self.buf, **wkw)
+
+    def encode(self, row):
+        self.buf.seek(0)
+        self.buf.truncate()
+        self.writer.writerow(row)
+        return self.buf.getvalue().encode("utf-8")
+
+
+class Sharder(object):
+    """Writes part-NNNNN.csv files into a directory, honouring limits."""
+
+    def __init__(self, directory, header, max_rows, max_bytes):
+        self.dir = directory
+        self.header = header
+        self.max_rows = max_rows
+        self.max_bytes = max_bytes
+        self.index = 0
+        self.f = None
+        self.rows = 0
+        self.size = 0
+
+    def open_new(self):
+        if self.f is not None:
+            self.f.close()
+        path = os.path.join(self.dir, "part-%05d.csv" % self.index)
+        self.index += 1
+        self.f = open(path, "wb")
+        self.f.write(self.header)
+        self.rows = 0
+        self.size = len(self.header)
+
+    def write(self, data):
+        if self.f is None:
+            self.open_new()
+        elif self.rows > 0 and (
+                (self.max_rows is not None and self.rows >= self.max_rows)
+                or (self.max_bytes is not None
+                    and self.size + len(data) > self.max_bytes)):
+            self.open_new()
+        self.f.write(data)
+        self.rows += 1
+        self.size += len(data)
+
+    def close(self):
+        if self.f is not None:
+            self.f.close()
+            self.f = None
+
+
 def single_char(p, name, value):
     if value is not None and len(value) != 1:
         p.error("%s must be a single character" % name)
@@ -845,6 +923,9 @@ def main(argv=None):
         description="Merge and sort CSV/TSV/JSONL/Parquet files into CSV.")
     p.add_argument("--output", required=True)
     p.add_argument("--key", required=True)
+    p.add_argument("--partition-by")
+    p.add_argument("--max-rows-per-file", type=int)
+    p.add_argument("--max-bytes-per-file", type=int)
     p.add_argument("--desc", action="store_true")
     p.add_argument("--schema")
     p.add_argument("--infer", choices=("strict", "loose"), default="strict")
@@ -875,6 +956,22 @@ def main(argv=None):
         p.error("--memory-limit-mb must be positive")
     if args.parquet_row_group_bytes <= 0:
         p.error("--parquet-row-group-bytes must be positive")
+    if args.max_rows_per_file is not None and args.max_rows_per_file <= 0:
+        p.error("--max-rows-per-file must be positive")
+    if args.max_bytes_per_file is not None and args.max_bytes_per_file <= 0:
+        p.error("--max-bytes-per-file must be positive")
+    part_cols = []
+    if args.partition_by is not None:
+        part_cols = [c.strip() for c in args.partition_by.split(",")]
+        if any(c == "" for c in part_cols):
+            p.error("invalid --partition-by specification")
+        if len(set(part_cols)) != len(part_cols):
+            p.error("duplicate column in --partition-by")
+    partitioned = (args.partition_by is not None
+                   or args.max_rows_per_file is not None
+                   or args.max_bytes_per_file is not None)
+    if partitioned and args.output == "-":
+        p.error("--output must be a directory path when partitioning")
 
     def _term(signum, frame):
         raise SystemExit(128 + signum)
@@ -887,7 +984,13 @@ def main(argv=None):
 
     tmpdir = None
     out_tmp = None
+    out_tmp_dir = None
     try:
+        if partitioned:
+            out_abs = os.path.abspath(args.output)
+            if os.path.exists(out_abs) and not os.path.isdir(out_abs):
+                raise UserError("output path exists and is not a directory: "
+                                "%s" % args.output, EXIT_USAGE)
         keys = [k.strip() for k in args.key.split(",")]
         if not keys or any(k == "" for k in keys):
             raise UserError("invalid --key specification", EXIT_USAGE)
@@ -934,6 +1037,11 @@ def main(argv=None):
                 raise UserError("key column %r not present in schema" % k,
                                 EXIT_SCHEMA)
         key_idx = [pos[k] for k in keys]
+        for c in part_cols:
+            if c not in pos:
+                raise UserError("partition column %r not present in schema"
+                                % c, EXIT_SCHEMA)
+        part_idx = [pos[c] for c in part_cols]
 
         budget = max(1 << 20, mem_bytes // 4)
         runs = []
@@ -974,6 +1082,10 @@ def main(argv=None):
                             sk[oi] = (2, t)
                 key = tuple(sk[i] if sk[i] is not None else NULL_KEY
                             for i in key_idx)
+                if part_idx:
+                    # Group rows by partition directory first, so each
+                    # partition is a contiguous, key-sorted run.
+                    key = (partition_path(names, out, part_idx), key)
                 buf.append((key, seq, out))
                 seq += 1
                 used += estimate_size(out, key)
@@ -1023,27 +1135,82 @@ def main(argv=None):
         else:
             stream = heapq.merge(*streams, key=keyfn)
 
-        if args.output == "-":
-            fout = open(sys.stdout.fileno(), "w", encoding="utf-8",
-                        newline="", closefd=False)
+        wkw = {"delimiter": ",", "quotechar": args.csv_quotechar,
+               "doublequote": True, "lineterminator": "\n",
+               "quoting": csv.QUOTE_MINIMAL}
+        if args.csv_escapechar is not None:
+            wkw["escapechar"] = args.csv_escapechar
+        null_lit = args.csv_null_literal
+
+        if not partitioned:
+            if args.output == "-":
+                fout = open(sys.stdout.fileno(), "w", encoding="utf-8",
+                            newline="", closefd=False)
+            else:
+                out_dir = os.path.dirname(os.path.abspath(args.output))
+                fd, out_tmp = tempfile.mkstemp(prefix=".merge_out_",
+                                               dir=out_dir)
+                fout = os.fdopen(fd, "w", encoding="utf-8", newline="")
+            with fout:
+                writer = csv.writer(fout, **wkw)
+                writer.writerow(names)
+                for _, _, out in stream:
+                    writer.writerow([null_lit if v is None else v
+                                     for v in out])
+            if out_tmp is not None:
+                os.replace(out_tmp, args.output)
+                out_tmp = None
+            return 0
+
+        parent = os.path.dirname(out_abs)
+        os.makedirs(parent, exist_ok=True)
+        out_tmp_dir = tempfile.mkdtemp(
+            prefix="." + os.path.basename(out_abs) + ".tmp-", dir=parent)
+        enc = RowEncoder(wkw)
+        header_bytes = enc.encode(names)
+        sharder = None
+        cur_part = None
+        for key, _, out in stream:
+            if part_idx:
+                ppath = key[0]
+                if sharder is None or ppath != cur_part:
+                    if sharder is not None:
+                        sharder.close()
+                    cur_part = ppath
+                    d = os.path.join(out_tmp_dir, *ppath)
+                    os.makedirs(d, exist_ok=True)
+                    sharder = Sharder(d, header_bytes, args.max_rows_per_file,
+                                      args.max_bytes_per_file)
+            elif sharder is None:
+                sharder = Sharder(out_tmp_dir, header_bytes,
+                                  args.max_rows_per_file,
+                                  args.max_bytes_per_file)
+            sharder.write(enc.encode([null_lit if v is None else v
+                                      for v in out]))
+        if sharder is None and not part_idx:
+            # No rows: still emit a single header-only part file.
+            sharder = Sharder(out_tmp_dir, header_bytes, None, None)
+            sharder.open_new()
+        if sharder is not None:
+            sharder.close()
+        sharder = None
+
+        # Atomically move the finished tree into place.
+        if os.path.isdir(out_abs):
+            backup = tempfile.mkdtemp(
+                prefix="." + os.path.basename(out_abs) + ".old-", dir=parent)
+            os.rmdir(backup)
+            os.rename(out_abs, backup)
+            try:
+                os.rename(out_tmp_dir, out_abs)
+            except OSError:
+                os.rename(backup, out_abs)
+                raise
+            out_tmp_dir = None
+            shutil.rmtree(backup, ignore_errors=True)
         else:
-            out_dir = os.path.dirname(os.path.abspath(args.output))
-            fd, out_tmp = tempfile.mkstemp(prefix=".merge_out_", dir=out_dir)
-            fout = os.fdopen(fd, "w", encoding="utf-8", newline="")
-        with fout:
-            wkw = {"delimiter": ",", "quotechar": args.csv_quotechar,
-                   "doublequote": True, "lineterminator": "\n",
-                   "quoting": csv.QUOTE_MINIMAL}
-            if args.csv_escapechar is not None:
-                wkw["escapechar"] = args.csv_escapechar
-            writer = csv.writer(fout, **wkw)
-            writer.writerow(names)
-            null_lit = args.csv_null_literal
-            for _, _, out in stream:
-                writer.writerow([null_lit if v is None else v for v in out])
-        if out_tmp is not None:
-            os.replace(out_tmp, args.output)
-            out_tmp = None
+            os.rename(out_tmp_dir, out_abs)
+            out_tmp_dir = None
         return 0
     except UserError as e:
         sys.stderr.write("error: %s\n" % e)
@@ -1058,6 +1225,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         return 130
     finally:
+        if out_tmp_dir is not None:
+            shutil.rmtree(out_tmp_dir, ignore_errors=True)
         if out_tmp is not None:
             try:
                 os.remove(out_tmp)
