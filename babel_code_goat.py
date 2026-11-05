@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""babel_code_goat: translate a Python ``tests.py`` harness into a tester for
+"""babel_code_goat: translate Python test files (any ``.py`` under <tests_dir>) into a tester for
 python / javascript / typescript and run it against a solution.
 
 Commands:
@@ -16,6 +16,11 @@ Parameterization loops (for / while, nested, enumerate, range, break/continue) a
 unrolled at discovery time. The loop statement is itself a test (``tests.py:<line>``)
 that passes iff it iterates at least once (on every execution); assertions in the body
 get ids ``tests.py:<line>:<k>`` where k counts executions of that assertion.
+Test ids are ``<relative/path.py>:<line>`` (``#k`` suffix for several tests on one line).
+
+Mutation-style tests: an entrypoint call used as a statement (or assignment) that is
+immediately followed by asserts referencing the variables passed to it; those asserts
+check the arguments' state after the call.
 """
 
 from __future__ import annotations
@@ -125,12 +130,16 @@ def _ev_comp(gens, i, env, out):
             _ev_comp(gens, i + 1, e2, out)
 
 
-def _ev(n, r, env=None):
+def _ev(n, r, env=None, args=None, kwargs=None):
     if env is None:
-        env = {"\0r": r}
+        env = {"\0r": r, "\0args": args, "\0kwargs": kwargs}
     t = n[0]
     if t == "r":
         return r
+    if t == "arg":
+        return env["\0args"][n[1]]
+    if t == "kwarg":
+        return env["\0kwargs"][n[1]]
     if t == "lit":
         return n[1]
     if t == "var":
@@ -546,7 +555,7 @@ def _ir_closed(ir, bound=frozenset()):
     tag = ir[0]
     if tag == "lit":
         return True
-    if tag == "r":
+    if tag in ("r", "arg", "kwarg"):
         return False
     if tag == "var":
         return ir[1] in bound
@@ -570,6 +579,16 @@ def _target_names(tgt):
     out = set()
     for t in tgt[1]:
         out |= _target_names(t)
+    return out
+
+
+def _target_names_ast(t):
+    if isinstance(t, ast.Name):
+        return {t.id}
+    out = set()
+    if isinstance(t, (ast.Tuple, ast.List)):
+        for e in t.elts:
+            out |= _target_names_ast(e)
     return out
 
 
@@ -690,10 +709,12 @@ class Discoverer:
         self._loop_depth = 0
         self._exec_counts = {}   # (line, col) -> executions of a test statement inside loops
         self._loops = {}         # (line, col) -> loop-as-test record
+        self.tainted = {}        # name -> line of the mutation call that consumed it
 
     # -- helpers
     def lit(self, node):
         """Value of a node that must be a literal (primitive operations are folded)."""
+        self._check_tainted(node)
         try:
             return literal_value(node, self.ctx)
         except DiscoveryError as err:
@@ -717,6 +738,7 @@ class Discoverer:
     def value(self, node):
         """Discovery-time value of an expression that must not involve the entrypoint.
         Unlike ``lit`` the result may be any Python value (e.g. a ``range``)."""
+        self._check_tainted(node)
         try:
             return literal_value(node, self.ctx)
         except DiscoveryError as err:
@@ -925,6 +947,8 @@ class Discoverer:
         if isinstance(node, ast.Name):
             if node.id in scope:
                 return ["var", node.id]
+            if node.id in self.tainted and node.id not in self.ctx.calls:
+                raise self._tainted_error(node.id, lineno)
             if node.id in self.ctx.calls:
                 ir, info = self.ctx.calls[node.id]
                 self._reg(info)
@@ -1478,6 +1502,7 @@ class Discoverer:
 
     def _bind_call(self, t, ir, info):
         if isinstance(t, ast.Name):
+            self.tainted.pop(t.id, None)
             self.ctx.calls[t.id] = (ir, info)
             self.ctx.consts.pop(t.id, None)
             return
@@ -1486,6 +1511,7 @@ class Discoverer:
 
     def _bind_const(self, t, v, lineno):
         if isinstance(t, ast.Name):
+            self.tainted.pop(t.id, None)
             self.ctx.consts[t.id] = v
             self.ctx.calls.pop(t.id, None)
             return
@@ -1497,6 +1523,119 @@ class Discoverer:
             raise DiscoveryError(f"line {lineno}: wrong number of values to unpack")
         for e, x in zip(t.elts, vals):
             self._bind_const(e, x, lineno)
+
+    # -- mutation-style tests -----------------------------------------------
+    def _check_tainted(self, node):
+        if not self.tainted:
+            return
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id in self.tainted and n.id not in self.ctx.calls \
+                    and n.id not in self.ctx.consts:
+                raise self._tainted_error(n.id, getattr(n, "lineno", "?"))
+
+    def _tainted_error(self, name, lineno):
+        return DiscoveryError(
+            f"line {lineno}: {name!r} was passed to the entrypoint call at line "
+            f"{self.tainted[name]} and may have been mutated; mutation-style assertions must "
+            "immediately follow the entrypoint call")
+
+    def _has_entry_call(self, node):
+        return any(isinstance(n, ast.Call) and self.is_entry_call(n) for n in ast.walk(node))
+
+    def is_mutation_candidate(self, stmt):
+        """An entrypoint call used as a statement, or assigned to names."""
+        if isinstance(stmt, ast.Expr):
+            return isinstance(stmt.value, ast.Call) and self.is_entry_call(stmt.value)
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None:
+            return self._has_entry_call(stmt.value)
+        return False
+
+    def _passed_vars(self, call, exclude):
+        """Map variable name -> IR of that argument after the call."""
+        out = {}
+        pos = 0
+        for a in call.args:
+            if isinstance(a, ast.Starred):
+                try:
+                    pos += len(list(self.value(a.value)))
+                except (DiscoveryError, TypeError):
+                    raise DiscoveryError(f"line {call.lineno}: unsupported starred argument")
+                continue
+            if isinstance(a, ast.Name) and a.id not in exclude and a.id not in out:
+                out[a.id] = ["arg", pos]
+            pos += 1
+        for kw in call.keywords:
+            if kw.arg is not None and isinstance(kw.value, ast.Name) \
+                    and kw.value.id not in exclude and kw.value.id not in out:
+                out[kw.value.id] = ["kwarg", kw.arg]
+        return out
+
+    def handle_mutation(self, body, i):
+        """Handle an entrypoint call statement/assignment at ``body[i]`` together with the
+        asserts immediately following it. Returns the index of the next statement."""
+        stmt = body[i]
+        lineno = stmt.lineno
+        bare = isinstance(stmt, ast.Expr)
+        if bare:
+            call = stmt.value
+            for n in ast.walk(call):
+                if n is not call and isinstance(n, ast.Call) and self.is_entry_call(n):
+                    raise DiscoveryError(
+                        f"line {lineno}: entrypoint arguments must not depend on another entrypoint call")
+            info = self.parse_call(call)
+            assigned = set()
+        else:
+            calls = [n for n in ast.walk(stmt.value) if isinstance(n, ast.Call) and self.is_entry_call(n)]
+            targets = [stmt.target] if isinstance(stmt, ast.AnnAssign) else stmt.targets
+            assigned = set()
+            for t in targets:
+                self._check_target(t, lineno)
+                assigned |= _target_names_ast(t)
+            self.handle_assign(stmt)
+            if len(calls) != 1:
+                return i + 1
+            call = calls[0]
+            info = None
+            for name in assigned:
+                if name in self.ctx.calls:
+                    info = self.ctx.calls[name][1]
+                    break
+            if info is None:
+                return i + 1
+        passed = self._passed_vars(call, assigned)
+        passed = {k: v for k, v in passed.items() if k in self.ctx.consts}
+        j = i + 1
+        while j < len(body) and isinstance(body[j], ast.Assert) \
+                and not self._has_entry_call(body[j].test):
+            j += 1
+        run = body[i + 1:j]
+
+        def names_of(a):
+            return {n.id for n in ast.walk(a.test) if isinstance(n, ast.Name)}
+        refs = [names_of(a) & set(passed) for a in run]
+        if not bare and not any(refs):
+            return i + 1  # an ordinary ``result = f(...)`` assignment
+        if not run:
+            raise DiscoveryError(
+                f"line {lineno}: an entrypoint call statement must be immediately followed by "
+                "one or more assertions about the variables passed to it")
+        for a, r in zip(run, refs):
+            if not r and not (names_of(a) & assigned):
+                raise DiscoveryError(
+                    f"line {a.lineno}: assertion after the mutation call at line {lineno} must "
+                    "reference a variable passed to the call (or assigned from it)")
+        saved = {}
+        for name, ir in passed.items():
+            saved[name] = self.ctx.consts.pop(name)
+            self.ctx.calls[name] = (ir, info)
+        try:
+            for a in run:
+                self.handle_assert(a)
+        finally:
+            for name in passed:
+                self.ctx.calls.pop(name, None)
+                self.tainted[name] = lineno
+        return j
 
     # -- loops (parameterization) -----------------------------------------
     def _loop_record(self, node):
@@ -1601,15 +1740,23 @@ class Discoverer:
 
     def handle_body(self, body, in_func):
         self._pending_raises = None
-        for stmt in body:
+        i = 0
+        while i < len(body):
+            stmt = body[i]
+            i += 1
             pending, self._pending_raises = self._pending_raises, None
+            if self.is_mutation_candidate(stmt):
+                i = self.handle_mutation(body, i - 1)
+                self._pending_raises = None
+                continue
             if isinstance(stmt, ast.FunctionDef):
                 if stmt.decorator_list:
                     raise DiscoveryError(f"line {stmt.lineno}: decorators not allowed")
                 self.local_funcs.add(stmt.name)
-                saved = (dict(self.ctx.consts), dict(self.ctx.calls), dict(self.ctx.aliases))
+                saved = (dict(self.ctx.consts), dict(self.ctx.calls), dict(self.ctx.aliases),
+                         dict(self.tainted))
                 self.handle_body(stmt.body, True)
-                self.ctx.consts, self.ctx.calls, self.ctx.aliases = saved
+                self.ctx.consts, self.ctx.calls, self.ctx.aliases, self.tainted = saved
                 self._pending_raises = None
             elif isinstance(stmt, ast.Assert):
                 if pending is not None and pending[0] is not None:
@@ -1701,50 +1848,102 @@ def read_expect_comments(source):
     return out, comment_lines
 
 
-def discover(tests_dir, entrypoint=None):
-    """Return (tests, entrypoint). Raises DiscoveryError."""
-    path = os.path.join(tests_dir, "tests.py")
-    if not os.path.isfile(path):
-        raise DiscoveryError(f"{path} not found")
+SKIP_DIRS = {"__pycache__", ".git", ".hg", ".svn", "node_modules", ".venv", "venv",
+             ".mypy_cache", ".pytest_cache"}
+
+
+def _is_test_like(name):
+    """``test*.{ext}``, ``*_test.{ext}``, ``tests.{ext}``, ``*_tests.{ext}``."""
+    if "." not in name or name.startswith("."):
+        return False
+    stem, ext = name.split(".", 1)
+    if not ext:
+        return False
+    if name.startswith("test"):
+        return True
+    base = name.rsplit(".", 1)[0]
+    for s_ in {stem, base}:
+        if s_ == "tests" or s_.endswith("_test") or s_.endswith("_tests"):
+            return True
+    return False
+
+
+def find_test_files(tests_dir, exclude=()):
+    """Return sorted relative (posix) paths of ``.py`` files under ``tests_dir``.
+    Raises DiscoveryError for non-Python files with test-like names."""
+    root = os.path.abspath(tests_dir)
+    excl = {os.path.normcase(os.path.abspath(x)) for x in exclude if x}
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        rel_dir = os.path.relpath(dirpath, root)
+        for fn in sorted(filenames):
+            full = os.path.join(dirpath, fn)
+            rel = fn if rel_dir == "." else os.path.join(rel_dir, fn).replace(os.sep, "/")
+            if os.path.normcase(os.path.abspath(full)) in excl:
+                continue
+            if rel_dir == "." and fn in LANGS.values():
+                continue  # generated tester
+            if fn.startswith(".bcg-"):
+                continue  # in-progress generated tester
+            if fn.endswith(".py"):
+                if os.path.isfile(full):
+                    out.append(rel)
+                continue
+            if fn.endswith((".pyc", ".pyo")):
+                continue
+            if _is_test_like(fn):
+                raise DiscoveryError(f"{rel}: test files must be Python (.py) files")
+    out.sort()
+    return out
+
+
+def _defines_entrypoint(tree, entrypoint):
+    """True if the module defines the entrypoint itself (i.e. it is a solution, not tests)."""
+    if not entrypoint:
+        return False
+    head = entrypoint.split(".")[0]
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == head:
+            return True
+    return False
+
+
+def _discover_file(path, rel, entrypoint):
     try:
         with open(path, "rb") as f:
             raw = f.read()
         source = raw.decode("utf-8-sig")
     except Exception as e:
-        raise DiscoveryError(f"cannot read tests.py: {e}")
+        raise DiscoveryError(f"cannot read {rel}: {e}")
     try:
-        tree = ast.parse(source, filename="tests.py")
+        tree = ast.parse(source, filename=rel)
     except SyntaxError as e:
-        raise DiscoveryError(f"syntax error in tests.py: {e}")
-
-    # Pre-collect locally defined function names (so calls to them are allowed).
+        raise DiscoveryError(f"syntax error in {rel}: {e}")
+    if _defines_entrypoint(tree, entrypoint):
+        return None
     d = Discoverer(source, entrypoint)
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             d.local_funcs.add(n.name)
-    d.handle_body(tree.body, False)
+    try:
+        d.handle_body(tree.body, False)
+    except DiscoveryError as e:
+        raise DiscoveryError(f"{rel}: {e}")
+    return d, source
 
-    callees = set(d.callees)
-    if entrypoint is None:
-        if not callees:
-            entrypoint = None
-        else:
-            bases = {c.split(".")[-1] for c in callees}
-            if len(bases) != 1:
-                raise DiscoveryError(f"cannot infer a single entrypoint from {sorted(callees)}")
-            dotted = sorted(c for c in callees if "." in c)
-            classes = {c.split(".")[0] for c in dotted}
-            if len(classes) > 1:
-                raise DiscoveryError(f"inconsistent entrypoint classes {sorted(classes)}")
-            entrypoint = dotted[0] if dotted else next(iter(bases))
 
-    expects, comment_lines = read_expect_comments(source)
+def _assign_ids(rel, raw_tests, source):
+    try:
+        expects, comment_lines = read_expect_comments(source)
+    except DiscoveryError as e:
+        raise DiscoveryError(f"{rel}: {e}")
     lines = source.splitlines()
 
     def _ik(t):
         return -1 if t.get("iter") is None else t["iter"]
 
-    tests = sorted(d.tests, key=lambda t: (t["line"], _ik(t), t["col"]))
+    tests = sorted(raw_tests, key=lambda t: (t["line"], _ik(t), t["col"]))
     counts = {}
     for t in tests:
         k = (t["line"], t.get("iter"))
@@ -1755,8 +1954,9 @@ def discover(tests_dir, entrypoint=None):
         k = (line, t.get("iter"))
         idx = seen.get(k, 0)
         seen[k] = idx + 1
-        base = f"tests.py:{line}" if t.get("iter") is None else f"tests.py:{line}:{t['iter']}"
+        base = f"{rel}:{line}" if t.get("iter") is None else f"{rel}:{line}:{t['iter']}"
         t["id"] = base if counts[k] == 1 else f"{base}#{idx}"
+        t["file"] = rel
         t["stdout"] = None
         t["stderr"] = None
         if idx == 0:
@@ -1774,6 +1974,44 @@ def discover(tests_dir, entrypoint=None):
                     k -= 1
                     continue
                 break
+    return tests
+
+
+def discover(tests_dir, entrypoint=None, exclude=()):
+    """Return (tests, entrypoint). Raises DiscoveryError."""
+    if not os.path.isdir(tests_dir):
+        raise DiscoveryError(f"{tests_dir} is not a directory")
+    files = find_test_files(tests_dir, exclude)
+    found = []
+    callees = []
+    for rel in files:
+        r = _discover_file(os.path.join(tests_dir, *rel.split("/")), rel, entrypoint)
+        if r is None:
+            continue
+        d, source = r
+        callees.extend(d.callees)
+        if d.tests:
+            found.append((rel, d.tests, source))
+    if not found:
+        raise DiscoveryError(f"no tests discovered in {tests_dir}")
+
+    if entrypoint is None:
+        callees = set(callees)
+        if not callees:
+            entrypoint = None
+        else:
+            bases = {c.split(".")[-1] for c in callees}
+            if len(bases) != 1:
+                raise DiscoveryError(f"cannot infer a single entrypoint from {sorted(callees)}")
+            dotted = sorted(c for c in callees if "." in c)
+            classes = {c.split(".")[0] for c in dotted}
+            if len(classes) > 1:
+                raise DiscoveryError(f"inconsistent entrypoint classes {sorted(classes)}")
+            entrypoint = dotted[0] if dotted else next(iter(bases))
+
+    tests = []
+    for rel, raw_tests, source in found:
+        tests.extend(_assign_ids(rel, raw_tests, source))
     return tests, entrypoint
 
 
@@ -2196,7 +2434,7 @@ def _run_one(t, factory, cap):
             result = raw = fn(*args, **kwargs)
             xf = t["xf"]()
             if xf is not None:
-                result = _ev(xf, raw)
+                result = _ev(xf, raw, None, args, kwargs)
         except Exception as e:
             raised = e
         except BaseException as e:  # SystemExit, KeyboardInterrupt, ...
@@ -3472,6 +3710,7 @@ function pyEv(n, r, env) {
   if (env === undefined) env = Object.create(null);
   switch (n[0]) {
     case "r": return r === undefined ? null : r;
+    case "arg": return env["\0args"][n[1]];
     case "lit": return n[1];
     case "var": return env[n[1]];
     case "bin": return pyBin(n[1], pyEv(n[2], r, env), pyEv(n[3], r, env));
@@ -3712,7 +3951,11 @@ async function runOne(t, factory) {
       result = fn(...args);
       if (isThenable(result)) result = await result;
       raw = result;
-      if (xf !== null) result = pyEv(xf, raw);
+      if (xf !== null) {
+        const env = Object.create(null);
+        env["\0args"] = args;
+        result = pyEv(xf, raw, env);
+      }
     } catch (e) {
       raised = true; err = e;
     }
@@ -4163,12 +4406,13 @@ def cmd_test(opts):
     ep = opts.get("entrypoint")
     if not ep and meta and isinstance(meta.get("entrypoint"), str):
         ep = meta["entrypoint"]
+    excl = [solution]
     try:
-        tests, ep = discover(tests_dir, ep)
+        tests, ep = discover(tests_dir, ep, excl)
     except DiscoveryError:
         if ep is not None:
             try:
-                tests, ep = discover(tests_dir, None)
+                tests, ep = discover(tests_dir, None, excl)
             except DiscoveryError:
                 return emit_result("error", [], [])
         else:
