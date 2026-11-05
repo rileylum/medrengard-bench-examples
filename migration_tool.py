@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Database migration tool: applies JSON schema migrations to SQLite databases."""
 
+import heapq
 import json
 import os
 import re
@@ -277,7 +278,7 @@ def _strip_literals(sql):
     return "".join(out)
 
 
-def validate_migration(mig):
+def validate_migration(mig, check_operations=True):
     if not isinstance(mig, dict):
         raise schema_error("migration must be a JSON object")
     for field in ("version", "description", "operations"):
@@ -289,12 +290,22 @@ def validate_migration(mig):
         raise schema_error("field 'description' must be a string")
     if not isinstance(mig["operations"], list):
         raise schema_error("field 'operations' must be an array")
+    deps = mig.get("depends_on")
+    if deps is not None:
+        if not isinstance(deps, list) or not all(
+            is_int(d) and d > 0 for d in deps
+        ):
+            raise schema_error(
+                "field 'depends_on' must be an array of positive integers"
+            )
+    rops = mig.get("rollback_operations")
+    if rops is not None and not isinstance(rops, list):
+        raise schema_error("field 'rollback_operations' must be an array")
+    if not check_operations:
+        return
     for i, op in enumerate(mig["operations"]):
         validate_operation(op, i)
-    if mig.get("rollback_operations") is not None:
-        rops = mig["rollback_operations"]
-        if not isinstance(rops, list):
-            raise schema_error("field 'rollback_operations' must be an array")
+    if rops is not None:
         for i, op in enumerate(rops):
             validate_operation(op, i, "rollback operation")
 
@@ -1681,7 +1692,8 @@ MIGRATIONS_TABLE_SQL = (
     "description TEXT NOT NULL, "
     "applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
     "operations TEXT NOT NULL, "
-    "rollback_operations TEXT)"
+    "rollback_operations TEXT, "
+    "depends_on TEXT)"
 )
 
 
@@ -1701,6 +1713,8 @@ def ensure_migrations_table(conn):
         )
     if "rollback_operations" not in cols:
         conn.execute("ALTER TABLE _migrations ADD COLUMN rollback_operations TEXT")
+    if "depends_on" not in cols:
+        conn.execute("ALTER TABLE _migrations ADD COLUMN depends_on TEXT")
 
 
 def operation_event(event_name, op, version, extra=None):
@@ -1725,65 +1739,396 @@ def operation_event(event_name, op, version, extra=None):
     return event
 
 
-def migrate(migration_path, db_path):
-    mig = load_migration(migration_path)
-    version = mig["version"]
+def migration_deps(mig):
+    """Dependencies of a migration, deduplicated, in declaration order."""
+    seen = []
+    for d in mig.get("depends_on") or []:
+        if d not in seen:
+            seen.append(d)
+    return seen
 
+
+def check_local_dependencies(mig):
+    """Dependency checks that need no other migration: self and future deps."""
+    version = mig["version"]
+    deps = migration_deps(mig)
+    if version in deps:
+        raise MigrationError(
+            f"circular dependency detected: cycle {[version, version]}"
+        )
+    for d in deps:
+        if d > version:
+            raise MigrationError(
+                f"migration version {version} cannot depend on future version {d}"
+            )
+
+
+def open_database(db_path):
     try:
         conn = sqlite3.connect(db_path, isolation_level=None)
     except sqlite3.Error as e:
         raise MigrationError(f"SQL error: {e}")
-
     try:
-        try:
-            # Foreign keys are enforced by the tool itself during a migration:
-            # SQLite cannot toggle the foreign_keys pragma inside a transaction,
-            # and table recreation (drop_column, drop_foreign_key, check
-            # constraints...) must not trigger ON DELETE actions on child tables
-            # when the old table is dropped. After every operation that can
-            # affect referential integrity, PRAGMA foreign_key_check is run and
-            # violations abort (and roll back) the migration.
-            conn.execute("PRAGMA foreign_keys = OFF")
-            ensure_migrations_table(conn)
-            row = conn.execute(
-                "SELECT 1 FROM _migrations WHERE version = ?", (version,)
-            ).fetchone()
-        except sqlite3.Error as e:
-            raise MigrationError(f"SQL error: {e}")
+        # Foreign keys are enforced by the tool itself during a migration:
+        # SQLite cannot toggle the foreign_keys pragma inside a transaction,
+        # and table recreation (drop_column, drop_foreign_key, check
+        # constraints...) must not trigger ON DELETE actions on child tables
+        # when the old table is dropped. After every operation that can
+        # affect referential integrity, PRAGMA foreign_key_check is run and
+        # violations abort (and roll back) the migration.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        ensure_migrations_table(conn)
+    except sqlite3.Error as e:
+        conn.close()
+        raise MigrationError(f"SQL error: {e}")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
-        if row is not None:
+
+def applied_versions(conn):
+    try:
+        return {r[0] for r in conn.execute("SELECT version FROM _migrations")}
+    except sqlite3.Error as e:
+        raise MigrationError(f"SQL error: {e}")
+
+
+def final_version(conn):
+    try:
+        return conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM _migrations"
+        ).fetchone()[0]
+    except sqlite3.Error as e:
+        raise MigrationError(f"SQL error: {e}")
+
+
+def apply_migration(conn, mig, announce=False):
+    """Apply one migration atomically and record it in _migrations."""
+    version = mig["version"]
+    if announce:
+        emit({"event": "migration_started", "version": version,
+              "description": mig["description"]})
+    try:
+        conn.execute("BEGIN")
+        stored = []
+        for op in mig["operations"]:
+            stored.append(capture_rollback_info(conn, op))
+            extra = OPERATIONS[op["type"]](conn, op)
+            emit(operation_event("operation_applied", op, version, extra))
+        rops = mig.get("rollback_operations")
+        conn.execute(
+            "INSERT INTO _migrations "
+            "(version, description, operations, rollback_operations, depends_on) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (version, mig["description"], json.dumps(stored),
+             None if rops is None else json.dumps(rops),
+             json.dumps(migration_deps(mig))),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error as e:
+        _rollback(conn)
+        raise MigrationError(f"SQL error: {e}")
+    except BaseException:
+        _rollback(conn)
+        raise
+    emit({"event": "migration_complete", "version": version,
+          "operations_count": len(mig["operations"])})
+
+
+def migrate(migration_path, db_path):
+    mig = load_migration(migration_path)
+    version = mig["version"]
+    check_local_dependencies(mig)
+
+    conn = open_database(db_path)
+    try:
+        applied = applied_versions(conn)
+        if version in applied:
             sys.stderr.write(
                 f"Warning: Migration version {version} already applied, skipping\n"
             )
             emit({"event": "migration_skipped", "version": version,
                   "reason": "already_applied"})
             return
+        for d in migration_deps(mig):
+            if d not in applied:
+                raise MigrationError(f"dependency version {d} not found")
+        apply_migration(conn, mig)
+    finally:
+        conn.close()
 
-        try:
-            conn.execute("BEGIN")
-            stored = []
-            for op in mig["operations"]:
-                stored.append(capture_rollback_info(conn, op))
-                extra = OPERATIONS[op["type"]](conn, op)
-                emit(operation_event("operation_applied", op, version, extra))
-            rops = mig.get("rollback_operations")
-            conn.execute(
-                "INSERT INTO _migrations "
-                "(version, description, operations, rollback_operations) "
-                "VALUES (?, ?, ?, ?)",
-                (version, mig["description"], json.dumps(stored),
-                 None if rops is None else json.dumps(rops)),
+
+# --------------------------------------------------------------------------
+# Dependency management
+# --------------------------------------------------------------------------
+
+def parse_migration_file(path):
+    """Load a migration for validate/migrate-all; any problem is reported as
+    an invalid migration file. Only the migration structure (version,
+    description, operations array, depends_on) is checked here; operations
+    are checked by check_operations() once the dependency graph is valid."""
+    name = os.path.basename(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            mig = json.load(f)
+        validate_migration(mig, check_operations=False)
+    except (OSError, UnicodeDecodeError, ValueError, MigrationError):
+        raise MigrationError(f"invalid migration file: {name}")
+    return mig
+
+
+def check_operations(mig, path):
+    try:
+        validate_migration(mig)
+    except MigrationError:
+        raise MigrationError(
+            f"invalid migration file: {os.path.basename(path)}")
+
+
+def _natural_key(name):
+    return [int(t) if t.isdigit() else t.lower()
+            for t in re.split(r"(\d+)", name)]
+
+
+def scan_directory(directory, emit_events=False):
+    """Parse every .json file of a directory.
+
+    Returns a list of (version, filename, path, migration) sorted by version.
+    """
+    if not os.path.isdir(directory):
+        raise MigrationError(f"migrations directory not found: {directory}")
+    try:
+        names = os.listdir(directory)
+    except OSError as e:
+        raise MigrationError(f"cannot read migrations directory: {directory}: {e}")
+    entries = []
+    for name in sorted(names, key=_natural_key):
+        path = os.path.join(directory, name)
+        if not name.lower().endswith(".json") or not os.path.isfile(path):
+            continue
+        mig = parse_migration_file(path)
+        entries.append((mig["version"], name, path, mig))
+    entries.sort(key=lambda e: e[0])
+    if emit_events:
+        for version, name, _path, _mig in entries:
+            emit({"event": "migration_discovered", "file": name,
+                  "version": version})
+    by_version = {}
+    for version, name, _path, _mig in entries:
+        if version in by_version:
+            raise MigrationError(
+                f"duplicate migration version {version} in files "
+                f"{by_version[version]} and {name}"
             )
-            conn.execute("COMMIT")
-        except sqlite3.Error as e:
-            _rollback(conn)
-            raise MigrationError(f"SQL error: {e}")
-        except BaseException:
-            _rollback(conn)
-            raise
+        by_version[version] = name
+    return entries
 
-        emit({"event": "migration_complete", "version": version,
-              "operations_count": len(mig["operations"])})
+
+def find_cycle(graph, starts):
+    """DFS with white/gray/black colouring over dependency edges.
+
+    graph maps version -> list of dependency versions (only existing nodes are
+    followed). Returns the first cycle found as [v, ..., v] or None.
+    """
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {v: WHITE for v in graph}
+    for start in starts:
+        if color.get(start, BLACK) != WHITE:
+            continue
+        path = [start]
+        color[start] = GRAY
+        stack = [iter(graph[start])]
+        while stack:
+            advanced = False
+            for dep in stack[-1]:
+                if dep not in graph:
+                    continue
+                if color[dep] == GRAY:
+                    return path[path.index(dep):] + [dep]
+                if color[dep] == WHITE:
+                    color[dep] = GRAY
+                    path.append(dep)
+                    stack.append(iter(graph[dep]))
+                    advanced = True
+                    break
+            if not advanced:
+                color[path.pop()] = BLACK
+                stack.pop()
+    return None
+
+
+def topological_sort(graph):
+    """Kahn's algorithm; ties are broken by the lowest version first."""
+    dependents = {v: [] for v in graph}
+    indegree = {v: 0 for v in graph}
+    for v, deps in graph.items():
+        for d in deps:
+            dependents[d].append(v)
+            indegree[v] += 1
+    ready = [v for v, n in indegree.items() if n == 0]
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        v = heapq.heappop(ready)
+        order.append(v)
+        for w in dependents[v]:
+            indegree[w] -= 1
+            if indegree[w] == 0:
+                heapq.heappush(ready, w)
+    if len(order) != len(graph):
+        raise MigrationError("dependency resolution failed: conflicting requirements")
+    return order
+
+
+def check_graph(graph, first=None, on_missing=None, on_cycle=None,
+                on_future=None):
+    """Validate a dependency graph (version -> deps): existence, cycles and
+    forward dependencies. Raises MigrationError on the first problem."""
+    starts = ([first] if first is not None else []) + sorted(
+        v for v in graph if v != first)
+    for v in starts:
+        for d in graph[v]:
+            if d not in graph:
+                msg = f"dependency version {d} not found"
+                if on_missing:
+                    on_missing(v, msg)
+                raise MigrationError(msg)
+    cycle = find_cycle(graph, starts)
+    if cycle is not None:
+        if on_cycle:
+            on_cycle(cycle)
+        raise MigrationError(f"circular dependency detected: cycle {cycle}")
+    for v in starts:
+        for d in graph[v]:
+            if d > v:
+                msg = f"migration version {v} cannot depend on future version {d}"
+                if on_future:
+                    on_future(v, d, msg)
+                raise MigrationError(msg)
+
+
+def _same_file(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def validate(migration_path, migrations_dir=None):
+    path = migration_path
+    if (migrations_dir is not None and not os.path.exists(path)
+            and not os.path.isabs(path)):
+        candidate = os.path.join(migrations_dir, path)
+        if os.path.exists(candidate):
+            path = candidate
+    name = os.path.basename(migration_path)
+    emit({"event": "validation_started", "migration_file": name})
+
+    def invalid(version):
+        emit({"event": "validation_complete", "version": version,
+              "status": "invalid"})
+
+    try:
+        mig = parse_migration_file(path)
+    except MigrationError:
+        version = None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict) and is_int(raw.get("version")):
+                version = raw["version"]
+        except (OSError, UnicodeDecodeError, ValueError):
+            pass
+        invalid(version)
+        raise MigrationError(f"invalid migration file: {name}")
+
+    version = mig["version"]
+    deps = migration_deps(mig)
+    try:
+        if migrations_dir is None:
+            if deps:
+                emit({"event": "dependency_check", "version": version,
+                      "depends_on": deps, "status": "warning",
+                      "message": "cannot verify dependencies without "
+                                 "--migrations-dir"})
+            local = {version: deps}
+            for d in deps:
+                local.setdefault(d, [])
+            check_graph(
+                local, first=version,
+                on_cycle=lambda c: emit({"event": "circular_dependency_detected",
+                                         "cycle": c, "status": "error"}),
+                on_future=lambda v, d, msg: emit({
+                    "event": "future_dependency_detected", "version": v,
+                    "dependency": d, "status": "error", "message": msg}),
+            )
+        else:
+            entries = scan_directory(migrations_dir)
+            graph = {}
+            for v, other_name, other_path, other in entries:
+                if v == version and not _same_file(other_path, path):
+                    raise MigrationError(
+                        f"duplicate migration version {v} in files "
+                        f"{name} and {other_name}"
+                    )
+                graph[v] = migration_deps(other)
+            graph[version] = deps
+            if deps and all(d in graph for d in deps):
+                emit({"event": "dependency_check", "version": version,
+                      "depends_on": deps, "status": "ok"})
+
+            def on_missing(v, msg):
+                emit({"event": "dependency_check", "version": v,
+                      "depends_on": graph[v], "status": "error",
+                      "message": msg})
+
+            check_graph(
+                graph, first=version, on_missing=on_missing,
+                on_cycle=lambda c: emit({"event": "circular_dependency_detected",
+                                         "cycle": c, "status": "error"}),
+                on_future=lambda v, d, msg: emit({
+                    "event": "future_dependency_detected", "version": v,
+                    "dependency": d, "status": "error", "message": msg}),
+            )
+        check_operations(mig, path)
+    except MigrationError:
+        invalid(version)
+        raise
+    emit({"event": "validation_complete", "version": version, "status": "valid"})
+
+
+def migrate_all(migrations_dir, db_path):
+    emit({"event": "scan_started", "directory": migrations_dir})
+    entries = scan_directory(migrations_dir, emit_events=True)
+    emit({"event": "scan_complete", "migrations_found": len(entries)})
+    emit({"event": "dependency_resolution_started"})
+    graph = {v: migration_deps(mig) for v, _n, _p, mig in entries}
+    migrations = {v: mig for v, _n, _p, mig in entries}
+    check_graph(graph)
+    for _v, _n, path, mig in entries:
+        check_operations(mig, path)
+    order = topological_sort(graph)
+    emit({"event": "dependency_resolved", "order": order})
+
+    conn = open_database(db_path)
+    try:
+        applied = applied_versions(conn)
+        count_applied = 0
+        count_skipped = 0
+        for v in order:
+            if v in applied:
+                count_skipped += 1
+                continue
+            for d in graph[v]:
+                if d not in applied:
+                    raise MigrationError(f"dependency version {d} not found")
+            apply_migration(conn, migrations[v], announce=True)
+            applied.add(v)
+            count_applied += 1
+        emit({"event": "batch_complete", "migrations_applied": count_applied,
+              "migrations_skipped": count_skipped,
+              "final_version": final_version(conn)})
     finally:
         conn.close()
 
@@ -1814,6 +2159,45 @@ def _load_json_field(text, version, what):
     return value
 
 
+def _stored_deps(text):
+    if text is None:
+        return []
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [d for d in value if is_int(d)]
+
+
+def _reverse_dependency_order(targets, stored_deps):
+    """Order rows so every migration precedes the migrations it depends on,
+    preferring higher versions first."""
+    versions = {r[0] for r in targets}
+    graph = {v: [d for d in stored_deps.get(v, []) if d in versions]
+             for v in versions}
+    by_version = {r[0]: r for r in targets}
+    dependents = {v: [] for v in versions}
+    for v, deps in graph.items():
+        for d in deps:
+            dependents[d].append(v)
+    remaining = {v: len(dependents[v]) for v in versions}
+    ready = [-v for v, n in remaining.items() if n == 0]
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        v = -heapq.heappop(ready)
+        order.append(v)
+        for d in graph[v]:
+            remaining[d] -= 1
+            if remaining[d] == 0:
+                heapq.heappush(ready, -d)
+    if len(order) != len(versions):
+        return targets  # corrupted metadata: fall back to version order
+    return [by_version[v] for v in order]
+
+
 def rollback(db_path, to_version=None, count=None):
     if not os.path.isfile(db_path):
         raise MigrationError("no migrations to rollback")
@@ -1832,10 +2216,13 @@ def rollback(db_path, to_version=None, count=None):
             rops_sql = (
                 "rollback_operations" if "rollback_operations" in cols else "NULL"
             )
-            rows = conn.execute(
-                f"SELECT version, description, {ops_sql}, {rops_sql} "
+            deps_sql = "depends_on" if "depends_on" in cols else "NULL"
+            full_rows = conn.execute(
+                f"SELECT version, description, {ops_sql}, {rops_sql}, {deps_sql} "
                 "FROM _migrations ORDER BY version DESC"
             ).fetchall()
+            rows = [r[:4] for r in full_rows]
+            stored_deps = {r[0]: _stored_deps(r[4]) for r in full_rows}
         except sqlite3.Error as e:
             raise MigrationError(f"SQL error: {e}")
 
@@ -1848,6 +2235,20 @@ def rollback(db_path, to_version=None, count=None):
             targets = [r for r in rows if r[0] > to_version]
         else:
             targets = rows[:count if count is not None else 1]
+
+        # Dependencies: a migration that stays applied must not depend on one
+        # being rolled back; dependents are rolled back before their
+        # dependencies (reverse topological order).
+        target_versions = {r[0] for r in targets}
+        for r in rows:
+            if r[0] in target_versions:
+                continue
+            for d in stored_deps.get(r[0], []):
+                if d in target_versions:
+                    raise MigrationError(
+                        f"cannot rollback version {d}: version {r[0]} depends on it"
+                    )
+        targets = _reverse_dependency_order(targets, stored_deps)
 
         # Validate everything before touching the database.
         plan = []
@@ -1902,7 +2303,10 @@ def rollback(db_path, to_version=None, count=None):
 USAGE = (
     "usage: migration_tool.py migrate <migration.json> <database.db>\n"
     "       migration_tool.py rollback <database.db> "
-    "[--to-version <version>] [--count <n>]"
+    "[--to-version <version>] [--count <n>]\n"
+    "       migration_tool.py validate <migration.json> "
+    "[--migrations-dir <dir>]\n"
+    "       migration_tool.py migrate-all --migrations-dir <dir> <database.db>"
 )
 
 
@@ -1956,6 +2360,37 @@ def parse_rollback_args(args):
     return db_path, to_version, count
 
 
+def parse_dir_args(args, positional_names, require_dir):
+    """Parse positional arguments plus an optional --migrations-dir option."""
+    positionals = []
+    migrations_dir = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        opt, eq, val = a.partition("=")
+        if opt == "--migrations-dir":
+            if not eq:
+                if i + 1 >= len(args):
+                    raise ArgumentError("missing value for --migrations-dir")
+                i += 1
+                val = args[i]
+            if migrations_dir is not None:
+                raise ArgumentError("--migrations-dir given more than once")
+            migrations_dir = val
+        elif a.startswith("--"):
+            raise ArgumentError(f"unknown option {a}")
+        else:
+            positionals.append(a)
+        i += 1
+    if len(positionals) < len(positional_names):
+        raise ArgumentError(f"missing {positional_names[len(positionals)]}")
+    if len(positionals) > len(positional_names):
+        raise ArgumentError("too many arguments")
+    if require_dir and migrations_dir is None:
+        raise ArgumentError("missing --migrations-dir")
+    return positionals, migrations_dir
+
+
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     try:
@@ -1968,6 +2403,21 @@ def main(argv=None):
                 sys.stderr.write(f"Error: invalid arguments: {e}\n{USAGE}\n")
                 return 1
             rollback(db_path, to_version, count)
+        elif args and args[0] in ("validate", "migrate-all"):
+            try:
+                if args[0] == "validate":
+                    (path,), mdir = parse_dir_args(
+                        args[1:], ["migration file"], False)
+                else:
+                    (path,), mdir = parse_dir_args(
+                        args[1:], ["database path"], True)
+            except ArgumentError as e:
+                sys.stderr.write(f"Error: invalid arguments: {e}\n{USAGE}\n")
+                return 1
+            if args[0] == "validate":
+                validate(path, mdir)
+            else:
+                migrate_all(mdir, path)
         else:
             sys.stderr.write(f"Error: invalid arguments\n{USAGE}\n")
             return 1
