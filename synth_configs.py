@@ -30,8 +30,8 @@ class SynthError(Exception):
 
 
 REQUIRED_SECTIONS = ("experiment_name", "training", "resources")
-FLAG_NAMES = ("base", "overrides", "fragments", "flags", "env", "out", "manifest")
-OPTIONAL_FLAGS = ("fragments", "manifest")
+FLAG_NAMES = ("base", "overrides", "fragments", "flags", "env", "out", "manifest", "schema", "hardware")
+OPTIONAL_FLAGS = ("fragments", "manifest", "schema", "hardware")
 
 
 # --------------------------------------------------------------------------
@@ -645,6 +645,205 @@ def _with_path(exc, path):
     return exc
 
 
+# --------------------------------------------------------------------------
+# Hardware profiles & schema validation
+# --------------------------------------------------------------------------
+HARDWARE_NAME = "hardware.yaml"
+
+
+class MultiError(SynthError):
+    """Several blocking violations for one run (one violations.ndjson line each)."""
+
+    def __init__(self, errors):
+        first = errors[0]
+        super().__init__(first.code, first.message, first.path)
+        self.errors = list(errors)
+
+
+def load_hardware(path):
+    data = load_yaml(path, HARDWARE_NAME)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise SynthError("INVALID_INPUT", "hardware.yaml must be a mapping of profiles", HARDWARE_NAME)
+    default_profile = data.get("default_profile")
+    if isinstance(data.get("profiles"), dict):
+        profiles = data["profiles"]
+    else:
+        profiles = {k: v for k, v in data.items() if k not in ("default_profile", "profiles")}
+    if default_profile is not None and not isinstance(default_profile, str):
+        raise SynthError("INVALID_INPUT", "hardware.default_profile must be a string",
+                         HARDWARE_NAME + "#/default_profile")
+    return {"profiles": profiles, "default_profile": default_profile}
+
+
+def _check_profile(name, profile):
+    where = "%s#/%s" % (HARDWARE_NAME, escape_pointer(name))
+    if not isinstance(profile, dict):
+        raise SynthError("INVALID_INPUT", "hardware profile %r must be an object" % name, where)
+    if "accelerators" in profile:
+        accs = profile["accelerators"]
+        if not isinstance(accs, list):
+            raise SynthError("INVALID_INPUT", "hardware profile %r: accelerators must be a list" % name,
+                             where + "/accelerators")
+        for i, acc in enumerate(accs):
+            if (not isinstance(acc, dict) or not isinstance(acc.get("type"), str)
+                    or not is_pos_int(acc.get("count"))):
+                raise SynthError("INVALID_INPUT",
+                                 "hardware profile %r: accelerators[%d] must be {type: str, count: int}" % (name, i),
+                                 "%s/accelerators/%d" % (where, i))
+    if "max_world_size" in profile and not is_pos_int(profile["max_world_size"]):
+        raise SynthError("INVALID_INPUT", "hardware profile %r: max_world_size must be a positive integer" % name,
+                         where + "/max_world_size")
+    if profile.get("defaults") is not None and not isinstance(profile["defaults"], dict):
+        raise SynthError("INVALID_INPUT", "hardware profile %r: defaults must be an object" % name,
+                         where + "/defaults")
+    if profile.get("constraints") is not None and not isinstance(profile["constraints"], dict):
+        raise SynthError("INVALID_INPUT", "hardware profile %r: constraints must be an object" % name,
+                         where + "/constraints")
+
+
+def resolve_profile(merged, hardware, env):
+    """Select the hardware profile for a run from its (pre-hardware) merged config."""
+    raw = None
+    present = False
+    if isinstance(merged, dict) and isinstance(merged.get("resources"), dict):
+        res = merged["resources"]
+        if "profile" in res:
+            present = True
+            raw = res["profile"]
+    if present:
+        if not isinstance(raw, str):
+            raise SynthError("INVALID_VALUE", "resources.profile must be a string", "/resources/profile")
+        touched = set()
+        name = interpolate(raw, env, "/resources/profile", touched)
+        if touched and name.strip() == "":
+            raise SynthError("MISSING_KEY", "resources.profile is empty after interpolation",
+                             "/resources/profile")
+    else:
+        name = hardware["default_profile"]
+        if name is None:
+            raise SynthError("UNKNOWN_PROFILE",
+                             "resources.profile is not set and hardware.yaml has no default_profile",
+                             "/resources/profile")
+    profiles = hardware["profiles"]
+    if name not in profiles:
+        raise SynthError("UNKNOWN_PROFILE", "hardware profile %r is not defined in hardware.yaml" % name,
+                         "/resources/profile")
+    profile = profiles[name]
+    if profile is None:
+        profile = {}
+    _check_profile(name, profile)
+    return name, profile
+
+
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _lookup_field(doc, field):
+    """Find a constrained field: dotted path from the root, else resources.<f>,
+    training.<f>, then top-level <f>. Returns (found, value, pointer)."""
+    candidates = []
+    if "." in field:
+        candidates.append(field.split("."))
+    else:
+        candidates.extend([["resources", field], ["training", field], [field]])
+    for parts in candidates:
+        cur = doc
+        ok = True
+        for part in parts:
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                ok = False
+                break
+        if ok:
+            return True, cur, "/" + "/".join(escape_pointer(p) for p in parts)
+    return False, None, None
+
+
+def _fmt(v):
+    return json.dumps(v, ensure_ascii=False)
+
+
+CONSTRAINT_RE = re.compile(r"^(?:(max|min)_(.+)|(.+)_(multiple_of|max|min|allowed|in))$")
+
+
+def check_hardware(doc, name, profile):
+    errors = []
+
+    def add(msg, pointer):
+        errors.append(SynthError("HARDWARE_CONSTRAINT", msg, pointer))
+
+    rules = []
+    if "max_world_size" in profile:
+        rules.append(("max", "world_size", profile["max_world_size"], "max_world_size"))
+    constraints = profile.get("constraints") or {}
+    for key in sorted(constraints):
+        value = constraints[key]
+        m = CONSTRAINT_RE.match(key)
+        if m is None:
+            continue
+        if m.group(1):
+            kind, field = m.group(1), m.group(2)
+        else:
+            kind, field = m.group(4), m.group(3)
+            if kind == "in":
+                kind = "allowed"
+        rules.append((kind, field, value, key))
+
+    for kind, field, limit, key in rules:
+        found, value, pointer = _lookup_field(doc, field)
+        if not found:
+            continue
+        label = pointer[1:].replace("/", ".")
+        if kind == "allowed":
+            allowed = limit if isinstance(limit, list) else [limit]
+            if value not in allowed:
+                add("%s %s is not allowed by %s %s for profile %s"
+                    % (label, _fmt(value), key, _fmt(allowed), name), pointer)
+            continue
+        if not _is_number(limit):
+            continue
+        if not _is_number(value):
+            add("%s must be a number to satisfy %s for profile %s" % (label, key, name), pointer)
+            continue
+        if kind == "max" and value > limit:
+            add("%s %s exceeds %s %s for profile %s" % (label, _fmt(value), key, _fmt(limit), name), pointer)
+        elif kind == "min" and value < limit:
+            add("%s %s is below %s %s for profile %s" % (label, _fmt(value), key, _fmt(limit), name), pointer)
+        elif kind == "multiple_of" and limit != 0 and value % limit != 0:
+            add("%s %s is not a multiple of %s (%s) for profile %s"
+                % (label, _fmt(value), _fmt(limit), key, name), pointer)
+    return errors
+
+
+def load_schema(path):
+    import jsonschema
+    schema = load_json(path, "schema.json")
+    if schema is None:
+        schema = {}
+    if not isinstance(schema, (dict, bool)):
+        raise SynthError("INVALID_INPUT", "schema.json must be a JSON object", "schema.json")
+    try:
+        jsonschema.Draft7Validator.check_schema(schema)
+    except jsonschema.exceptions.SchemaError as exc:
+        raise SynthError("INVALID_INPUT", "schema.json is not a valid Draft 7 schema: %s" % exc.message,
+                         "schema.json")
+    return jsonschema.Draft7Validator(schema)
+
+
+def schema_errors(doc, validator):
+    out = []
+    for err in validator.iter_errors(doc):
+        parts = list(err.absolute_path)
+        pointer = "/" + "/".join(escape_pointer(str(p)) for p in parts) if parts else "/"
+        out.append((pointer, err.message, list(err.absolute_schema_path)))
+    out.sort(key=lambda e: (e[0], e[1], [str(x) for x in e[2]]))
+    return [SynthError("SCHEMA_ERROR", msg, ptr) for ptr, msg, _ in out]
+
+
 def process_run(row, ctx):
     """Returns (spec_or_None, warnings_list, conflict_count, error_or_None)."""
     resolver = ctx["resolver"]
@@ -674,15 +873,45 @@ def process_run(row, ctx):
                     layers.append((name, resolver.expand(doc)))
                 except SynthError as exc:
                     raise _with_path(exc, label)
+
+            profile_name = None
+            profile = None
+            if ctx["hardware"] is not None:
+                pre_merged, _ = merge_layers(layers)
+                profile_name, profile = resolve_profile(pre_merged, ctx["hardware"], ctx["env"])
+                hw_defaults = profile.get("defaults")
+                if hw_defaults is not None:
+                    try:
+                        hw_defaults = resolver.expand(hw_defaults, "", ())
+                    except SynthError as exc:
+                        raise _with_path(exc, HARDWARE_NAME)
+                    # Hardware defaults sit after overrides/defaults.yaml and
+                    # before the run-specific override.
+                    layers.insert(2, (HARDWARE_NAME, hw_defaults))
         finally:
             deprecations = ["FRAGMENT_DEPRECATED %s %s" % (row["run_id"], w[len("FRAGMENT_DEPRECATED "):])
                             for w in resolver.warnings]
             deprecations = [w.rstrip() for w in deprecations]
 
         merged, conflicts = merge_layers(layers)
+        if profile_name is not None and isinstance(merged, dict):
+            res = merged.get("resources")
+            if res is None:
+                merged["resources"] = {"profile": profile_name}
+            elif isinstance(res, dict) and "profile" not in res:
+                res = dict(res)
+                res["profile"] = profile_name
+                merged["resources"] = res
         touched = set()
         merged = interpolate(merged, ctx["env"], "", touched)
         validate(merged, touched)
+        problems = []
+        if profile is not None:
+            problems.extend(check_hardware(merged, profile_name, profile))
+        if ctx["schema_validator"] is not None:
+            problems.extend(schema_errors(merged, ctx["schema_validator"]))
+        if problems:
+            raise MultiError(problems)
         error = None
     except SynthError as exc:
         merged = None
@@ -735,6 +964,12 @@ def run_manifest(args):
     if not os.path.isfile(defaults_path) or not os.access(defaults_path, os.R_OK):
         raise SynthError("MISSING_FILE", "overrides/defaults.yaml not found or unreadable: %s" % defaults_path)
     env = parse_env(args["env"])
+    hardware_path = args.get("hardware")
+    if hardware_path and (not os.path.isfile(hardware_path) or not os.access(hardware_path, os.R_OK)):
+        raise SynthError("MISSING_FILE", "hardware.yaml not found or unreadable: %s" % hardware_path)
+    schema_path = args.get("schema")
+    if schema_path and (not os.path.isfile(schema_path) or not os.access(schema_path, os.R_OK)):
+        raise SynthError("MISSING_FILE", "schema.json not found or unreadable: %s" % schema_path)
 
     ctx = {
         "manifest_dir": os.path.dirname(os.path.abspath(manifest_path)),
@@ -743,6 +978,7 @@ def run_manifest(args):
         "gflags_name": os.path.basename(args.get("flags") or "") or "flags.json",
         "base": None, "defaults": None, "gflags": None,
         "env": env, "resolver": None, "global_error": None,
+        "hardware": None, "schema_validator": None,
     }
     try:
         try:
@@ -763,6 +999,16 @@ def run_manifest(args):
             ctx["resolver"] = FragmentResolver(args.get("fragments"))
         except SynthError as exc:
             raise _with_path(exc, "fragments/meta.yaml")
+        if hardware_path:
+            try:
+                ctx["hardware"] = load_hardware(hardware_path)
+            except SynthError as exc:
+                raise _with_path(exc, HARDWARE_NAME)
+        if schema_path:
+            try:
+                ctx["schema_validator"] = load_schema(schema_path)
+            except SynthError as exc:
+                raise _with_path(exc, "schema.json")
     except OSError as exc:
         ctx["global_error"] = SynthError("MISSING_FILE", "failed to read input: %s" % exc)
     except SynthError as exc:
@@ -780,8 +1026,9 @@ def run_manifest(args):
         else:
             if os.path.isfile(spec_file):
                 os.remove(spec_file)  # never leave a stale spec for a failed run
-            violations.append({"run_id": row["run_id"], "code": error.code,
-                               "message": error.message, "path": error.path or ""})
+            for err in getattr(error, "errors", None) or [error]:
+                violations.append({"run_id": row["run_id"], "code": err.code,
+                                   "message": err.message, "path": err.path or ""})
         all_warnings.extend(warns)
         summary_runs.append({
             "run_id": row["run_id"],
