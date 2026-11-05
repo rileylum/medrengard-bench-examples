@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """synth_configs: merge layered YAML/JSON configs into a canonical experiment spec."""
 
+import copy
 import json
 import math
 import os
@@ -29,7 +30,7 @@ def fail(code, message):
 # CLI
 # --------------------------------------------------------------------------
 
-KNOWN_FLAGS = ("base", "overrides", "flags", "env", "out")
+KNOWN_FLAGS = ("base", "overrides", "fragments", "flags", "env", "out")
 
 
 def parse_args(argv):
@@ -224,24 +225,140 @@ def parse_json(text, label):
 
 
 def parse_env(path):
-    """Parse KEY=VALUE lines; values are unused in Part 1."""
-    result = {}
+    """Parse KEY=VALUE lines from env.list (required in Part 2)."""
     if not os.path.isfile(path):
-        return result
-    try:
-        with open(path, "rb") as fh:
-            text = fh.read().decode("utf-8", errors="replace")
-    except OSError:
-        return result
+        raise SynthError("MISSING_FILE", "env.list: file not found: %s" % path)
+    text = read_text(path, "env.list")
+    result = {}
     for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
-        key, value = line.split("=", 1)
+        key, value = stripped.split("=", 1)
         key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
         if key:
-            result[key] = value
+            result[key] = value.strip()
     return result
+
+
+# --------------------------------------------------------------------------
+# Fragments
+# --------------------------------------------------------------------------
+
+FRAGMENT_EXACT_RE = re.compile(r"^\s*\{\{\s*fragment\s*:(.*?)\}\}\s*$", re.S)
+FRAGMENT_ANY_RE = re.compile(r"\{\{\s*fragment\s*:")
+FRAGMENT_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+class FragmentResolver:
+    def __init__(self, fragments_dir, warnings):
+        self.dir = fragments_dir
+        self.warnings = warnings
+        self.cache = {}
+        self.warned = set()
+        self.meta = self._load_meta()
+
+    def _load_meta(self):
+        path = os.path.join(self.dir, "meta.yaml")
+        if not os.path.isfile(path):
+            return {}
+        data = parse_yaml(read_text(path, "fragments/meta.yaml"), "fragments/meta.yaml")
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    def _deprecation_reason(self, name, own_meta):
+        entry = self.meta.get(name)
+        if isinstance(entry, dict) and "deprecated_reason" in entry \
+                and entry["deprecated_reason"] is not None:
+            return entry["deprecated_reason"]
+        if isinstance(own_meta, dict) and own_meta.get("deprecated_reason") is not None:
+            return own_meta["deprecated_reason"]
+        return None
+
+    def _load(self, name, stack):
+        if name in stack:
+            cycle = stack[stack.index(name):] + [name]
+            raise SynthError("FRAGMENT_CYCLE",
+                             "fragment cycle detected: %s" % " -> ".join(cycle))
+        if name in self.cache:
+            return self.cache[name]
+        path = os.path.join(self.dir, name + ".yaml")
+        if not os.path.isfile(path):
+            raise SynthError("UNKNOWN_FRAGMENT",
+                             "fragment %r not found (expected %s)" % (name, path))
+        label = "fragments/%s.yaml" % name
+        data = parse_yaml(read_text(path, label), label)
+        own_meta = None
+        if isinstance(data, dict) and "_meta" in data:
+            own_meta = data.pop("_meta")
+        reason = self._deprecation_reason(name, own_meta)
+        if reason is not None and name not in self.warned:
+            self.warned.add(name)
+            if not isinstance(reason, str):
+                reason = json.dumps(reason, sort_keys=True, ensure_ascii=False)
+            self.warnings.append("FRAGMENT_DEPRECATED %s %s" % (name, reason))
+        if isinstance(data, list):
+            raise SynthError("INVALID_TEMPLATE",
+                             "fragment %r evaluates to an array; only objects or scalars "
+                             "may be inlined" % name)
+        resolved = self._expand(data, stack + [name], None, ())
+        self.cache[name] = resolved
+        return resolved
+
+    def _expand(self, value, stack, record, path):
+        if isinstance(value, dict):
+            return {k: self._expand(v, stack, record, path + (k,)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._expand(v, stack, record, path + (i,)) for i, v in enumerate(value)]
+        if isinstance(value, str):
+            m = FRAGMENT_EXACT_RE.match(value)
+            if m:
+                name = m.group(1).strip()
+                if not FRAGMENT_NAME_RE.match(name):
+                    raise SynthError("INVALID_TEMPLATE",
+                                     "invalid fragment name %r in placeholder %r"
+                                     % (name, value))
+                if record is not None:
+                    record.add(path)
+                return copy.deepcopy(self._load(name, stack))
+            if FRAGMENT_ANY_RE.search(value):
+                raise SynthError("INVALID_TEMPLATE",
+                                 "malformed fragment placeholder in %r" % value)
+        return value
+
+    def expand_layer(self, data):
+        """Expand placeholders in a layer; returns (data, set of inlined paths)."""
+        record = set()
+        result = self._expand(data, [], record, ())
+        return result, record
+
+
+# --------------------------------------------------------------------------
+# Environment interpolation
+# --------------------------------------------------------------------------
+
+ENV_TOKEN_RE = re.compile(r"\$\{([^}]*)\}")
+
+
+def interpolate(value, env, path, touched):
+    if isinstance(value, dict):
+        return {k: interpolate(v, env, path + (k,), touched) for k, v in value.items()}
+    if isinstance(value, list):
+        return [interpolate(v, env, path + (i,), touched) for i, v in enumerate(value)]
+    if isinstance(value, str) and "${" in value:
+        def repl(m):
+            name = m.group(1)
+            if name not in env:
+                raise SynthError("UNKNOWN_ENV_VAR", "%s is not defined" % name)
+            return env[name]
+        new = ENV_TOKEN_RE.sub(repl, value)
+        if new != value or ENV_TOKEN_RE.search(value):
+            touched.add(path)
+        return new
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -315,8 +432,52 @@ def is_positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def validate(doc):
+class ValidationContext:
+    def __init__(self, merged=None, fragment_paths=None, interpolated=None):
+        self.merged = merged
+        self.fragment_paths = fragment_paths or {}
+        self.interpolated = interpolated or set()
+
+    def _source_at(self, path):
+        node = self.merged
+        if node is None:
+            return None
+        for key in path:
+            if isinstance(node.value, dict) and key in node.value:
+                node = node.value[key]
+            else:
+                return None
+        return node.source
+
+    def from_fragment(self, path):
+        source = self._source_at(path)
+        if source is None:
+            return False
+        record = self.fragment_paths.get(source, ())
+        return any(tuple(path[:i]) in record for i in range(len(path) + 1))
+
+    def require_object(self, value, path, label):
+        if isinstance(value, dict):
+            return
+        if self.from_fragment(path):
+            raise SynthError("INVALID_TEMPLATE",
+                             "fragment inlined at %s evaluates to %s, but an object is required"
+                             % (label, json_type(value)))
+        raise SynthError("INVALID_VALUE", "%s must be an object" % label)
+
+    def empty_interpolated(self, value, path):
+        return (path in self.interpolated and isinstance(value, str)
+                and not value.strip())
+
+
+def validate(doc, ctx=None):
+    if ctx is None:
+        ctx = ValidationContext()
     if not isinstance(doc, dict):
+        if ctx.from_fragment(()):
+            raise SynthError("INVALID_TEMPLATE",
+                             "fragment at document root evaluates to %s, but an object is "
+                             "required" % json_type(doc))
         raise SynthError("INVALID_STRUCTURE",
                          "merged document must be an object, got %s" % json_type(doc))
     for key in ("experiment_name", "training", "resources"):
@@ -324,17 +485,17 @@ def validate(doc):
             raise SynthError("MISSING_KEY", "%s is required" % key)
 
     name = doc["experiment_name"]
+    if ctx.empty_interpolated(name, ("experiment_name",)):
+        raise SynthError("MISSING_KEY", "experiment_name is empty after interpolation")
     if not isinstance(name, str):
         raise SynthError("INVALID_VALUE", "experiment_name must be a string")
     if not name.strip() or not any(not c.isspace() and c.isprintable() for c in name):
         raise SynthError("INVALID_VALUE", "experiment_name must contain non-whitespace characters")
 
-    if not isinstance(doc["training"], dict):
-        raise SynthError("INVALID_VALUE", "training must be an object")
+    ctx.require_object(doc["training"], ("training",), "training")
 
     resources = doc["resources"]
-    if not isinstance(resources, dict):
-        raise SynthError("INVALID_VALUE", "resources must be an object")
+    ctx.require_object(resources, ("resources",), "resources")
     if "accelerators" not in resources and "profile" not in resources:
         raise SynthError("MISSING_KEY", "resources.accelerators or resources.profile is required")
 
@@ -346,13 +507,19 @@ def validate(doc):
             where = "resources.accelerators[%d]" % idx
             if not isinstance(acc, dict):
                 raise SynthError("INVALID_VALUE", "%s must be an object" % where)
+            if ctx.empty_interpolated(acc.get("type"), ("resources", "accelerators", idx, "type")):
+                raise SynthError("MISSING_KEY", "%s.type is empty after interpolation" % where)
             if "type" not in acc or not isinstance(acc["type"], str):
                 raise SynthError("INVALID_VALUE", "%s.type must be a string" % where)
             if "count" not in acc or not is_positive_int(acc["count"]):
                 raise SynthError("INVALID_VALUE", "%s.count must be a positive integer" % where)
 
-    if "profile" in resources and not isinstance(resources["profile"], str):
-        raise SynthError("INVALID_VALUE", "resources.profile must be a string")
+    if "profile" in resources:
+        if ctx.empty_interpolated(resources["profile"], ("resources", "profile")) \
+                and "accelerators" not in resources:
+            raise SynthError("MISSING_KEY", "resources.profile is empty after interpolation")
+        if not isinstance(resources["profile"], str):
+            raise SynthError("INVALID_VALUE", "resources.profile must be a string")
 
     if "world_size" in resources and not is_positive_int(resources["world_size"]):
         raise SynthError("INVALID_VALUE", "resources.world_size must be a positive integer")
@@ -385,11 +552,25 @@ def run(argv):
         if text.strip():
             layers.append(("flags.json", parse_json(text, "flags.json")))
 
-    parse_env(args["env"])
+    env = parse_env(args["env"])
 
     warnings = []
-    merged = None
+    fragments_dir = args["fragments"]
+    resolver = FragmentResolver(fragments_dir, warnings)
+    fragment_paths = {}
+    expanded_layers = []
     for source, data in layers:
+        if data is None:
+            expanded_layers.append((source, data))
+            continue
+        data, record = resolver.expand_layer(data)
+        fragment_paths[source] = record
+        expanded_layers.append((source, data))
+        if source == "defaults.yaml":
+            defaults = data
+
+    merged = None
+    for source, data in expanded_layers:
         if data is None:
             continue  # empty document: absent layer
         if merged is None:
@@ -403,9 +584,13 @@ def run(argv):
     if isinstance(doc, dict) and isinstance(defaults, dict):
         for key, value in defaults.items():
             if key not in doc:
-                doc[key] = value
+                doc[key] = copy.deepcopy(value)
 
-    validate(doc)
+    # Environment interpolation (post-merge; never produces warnings).
+    interpolated = set()
+    doc = interpolate(doc, env, (), interpolated)
+
+    validate(doc, ValidationContext(merged, fragment_paths, interpolated))
 
     out_dir = args["out"]
     try:
