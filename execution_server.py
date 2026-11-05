@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Tiny local runner HTTP API (stdlib only)."""
 import argparse
+import bz2
+import csv
 import glob
+import gzip
+import io
 import json
 import math
 import os
@@ -92,8 +96,6 @@ def validate(body):
         raise ClientError("'files' must be an object of path to string", "INVALID_FIELD")
     clean_files = {}
     for path, content in files.items():
-        if not isinstance(content, str):
-            raise ClientError(f"content of file {path!r} must be a string", "INVALID_FIELD")
         if not isinstance(path, str) or not path or "\x00" in path:
             raise ClientError(f"invalid file path: {path!r}", "INVALID_FIELD")
         if os.path.isabs(path) or path.startswith("/") or path.startswith("\\"):
@@ -104,7 +106,7 @@ def validate(body):
             raise ClientError(f"file path escapes working directory: {path!r}", "INVALID_FIELD")
         if path.endswith("/"):
             raise ClientError(f"file path must name a file: {path!r}", "INVALID_FIELD")
-        clean_files[norm] = content
+        clean_files[norm] = encode_file(path, content)
 
     stdin = body.get("stdin")
     if stdin is None:
@@ -127,6 +129,141 @@ def validate(body):
     track = validate_track(body.get("track"))
 
     return command, env, clean_files, stdin, float(timeout), track
+
+
+COMPRESSIONS = {".gz": "gz", ".bz2": "bz2"}
+JSON_EXTS = {".json"}
+YAML_EXTS = {".yaml", ".yml"}
+JSONL_EXTS = {".jsonl", ".ndjson"}
+TABLE_EXTS = {".csv": ",", ".tsv": "\t"}
+
+
+def _suffixes(path):
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    parts = name.split(".")
+    if len(parts) <= 1:
+        return []
+    # A leading dot (hidden file) is not an extension separator.
+    if parts[0] == "":
+        parts = parts[1:]
+        if len(parts) <= 1:
+            return []
+    return ["." + p.lower() for p in parts[1:]]
+
+
+def _bad(path, msg):
+    return ClientError(f"file {path!r}: {msg}", "INVALID_FIELD")
+
+
+def _json_dumps(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False)
+
+
+def _to_rows(path, value):
+    """Normalize a 'dict of columns' or 'list of rows' value into a list of rows."""
+    if isinstance(value, dict):
+        cols = sorted(value.keys())
+        for c in cols:
+            if not isinstance(value[c], list):
+                raise _bad(path, "dict of columns must map column names to arrays")
+        n = max((len(value[c]) for c in cols), default=0)
+        rows = []
+        for i in range(n):
+            row = {}
+            for c in cols:
+                if i < len(value[c]):
+                    row[c] = value[c][i]
+            rows.append(row)
+        return rows
+    if isinstance(value, list):
+        return value
+    raise _bad(path, "expected a dict of columns or a list of rows")
+
+
+def _cell(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)):
+        return _json_dumps(v)
+    return _json_dumps(v)
+
+
+def _serialize_table(path, value, delimiter):
+    if isinstance(value, str):
+        return value if value else "\n"
+    rows = _to_rows(path, value)
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
+    if all(isinstance(r, dict) for r in rows):
+        header = sorted({k for r in rows for k in r})
+        w.writerow(header)
+        for r in rows:
+            w.writerow([_cell(r.get(k)) for k in header])
+    elif all(isinstance(r, list) for r in rows):
+        for r in rows:
+            w.writerow([_cell(c) for c in r])
+    else:
+        raise _bad(path, "rows must all be objects or all be arrays")
+    out = buf.getvalue()
+    return out if out else "\n"
+
+
+def _serialize_jsonl(path, value):
+    if isinstance(value, str):
+        return value
+    rows = _to_rows(path, value)
+    return "".join(_json_dumps(r) + "\n" for r in rows)
+
+
+def _serialize_yaml(value):
+    try:
+        import yaml
+    except ImportError:  # JSON is valid YAML
+        return _json_dumps(value) + "\n"
+    return yaml.safe_dump(value, sort_keys=False, default_flow_style=False,
+                          allow_unicode=True)
+
+
+def encode_file(path, content):
+    """Turn a request file value into the bytes to write on disk."""
+    sfx = _suffixes(path)
+    comp = None
+    if sfx and sfx[-1] in COMPRESSIONS:
+        comp = COMPRESSIONS[sfx[-1]]
+        sfx = sfx[:-1]
+        if sfx and sfx[-1] in COMPRESSIONS:
+            raise _bad(path, "multiple compression extensions are not allowed")
+    base = sfx[-1] if sfx else ""
+
+    try:
+        if base in JSON_EXTS:
+            text = content if isinstance(content, str) else _json_dumps(content) + "\n"
+        elif base in YAML_EXTS:
+            text = content if isinstance(content, str) else _serialize_yaml(content)
+        elif base in JSONL_EXTS:
+            text = _serialize_jsonl(path, content)
+        elif base in TABLE_EXTS:
+            text = _serialize_table(path, content, TABLE_EXTS[base])
+        else:
+            if isinstance(content, str):
+                text = content
+            elif content is None:
+                raise _bad(path, "content must not be null")
+            else:
+                text = _json_dumps(content)
+    except (ValueError, RecursionError) as e:
+        raise _bad(path, f"cannot serialize content: {e}")
+
+    data = text.encode("utf-8")
+    if comp == "gz":
+        data = gzip.compress(data, mtime=0)
+    elif comp == "bz2":
+        data = bz2.compress(data)
+    return data
 
 
 def validate_track(track):
@@ -196,7 +333,7 @@ def execute(command, env, files, stdin, timeout, track=None):
             d = os.path.dirname(full)
             try:
                 os.makedirs(d, exist_ok=True)
-                with open(full, "w", encoding="utf-8") as f:
+                with open(full, "wb") as f:
                     f.write(content)
             except (IsADirectoryError, NotADirectoryError, FileExistsError) as e:
                 raise ClientError(f"cannot create file {rel!r}: {e.strerror}", "INVALID_FIELD")
