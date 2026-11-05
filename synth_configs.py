@@ -10,6 +10,8 @@ Part 2: every layer has its `{{fragment:<name>}}` placeholders expanded
 (recursively, from --fragments) before merging, and `${VAR}` tokens in string
 values are interpolated from env.list after merging.
 """
+import csv
+import io
 import json
 import math
 import os
@@ -20,15 +22,16 @@ import yaml
 
 
 class SynthError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, path=None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.path = path
 
 
 REQUIRED_SECTIONS = ("experiment_name", "training", "resources")
-FLAG_NAMES = ("base", "overrides", "fragments", "flags", "env", "out")
-OPTIONAL_FLAGS = ("fragments",)
+FLAG_NAMES = ("base", "overrides", "fragments", "flags", "env", "out", "manifest")
+OPTIONAL_FLAGS = ("fragments", "manifest")
 
 
 # --------------------------------------------------------------------------
@@ -56,9 +59,10 @@ def parse_args(argv):
             raise SynthError("INVALID_INPUT", "duplicate --out flag")
         values[name] = value  # last occurrence wins
         i += 1
+    optional = OPTIONAL_FLAGS + (("flags",) if "manifest" in values else ())
     for name in FLAG_NAMES:
         if name not in values:
-            if name in OPTIONAL_FLAGS:
+            if name in optional:
                 continue
             raise SynthError("INVALID_INPUT", "missing required flag --%s" % name)
         if values[name] == "":
@@ -291,6 +295,11 @@ class FragmentResolver:
         self.cache[name] = (data, inline_reason)
         return self.cache[name]
 
+    def reset_warnings(self):
+        """Start a new run: deprecation notices are emitted once per run."""
+        self.warned = set()
+        self.warnings = []
+
     def _deprecation(self, name, inline_reason):
         if name in self.warned:
             return
@@ -321,16 +330,23 @@ class FragmentResolver:
         if m is None:
             if FRAGMENT_ANY_RE.search(value):
                 raise SynthError("INVALID_TEMPLATE",
-                                 "malformed fragment placeholder at %s: %r" % (pointer or "/", value))
+                                 "malformed fragment placeholder at %s: %r" % (pointer or "/", value),
+                                 pointer or "/")
             return value
         name = m.group(1)
         if not FRAGMENT_NAME_RE.match(name):
             raise SynthError("INVALID_TEMPLATE",
-                             "invalid fragment name %r at %s" % (name, pointer or "/"))
+                             "invalid fragment name %r at %s" % (name, pointer or "/"), pointer or "/")
         if name in stack:
             cycle = list(stack[stack.index(name):]) + [name]
-            raise SynthError("FRAGMENT_CYCLE", "fragment cycle detected: %s" % " -> ".join(cycle))
-        data, inline_reason = self._load(name)
+            raise SynthError("FRAGMENT_CYCLE", "fragment cycle detected: %s" % " -> ".join(cycle),
+                              pointer or "/")
+        try:
+            data, inline_reason = self._load(name)
+        except SynthError as exc:
+            if exc.path is None:
+                exc.path = pointer or "/"
+            raise
         self._deprecation(name, inline_reason)
         result = self.expand(data, pointer, stack + (name,))
         self._check_position(name, result, pointer)
@@ -343,19 +359,19 @@ class FragmentResolver:
         if pointer in OBJECT_POSITIONS or ACCEL_ITEM_RE.match(pointer):
             if rtype != "object":
                 raise SynthError("INVALID_TEMPLATE",
-                                 "fragment %r evaluates to %s but %s requires an object" % (name, rtype, where))
+                                 "fragment %r evaluates to %s but %s requires an object" % (name, rtype, where), where)
             return
         if pointer in ARRAY_POSITIONS:
             if rtype != "array":
                 raise SynthError("INVALID_TEMPLATE",
-                                 "fragment %r evaluates to %s but %s requires an array" % (name, rtype, where))
+                                 "fragment %r evaluates to %s but %s requires an array" % (name, rtype, where), where)
             return
         if pointer in STRING_POSITIONS and rtype in ("object", "array"):
             raise SynthError("INVALID_TEMPLATE",
-                             "fragment %r evaluates to %s but %s requires a string" % (name, rtype, where))
+                             "fragment %r evaluates to %s but %s requires a string" % (name, rtype, where), where)
         if rtype == "array":
             raise SynthError("INVALID_TEMPLATE",
-                             "fragment %r evaluates to an array; fragments must be objects or scalars" % name)
+                             "fragment %r evaluates to an array; fragments must be objects or scalars" % name, where)
 
 
 # --------------------------------------------------------------------------
@@ -376,7 +392,7 @@ def interpolate(value, env, pointer, touched):
     def repl(m):
         var = m.group(1)
         if var not in env:
-            raise SynthError("UNKNOWN_ENV_VAR", "%s is not defined" % var)
+            raise SynthError("UNKNOWN_ENV_VAR", "%s is not defined" % var, pointer or "/")
         return env[var]
 
     out = ENV_TOKEN_RE.sub(repl, value)
@@ -413,14 +429,21 @@ def deep_merge(low, high, pointer, low_src, high_src, warnings, sources):
     layer each leaf/value came from (used for warning messages)."""
     if isinstance(low, dict) and isinstance(high, dict):
         result = dict(low)
-        src_map = dict(sources) if isinstance(sources, dict) else {}
+        if isinstance(sources, dict):
+            src_map = dict(sources)
+        else:
+            # whole subtree came from a single layer
+            if isinstance(sources, str):
+                low_src = sources
+            src_map = {k: low_src for k in low}
         for key in sorted(high.keys()):
             child_ptr = pointer + "/" + escape_pointer(key)
             if key in low:
-                child_low_src = src_map.get(key, low_src)
+                child_sources = src_map.get(key, low_src)
+                child_low_src = _src_name(child_sources, low_src)
                 result[key], src_map[key] = deep_merge(
                     low[key], high[key], child_ptr, child_low_src, high_src,
-                    warnings, child_low_src,
+                    warnings, child_sources,
                 )
             else:
                 result[key] = high[key]
@@ -428,7 +451,7 @@ def deep_merge(low, high, pointer, low_src, high_src, warnings, sources):
         return result, src_map
     if json_type(low) != json_type(high):
         loser = _src_name(sources, low_src)
-        warnings.append("CONFLICT %s %s -> %s" % (pointer or "/", loser, high_src))
+        warnings.append((pointer or "/", loser, high_src))
     return high, high_src
 
 
@@ -476,52 +499,308 @@ def is_pos_int(v):
 
 def validate(doc, interpolated=frozenset()):
     if not isinstance(doc, dict):
-        raise SynthError("INVALID_STRUCTURE", "merged configuration must be an object, got %s" % json_type(doc))
+        raise SynthError("INVALID_STRUCTURE", "merged configuration must be an object, got %s" % json_type(doc), "/")
     for key in REQUIRED_SECTIONS:
         if key not in doc:
-            raise SynthError("MISSING_KEY", "%s is required" % key)
+            raise SynthError("MISSING_KEY", "%s is required" % key, "/" + key)
 
     name = doc["experiment_name"]
     if isinstance(name, str) and "/experiment_name" in interpolated and name.strip() == "":
-        raise SynthError("MISSING_KEY", "experiment_name is empty after interpolation")
+        raise SynthError("MISSING_KEY", "experiment_name is empty after interpolation", "/experiment_name")
     if not isinstance(name, str):
-        raise SynthError("INVALID_VALUE", "experiment_name must be a string")
+        raise SynthError("INVALID_VALUE", "experiment_name must be a string", "/experiment_name")
     if name.strip() == "" or not any(not c.isspace() and c.isprintable() for c in name):
-        raise SynthError("INVALID_VALUE", "experiment_name must contain non-whitespace characters")
+        raise SynthError("INVALID_VALUE", "experiment_name must contain non-whitespace characters",
+                          "/experiment_name")
 
     if not isinstance(doc["training"], dict):
-        raise SynthError("INVALID_VALUE", "training must be an object")
+        raise SynthError("INVALID_VALUE", "training must be an object", "/training")
 
     res = doc["resources"]
     if not isinstance(res, dict):
-        raise SynthError("INVALID_VALUE", "resources must be an object")
+        raise SynthError("INVALID_VALUE", "resources must be an object", "/resources")
     if ("profile" in res and "/resources/profile" in interpolated
             and isinstance(res["profile"], str) and res["profile"].strip() == ""):
-        raise SynthError("MISSING_KEY", "resources.profile is empty after interpolation")
+        raise SynthError("MISSING_KEY", "resources.profile is empty after interpolation", "/resources/profile")
     if "accelerators" not in res and "profile" not in res:
-        raise SynthError("MISSING_KEY", "resources.accelerators or resources.profile is required")
+        raise SynthError("MISSING_KEY", "resources.accelerators or resources.profile is required",
+                          "/resources/accelerators")
     if "accelerators" in res:
         accs = res["accelerators"]
         if not isinstance(accs, list):
-            raise SynthError("INVALID_VALUE", "resources.accelerators must be an array")
+            raise SynthError("INVALID_VALUE", "resources.accelerators must be an array", "/resources/accelerators")
         for i, acc in enumerate(accs):
             if not isinstance(acc, dict):
-                raise SynthError("INVALID_VALUE", "resources.accelerators[%d] must be an object" % i)
+                raise SynthError("INVALID_VALUE", "resources.accelerators[%d] must be an object" % i,
+                                  "/resources/accelerators/%d" % i)
             if "type" not in acc or not isinstance(acc["type"], str):
-                raise SynthError("INVALID_VALUE", "resources.accelerators[%d].type must be a string" % i)
+                raise SynthError("INVALID_VALUE", "resources.accelerators[%d].type must be a string" % i,
+                                  "/resources/accelerators/%d/type" % i)
             if "count" not in acc or not is_pos_int(acc["count"]):
-                raise SynthError("INVALID_VALUE", "resources.accelerators[%d].count must be a positive integer" % i)
+                raise SynthError("INVALID_VALUE", "resources.accelerators[%d].count must be a positive integer" % i,
+                                  "/resources/accelerators/%d/count" % i)
     if "profile" in res and not isinstance(res["profile"], str):
-        raise SynthError("INVALID_VALUE", "resources.profile must be a string")
+        raise SynthError("INVALID_VALUE", "resources.profile must be a string", "/resources/profile")
     if "world_size" in res and not is_pos_int(res["world_size"]):
-        raise SynthError("INVALID_VALUE", "resources.world_size must be a positive integer")
+        raise SynthError("INVALID_VALUE", "resources.world_size must be a positive integer", "/resources/world_size")
 
 
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+MANIFEST_REQUIRED = ("run_id", "override_path")
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def parse_manifest(path):
+    """Parse runs_manifest.csv -> list of row dicts (run_id, override_path,
+    flags_path, notes, line)."""
+    if not os.path.isfile(path) or not os.access(path, os.R_OK):
+        raise SynthError("MISSING_FILE", "manifest not found or unreadable: %s" % path, path)
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise SynthError("MISSING_FILE", "failed to read manifest: %s" % exc, path)
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise SynthError("INVALID_MANIFEST", "manifest is not valid UTF-8", path)
+    try:
+        records = list(csv.reader(io.StringIO(text, newline=""), strict=True))
+    except csv.Error as exc:
+        raise SynthError("INVALID_MANIFEST", "malformed CSV: %s" % exc, path)
+
+    header = None
+    rows = []
+    seen = set()
+    for idx, rec in enumerate(records, 1):
+        if not rec or all(f.strip() == "" for f in rec):
+            continue
+        if rec[0].lstrip().startswith("#"):
+            continue
+        if header is None:
+            header = [h.strip() for h in rec]
+            missing = [c for c in MANIFEST_REQUIRED if c not in header]
+            if missing:
+                raise SynthError("INVALID_MANIFEST",
+                                 "manifest header is missing required column(s): %s" % ", ".join(missing),
+                                 path)
+            dup_cols = sorted({h for h in header if header.count(h) > 1 and h})
+            if dup_cols:
+                raise SynthError("INVALID_MANIFEST",
+                                 "manifest header has duplicate column(s): %s" % ", ".join(dup_cols), path)
+            continue
+        if len(rec) > len(header):
+            raise SynthError("INVALID_MANIFEST",
+                             "manifest record %d has %d fields, header has %d" % (idx, len(rec), len(header)),
+                             path)
+        row = dict(zip(header, rec + [""] * (len(header) - len(rec))))
+        run_id = row["run_id"].strip()
+        if run_id == "":
+            raise SynthError("INVALID_MANIFEST", "manifest record %d has an empty run_id" % idx, path)
+        if not RUN_ID_RE.match(run_id):
+            raise SynthError("INVALID_MANIFEST", "invalid run_id %r (allowed: a-z A-Z 0-9 _ -)" % run_id, path)
+        if run_id in seen:
+            raise SynthError("INVALID_MANIFEST", "duplicate run_id %r" % run_id, path)
+        seen.add(run_id)
+        override = row["override_path"].strip()
+        if override == "":
+            raise SynthError("INVALID_MANIFEST", "run %s has an empty override_path" % run_id, path)
+        flags = (row.get("flags_path") or "").strip()
+        notes = row.get("notes")
+        if notes is not None and notes == "":
+            notes = None
+        rows.append({"run_id": run_id, "override_path": override,
+                     "flags_path": flags or None, "notes": notes})
+    if header is None:
+        raise SynthError("INVALID_MANIFEST", "manifest has no header row", path)
+    if not rows:
+        raise SynthError("INVALID_MANIFEST", "manifest contains no runs", path)
+    return rows
+
+
+def _resolve(manifest_dir, p):
+    return p if os.path.isabs(p) else os.path.join(manifest_dir, p)
+
+
+def _load_run_file(full, label, loader):
+    if not os.path.isfile(full) or not os.access(full, os.R_OK):
+        if os.path.isdir(full):
+            raise SynthError("MISSING_FILE", "%s is a directory, not a file" % label, label)
+        raise SynthError("MISSING_FILE", "%s not found" % label, label)
+    try:
+        return loader(full, label)
+    except OSError as exc:
+        raise SynthError("MISSING_FILE", "failed to read %s: %s" % (label, exc), label)
+    except SynthError as exc:
+        if exc.path is None:
+            exc.path = label
+        raise
+
+
+def _with_path(exc, path):
+    if exc.path is None:
+        exc.path = path
+    return exc
+
+
+def process_run(row, ctx):
+    """Returns (spec_or_None, warnings_list, conflict_count, error_or_None)."""
+    resolver = ctx["resolver"]
+    deprecations = []
+    conflicts = []
+    try:
+        if ctx["global_error"] is not None:
+            raise ctx["global_error"]
+        override_label = row["override_path"]
+        run_doc = _load_run_file(_resolve(ctx["manifest_dir"], override_label), override_label, load_yaml)
+        run_flags = None
+        flags_label = row["flags_path"]
+        if flags_label:
+            run_flags = _load_run_file(_resolve(ctx["manifest_dir"], flags_label), flags_label, load_json)
+
+        resolver.reset_warnings()
+        try:
+            layers = []
+            for name, doc, label in (
+                (ctx["base_name"], ctx["base"], ctx["base_name"]),
+                (ctx["defaults_name"], ctx["defaults"], ctx["defaults_name"]),
+                (override_label, run_doc, override_label),
+                (flags_label, run_flags, flags_label),
+                (ctx["gflags_name"], ctx["gflags"], ctx["gflags_name"]),
+            ):
+                try:
+                    layers.append((name, resolver.expand(doc)))
+                except SynthError as exc:
+                    raise _with_path(exc, label)
+        finally:
+            deprecations = ["FRAGMENT_DEPRECATED %s %s" % (row["run_id"], w[len("FRAGMENT_DEPRECATED "):])
+                            for w in resolver.warnings]
+            deprecations = [w.rstrip() for w in deprecations]
+
+        merged, conflicts = merge_layers(layers)
+        touched = set()
+        merged = interpolate(merged, ctx["env"], "", touched)
+        validate(merged, touched)
+        error = None
+    except SynthError as exc:
+        merged = None
+        error = exc
+    conflict_lines = ["CONFLICT %s %s %s -> %s" % (row["run_id"], p, lo, hi)
+                      for p, lo, hi in sorted(conflicts, key=lambda c: c[0])]
+    return merged, deprecations + conflict_lines, len(conflict_lines), error
+
+
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
+def write_reports(out_dir, summary_runs, warnings, violations):
+    os.makedirs(out_dir, exist_ok=True)
+    ok = sum(1 for r in summary_runs if r["status"] == "ok")
+    summary = {
+        "total_runs": len(summary_runs),
+        "succeeded": ok,
+        "failed": len(summary_runs) - ok,
+        "runs": summary_runs,
+    }
+    write_text(os.path.join(out_dir, "summary.json"),
+               json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    write_text(os.path.join(out_dir, "warnings.txt"), "".join(w + "\n" for w in warnings))
+    write_text(os.path.join(out_dir, "violations.ndjson"),
+               "".join(json.dumps(v, ensure_ascii=False, separators=(",", ":")) + "\n"
+                       for v in violations))
+
+
+def run_manifest(args):
+    out_dir = args["out"]
+    manifest_path = args["manifest"]
+    try:
+        rows = parse_manifest(manifest_path)
+    except SynthError as exc:
+        try:
+            write_reports(out_dir, [], [], [{"run_id": None, "code": exc.code, "message": exc.message,
+                                             "path": exc.path or manifest_path}])
+        except OSError:
+            pass
+        raise
+
+    # Shared inputs. Missing base / defaults / env are fatal for the whole job.
+    base_path = args["base"]
+    if not os.path.isfile(base_path) or not os.access(base_path, os.R_OK):
+        raise SynthError("MISSING_FILE", "base file not found or unreadable: %s" % base_path)
+    defaults_path = os.path.join(args["overrides"], "defaults.yaml")
+    if not os.path.isfile(defaults_path) or not os.access(defaults_path, os.R_OK):
+        raise SynthError("MISSING_FILE", "overrides/defaults.yaml not found or unreadable: %s" % defaults_path)
+    env = parse_env(args["env"])
+
+    ctx = {
+        "manifest_dir": os.path.dirname(os.path.abspath(manifest_path)),
+        "base_name": os.path.basename(base_path) or "base.yaml",
+        "defaults_name": "overrides/defaults.yaml",
+        "gflags_name": os.path.basename(args.get("flags") or "") or "flags.json",
+        "base": None, "defaults": None, "gflags": None,
+        "env": env, "resolver": None, "global_error": None,
+    }
+    try:
+        try:
+            ctx["base"] = load_yaml(base_path, ctx["base_name"])
+        except SynthError as exc:
+            raise _with_path(exc, ctx["base_name"])
+        try:
+            ctx["defaults"] = load_yaml(defaults_path, ctx["defaults_name"])
+        except SynthError as exc:
+            raise _with_path(exc, ctx["defaults_name"])
+        gpath = args.get("flags")
+        if gpath and os.path.isfile(gpath) and os.access(gpath, os.R_OK):
+            try:
+                ctx["gflags"] = load_json(gpath, ctx["gflags_name"])
+            except SynthError as exc:
+                raise _with_path(exc, ctx["gflags_name"])
+        try:
+            ctx["resolver"] = FragmentResolver(args.get("fragments"))
+        except SynthError as exc:
+            raise _with_path(exc, "fragments/meta.yaml")
+    except OSError as exc:
+        ctx["global_error"] = SynthError("MISSING_FILE", "failed to read input: %s" % exc)
+    except SynthError as exc:
+        ctx["global_error"] = exc
+
+    spec_dir = os.path.join(out_dir, "out")
+    os.makedirs(spec_dir, exist_ok=True)
+    summary_runs, all_warnings, violations = [], [], []
+    for row in rows:
+        spec, warns, n_conf, error = process_run(row, ctx)
+        spec_file = os.path.join(spec_dir, row["run_id"] + ".json")
+        if error is None:
+            write_text(spec_file, json.dumps(spec, sort_keys=True, ensure_ascii=False,
+                                             separators=(",", ":")) + "\n")
+        else:
+            if os.path.isfile(spec_file):
+                os.remove(spec_file)  # never leave a stale spec for a failed run
+            violations.append({"run_id": row["run_id"], "code": error.code,
+                               "message": error.message, "path": error.path or ""})
+        all_warnings.extend(warns)
+        summary_runs.append({
+            "run_id": row["run_id"],
+            "status": "ok" if error is None else "error",
+            "warnings": len(warns),
+            "conflicts": n_conf,
+            "notes": row["notes"],
+        })
+
+    write_reports(out_dir, summary_runs, all_warnings, violations)
+    if not any(r["status"] == "ok" for r in summary_runs):
+        raise SynthError("RUN_FAILURE", "all %d run(s) failed" % len(summary_runs))
+    return 0
+
+
 def run(argv):
     args = parse_args(argv)
+    if "manifest" in args:
+        return run_manifest(args)
 
     base_path = args["base"]
     if not os.path.isfile(base_path) or not os.access(base_path, os.R_OK):
@@ -550,7 +829,7 @@ def run(argv):
     merged, conflicts = merge_layers(
         [("base.yaml", base), ("run.yaml", run_doc), ("flags.json", flags)]
     )
-    warnings = resolver.warnings + conflicts
+    warnings = resolver.warnings + ["CONFLICT %s %s -> %s" % c for c in conflicts]
 
     # Defaults injection: fill keys missing at any depth (never override).
     if isinstance(merged, dict) and isinstance(defaults, dict):
