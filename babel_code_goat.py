@@ -5,6 +5,18 @@ python / javascript / typescript / cpp / rust and run it against a solution.
 Commands:
     generate <tests_dir> --entrypoint <name> --lang <python|javascript|typescript|cpp|rust>
     test <solution_path> <tests_dir> --lang <python|javascript|typescript|cpp|rust> [--timeout SECONDS] [--tol FLOAT]
+         [--list-tests] [--run <test_id>]... [--timeout-ms <int>] [--total-timeout-ms <int>]
+
+``test`` selection / timeouts: ``--list-tests`` only discovers (status "pass", passed = all ids);
+``--run <id>`` (repeatable) restricts the run to the given ids; ``--timeout-ms`` bounds each test;
+``--total-timeout-ms`` bounds the whole execution. Tests that time out or are never executed
+are reported in ``failed``.
+
+Async: tests may use ``async def`` / ``await`` / ``asyncio.run(...)`` (pytest asyncio markers are
+accepted). Every target drives the entrypoint's result to completion: Python awaitables run
+on a fresh event loop, JS/TS promises are awaited, C++ std::future / shared_future / coroutine
+task types (``promise_type`` + ``get()``) are waited on, and Rust futures (``async fn``,
+``impl Future``, ``Pin<Box<dyn Future>>``) are polled by a built-in block_on executor.
 
 C++ / Rust: ``generate`` writes tester.cpp / tester.rs; ``test`` compiles it together with the
 solution (a single .cpp / .rs file; g++/clang++ with C++17 or later, rustc 2021 edition) and
@@ -322,7 +334,7 @@ def _module_of(ctx, func):
     return None
 
 
-KNOWN_MODULES = {"collections", "decimal", "math", "re", "builtins", "pytest", "typing"}
+KNOWN_MODULES = {"collections", "decimal", "math", "re", "builtins", "pytest", "typing", "asyncio"}
 
 
 def is_value_call(node, ctx, entrypoint=None):
@@ -1917,6 +1929,105 @@ def _defines_entrypoint(tree, entrypoint):
     return False
 
 
+ASYNC_RUNNERS = {"run", "wait_for", "shield", "ensure_future", "create_task"}
+ASYNC_MARKS = {"asyncio", "anyio", "trio"}
+
+
+class _AsyncNormalizer(ast.NodeTransformer):
+    """Rewrite async test code into its synchronous equivalent: ``await X`` -> ``X``,
+    ``asyncio.run(X)`` / ``asyncio.wait_for(X, t)`` / ``loop.run_until_complete(X)`` -> ``X``,
+    ``async def`` -> ``def`` (dropping ``@pytest.mark.asyncio``-style markers). The harness
+    drives the entrypoint's awaitable to completion in every target language."""
+
+    def __init__(self, tree):
+        self.asyncio_names = {"asyncio"}
+        self.runner_names = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.name == "asyncio":
+                        self.asyncio_names.add(a.asname or a.name)
+            elif isinstance(n, ast.ImportFrom) and n.module == "asyncio":
+                for a in n.names:
+                    if a.name in ASYNC_RUNNERS:
+                        self.runner_names.add(a.asname or a.name)
+
+    def _is_runner(self, func):
+        if isinstance(func, ast.Name):
+            return func.id in self.runner_names
+        if isinstance(func, ast.Attribute):
+            if func.attr == "run_until_complete":
+                return True
+            if func.attr in ASYNC_RUNNERS and isinstance(func.value, ast.Name) \
+                    and func.value.id in self.asyncio_names:
+                return True
+        return False
+
+    @staticmethod
+    def _is_mark(dec):
+        d = dec.func if isinstance(dec, ast.Call) else dec
+        return (isinstance(d, ast.Attribute) and d.attr in ASYNC_MARKS
+                and isinstance(d.value, ast.Attribute) and d.value.attr == "mark")
+
+    def visit_Await(self, node):
+        return ast.copy_location(self.visit(node.value), node)
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        if self._is_runner(node.func) and len(node.args) >= 1 \
+                and not isinstance(node.args[0], ast.Starred):
+            return node.args[0]
+        return node
+
+    def _func(self, node):
+        node.decorator_list = [d for d in node.decorator_list if not self._is_mark(d)]
+        self.generic_visit(node)
+        return node
+
+    def visit_FunctionDef(self, node):
+        return self._func(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        node = self._func(node)
+        new = ast.FunctionDef(name=node.name, args=node.args, body=node.body,
+                              decorator_list=node.decorator_list, returns=node.returns,
+                              type_comment=getattr(node, "type_comment", None))
+        if hasattr(node, "type_params"):
+            new.type_params = node.type_params
+        return ast.copy_location(new, node)
+
+    def visit_AsyncWith(self, node):
+        self.generic_visit(node)
+        return ast.copy_location(ast.With(items=node.items, body=node.body,
+                                          type_comment=getattr(node, "type_comment", None)), node)
+
+    def visit_ClassDef(self, node):
+        node.decorator_list = [d for d in node.decorator_list if not self._is_mark(d)]
+        self.generic_visit(node)
+        return node
+
+    def visit_Module(self, node):
+        self.generic_visit(node)
+        # module-level ``pytestmark = pytest.mark.asyncio`` markers are no-ops
+        body = []
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+                    and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "pytestmark":
+                v = stmt.value
+                vals = v.elts if isinstance(v, (ast.List, ast.Tuple)) else [v]
+                if all(self._is_mark(x) for x in vals):
+                    continue
+            body.append(stmt)
+        node.body = body
+        return node
+
+
+def normalize_async(tree):
+    tree = _AsyncNormalizer(tree).visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def _discover_file(path, rel, entrypoint):
     try:
         with open(path, "rb") as f:
@@ -1930,6 +2041,7 @@ def _discover_file(path, rel, entrypoint):
         raise DiscoveryError(f"syntax error in {rel}: {e}")
     if _defines_entrypoint(tree, entrypoint):
         return None
+    tree = normalize_async(tree)
     d = Discoverer(source, entrypoint)
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2447,6 +2559,34 @@ def _check_msg(msg, chk):
     return found != neg
 
 
+def _complete(value):
+    """Run an awaitable (coroutine, future, task, async generator result) to completion."""
+    if not inspect.isawaitable(value):
+        return value
+    import asyncio
+
+    async def _drive():
+        return await value
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(_drive())
+        finally:
+            try:
+                pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except BaseException:
+                pass
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
 def _run_one(t, factory, cap):
     kind = t["kind"]
     extra = t.get("extra") or {}
@@ -2458,7 +2598,7 @@ def _run_one(t, factory, cap):
     try:
         try:
             fn = factory()
-            result = raw = fn(*args, **kwargs)
+            result = raw = _complete(fn(*args, **kwargs))
             xf = t["xf"]()
             if xf is not None:
                 result = _ev(xf, raw, None, args, kwargs)
@@ -4219,6 +4359,7 @@ CPP_RUNTIME = r'''
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <list>
@@ -4958,6 +5099,31 @@ struct Capture {
   }
 };
 
+// ---- async results: futures / coroutine tasks are driven to completion -----------------
+template <class T> struct IsStdFuture : std::false_type {};
+template <class T> struct IsStdFuture<std::future<T>> : std::true_type {};
+template <class T> struct IsStdFuture<std::shared_future<T>> : std::true_type {};
+template <class T, class = void> struct IsTask : std::false_type {};
+template <class T>
+struct IsTask<T, std::void_t<typename T::promise_type, decltype(std::declval<T&>().get())>> : std::true_type {};
+template <class T, class = void> struct IsSyncWaitable : std::false_type {};
+template <class T>
+struct IsSyncWaitable<T, std::void_t<typename T::promise_type, decltype(std::declval<T&>().sync_wait())>> : std::true_type {};
+
+template <class R>
+Value complete_value(R&& r) {
+  using S = storage_t<R>;
+  if constexpr (IsStdFuture<S>::value || IsTask<S>::value) {
+    if constexpr (std::is_void_v<decltype(r.get())>) { r.get(); return mk('N'); }
+    else { decltype(auto) v = r.get(); return complete_value(v); }
+  } else if constexpr (IsSyncWaitable<S>::value) {
+    if constexpr (std::is_void_v<decltype(r.sync_wait())>) { r.sync_wait(); return mk('N'); }
+    else { decltype(auto) v = r.sync_wait(); return complete_value(v); }
+  } else {
+    return Conv<S>::to(r);
+  }
+}
+
 template <class F, class Tr, class... A, size_t... I>
 void invoke_impl(F fn, std::vector<Value>& args, Outcome& o, Capture& cap, std::tuple<A...>*, std::index_sequence<I...>) {
   using Tup = std::tuple<storage_t<A>...>;
@@ -4986,7 +5152,7 @@ void invoke_impl(F fn, std::vector<Value>& args, Outcome& o, Capture& cap, std::
           o.ret = mk('N');
         } else {
           decltype(auto) r = (obj.*fn)(pass<A>(std::get<I>(*st))...);
-          o.ret = Conv<storage_t<R>>::to(r);
+          o.ret = complete_value(r);
         }
       } else {
         throw ConvError("entrypoint class is not default-constructible");
@@ -4997,7 +5163,7 @@ void invoke_impl(F fn, std::vector<Value>& args, Outcome& o, Capture& cap, std::
         o.ret = mk('N');
       } else {
         decltype(auto) r = fn(pass<A>(std::get<I>(*st))...);
-        o.ret = Conv<storage_t<R>>::to(r);
+        o.ret = complete_value(r);
       }
     }
   } catch (const std::exception& e) {
@@ -5637,6 +5803,36 @@ pub mod bcg {
             let rd = |suffix: &str| std::fs::read(format!("{}{}", self.base, suffix)).unwrap_or_default();
             (rd(".out"), rd(".err"))
         }
+    }
+
+    // ---- async: futures returned by the entrypoint are driven to completion ----
+    pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        use std::task::{Context, Poll, Wake, Waker};
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: std::sync::Arc<Self>) { self.0.unpark(); }
+            fn wake_by_ref(self: &std::sync::Arc<Self>) { self.0.unpark(); }
+        }
+        let waker = Waker::from(std::sync::Arc::new(ThreadWaker(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut f = Box::pin(f);
+        loop {
+            match f.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+    pub struct Done<T>(pub std::cell::Cell<Option<T>>);
+    pub trait DoneFut { type Out; fn bcg_done(self) -> Self::Out; }
+    impl<F: std::future::Future> DoneFut for Done<F> {
+        type Out = F::Output;
+        fn bcg_done(self) -> F::Output { block_on(self.0.into_inner().unwrap()) }
+    }
+    pub trait DoneVal { type Out; fn bcg_done(self) -> Self::Out; }
+    impl<'a, T> DoneVal for &'a Done<T> {
+        type Out = T;
+        fn bcg_done(self) -> T { self.0.take().unwrap() }
     }
 
     pub struct Outcome {
@@ -6410,7 +6606,7 @@ def rust_glue(src, entrypoint):
     else:
         call = f"{call_base}({', '.join(call_args)})"
     lines.append("    __cap.start();")
-    lines.append(f"    let __r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ let __ret = {call}; bcg::ToVal::to_ret(&__ret) }}));")
+    lines.append(f"    let __r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ #[allow(unused_imports)] use bcg::{{DoneFut as _, DoneVal as _}}; let __ret = bcg::Done(std::cell::Cell::new(Some({call}))).bcg_done(); bcg::ToVal::to_ret(&__ret) }}));")
     lines.append("    let __c = __cap.stop();")
     lines.append(f"    let __post = vec![{', '.join(post)}];")
     lines.append("    bcg::Outcome::finish(__r, __post, __c)")
@@ -6552,7 +6748,7 @@ def build_native(lang, tester_path, solution, workdir):
                 f.write("#define BCG_PARAM_NAMES {" + "".join(_c_str(x or "") + ", " for x in names) + "nullptr}\n")
                 f.write('#include "tester_src.cpp"\n')
             out = os.path.join(workdir, f"bin{idx}")
-            attempts.append(([cxx, f"-std={std}", "-O2", "-w", "-o", out, main_src], out))
+            attempts.append(([cxx, f"-std={std}", "-O2", "-w", "-pthread", "-o", out, main_src], out))
         return _compile_cached(["cpp", cxx, entry, repr(names), sol_src, tester_src], attempts, workdir)
     rustc = os.environ.get("RUSTC") or shutil.which("rustc")
     if not rustc:
@@ -6777,13 +6973,36 @@ def parse_events(path):
     return events
 
 
-def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judge=None):
-    """Run tests; return (results: id->bool, error: bool)."""
+def _kill(proc):
+    try:
+        os.killpg(proc.pid, 9)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait()
+    except Exception:
+        pass
+
+
+def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judge=None,
+               deadline=None, startup=None):
+    """Run tests; return (results: id->bool, error: bool).
+
+    ``timeout`` bounds each test (seconds without progress); ``startup`` bounds the time
+    until the first test starts; ``deadline`` (time.monotonic()) bounds the whole run --
+    tests still running or not yet executed when it passes are left without a result."""
     results = {}
     remaining = list(ids)
     error = False
     attempt = 0
+    if startup is None:
+        startup = timeout
     while remaining:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         attempt += 1
         res_path = os.path.join(workdir, f"results{attempt}.jsonl")
         ids_path = os.path.join(workdir, f"ids{attempt}.json")
@@ -6807,9 +7026,10 @@ def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judg
         except Exception:
             error = True
             break
-        last_size = -1
+        last_size = 0
         last_progress = time.monotonic()
         killed = False
+        expired = False
         while True:
             rc = proc.poll()
             try:
@@ -6822,18 +7042,15 @@ def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judg
                 last_progress = now
             if rc is not None:
                 break
-            if now - last_progress > timeout:
-                killed = True
-                try:
-                    os.killpg(proc.pid, 9)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                proc.wait()
+            if deadline is not None and now >= deadline:
+                killed = expired = True
+                _kill(proc)
                 break
-            time.sleep(0.01)
+            if now - last_progress > (timeout if last_size else startup):
+                killed = True
+                _kill(proc)
+                break
+            time.sleep(0.005)
         events = parse_events(res_path)
         started = None
         done = False
@@ -6864,7 +7081,7 @@ def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judg
         if started is not None and started not in results:
             results[started] = False  # crashed or timed out mid-test
         remaining = [i for i in remaining if i not in results]
-        if done:
+        if done or expired:
             break
         if not progressed:
             error = True
@@ -6881,6 +7098,8 @@ def emit_result(status, passed, failed):
 
 def cmd_test(opts):
     pos = opts["pos"]
+    if opts.get("list_tests") and len(pos) == 1:
+        pos = [None, pos[0]]
     if len(pos) < 2:
         return emit_result("error", [], [])
     solution, tests_dir = pos[0], pos[1]
@@ -6890,7 +7109,7 @@ def cmd_test(opts):
     ep = opts.get("entrypoint")
     if not ep and meta and isinstance(meta.get("entrypoint"), str):
         ep = meta["entrypoint"]
-    excl = [solution]
+    excl = [solution] if solution else []
     try:
         tests, ep = discover(tests_dir, ep, excl)
     except DiscoveryError:
@@ -6905,9 +7124,23 @@ def cmd_test(opts):
     for t in tests:
         if t["id"] not in ids:
             ids.append(t["id"])
+    selected = opts.get("run")
+    if selected is not None:
+        known = set(ids)
+        if not selected or any(x not in known for x in selected):
+            return emit_result("error", [], [x for x in selected if x in known])
+        ids = [i for i in ids if i in set(selected)]
+        tests = [t for t in tests if t["id"] in set(selected)]
+    if opts.get("list_tests"):
+        return emit_result("pass", ids, [])
     if lang not in LANGS or not os.path.isfile(tester_path) or not os.path.isfile(solution):
         return emit_result("error", [], ids)
     timeout = opts.get("timeout", DEFAULT_TIMEOUT)
+    startup = timeout
+    if "timeout_ms" in opts:
+        timeout = opts["timeout_ms"] / 1000.0
+        startup = max(timeout, opts.get("timeout", DEFAULT_TIMEOUT))
+    total = opts.get("total_timeout_ms")
     workdir = tempfile.mkdtemp(prefix="bcg-run-")
     try:
         prefix = build_command(lang, os.path.abspath(tester_path), workdir, os.path.abspath(solution))
@@ -6916,8 +7149,9 @@ def cmd_test(opts):
         static = {t["id"]: bool(t["ok"]) for t in tests if t["kind"] == "loop"}
         run_ids = [i for i in ids if i not in static]
         judge = NativeJudge(tests, opts.get("tol")).judge if lang in NATIVE_LANGS else None
+        deadline = None if total is None else time.monotonic() + total / 1000.0
         results, error = run_tester(prefix, os.path.abspath(solution), run_ids, timeout, workdir,
-                                    lang, opts.get("tol"), judge)
+                                    lang, opts.get("tol"), judge, deadline, startup)
         results.update(static)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -6934,7 +7168,15 @@ def cmd_test(opts):
 
 def parse_args(argv):
     opts = {"pos": []}
-    valued = {"--entrypoint": "entrypoint", "--lang": "lang", "--timeout": "timeout", "--tol": "tol"}
+    valued = {"--entrypoint": "entrypoint", "--lang": "lang", "--timeout": "timeout", "--tol": "tol",
+              "--timeout-ms": "timeout_ms", "--total-timeout-ms": "total_timeout_ms", "--run": "run"}
+    flags = {"--list-tests": "list_tests"}
+
+    def put(key, v):
+        if key == "run":
+            opts.setdefault("run", []).append(v)
+        else:
+            opts[key] = v
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -6942,11 +7184,15 @@ def parse_args(argv):
             if "=" in a:
                 k, v = a.split("=", 1)
                 if k in valued:
-                    opts[valued[k]] = v
+                    put(valued[k], v)
+                elif k in flags:
+                    raise ValueError(f"{k} does not take a value")
+            elif a in flags:
+                opts[flags[a]] = True
             elif a in valued:
                 if i + 1 >= len(argv):
                     raise ValueError(f"{a} requires a value")
-                opts[valued[a]] = argv[i + 1]
+                put(valued[a], argv[i + 1])
                 i += 1
             # unknown boolean flags are ignored
         else:
@@ -6959,6 +7205,16 @@ def parse_args(argv):
                 raise ValueError
         except ValueError:
             raise ValueError("--timeout must be a positive number")
+    for key in ("timeout_ms", "total_timeout_ms"):
+        if key in opts:
+            flag = "--" + key.replace("_", "-")
+            try:
+                v = int(str(opts[key]).strip())
+            except ValueError:
+                raise ValueError(f"{flag} must be a positive integer")
+            if v <= 0:
+                raise ValueError(f"{flag} must be a positive integer")
+            opts[key] = v
     if "tol" in opts:
         try:
             opts["tol"] = float(opts["tol"])
