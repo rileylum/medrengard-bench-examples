@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tiny local runner HTTP API: POST /v1/execute, GET /v1/stats/execution."""
+"""Tiny local runner HTTP API: POST /v1/environment, POST /v1/execute,
+GET /v1/stats/execution."""
 import argparse
 import copy
 import hashlib
@@ -119,8 +120,11 @@ class ResultCache:
         self._data = {}
 
     @staticmethod
-    def key(command, env, files, stdin, timeout, track, continue_on_error):
+    def key(command, env, files, stdin, timeout, track, continue_on_error,
+            environment=None, state=None):
         material = {
+            "environment": environment,
+            "state": state,
             "command": command,
             "env": sorted(env.items()),
             "files": sorted((k, v.hex()) for k, v in files.items()),
@@ -143,6 +147,20 @@ class ResultCache:
 
 
 CACHE = ResultCache()
+
+
+def _check_path(path):
+    if (not isinstance(path, str) or not path or "\x00" in path or os.path.isabs(path)
+            or any(p == ".." for p in path.replace("\\", "/").split("/"))):
+        raise ApiError(400, "INVALID_FIELD", f"invalid file path: {path!r}")
+
+
+def encode_files(files):
+    encoded = {}
+    for path, content in files.items():
+        _check_path(path)
+        encoded[path] = encode_file(path, content)
+    return encoded
 
 
 def validate(body):
@@ -178,13 +196,7 @@ def validate(body):
         files = {}
     if not isinstance(files, dict):
         raise ApiError(400, "INVALID_FIELD", "'files' must be an object of strings")
-    encoded_files = {}
-    for path, content in files.items():
-        if (not path or "\x00" in path or os.path.isabs(path)
-                or any(p == ".." for p in path.replace("\\", "/").split("/"))):
-            raise ApiError(400, "INVALID_FIELD", f"invalid file path: {path!r}")
-        encoded_files[path] = encode_file(path, content)
-    files = encoded_files
+    files = encode_files(files)
 
     stdin = body.get("stdin", "")
     if stdin is None:
@@ -444,25 +456,36 @@ def run_one(command, workdir, run_env, stdin, timeout):
     return result, duration
 
 
-def execute(command, env, files, stdin, timeout, track=None, continue_on_error=False):
-    """Run a command (string) or chain (list of steps).
+def write_files(workdir, files):
+    real_root = os.path.realpath(workdir)
+    for rel, content in files.items():
+        target = os.path.realpath(os.path.join(workdir, rel))
+        if not target.startswith(real_root + os.sep):
+            raise ApiError(400, "INVALID_FIELD", f"invalid file path: {rel!r}")
+        parent = os.path.dirname(target)
+        try:
+            os.makedirs(parent, exist_ok=True)
+            if os.path.isdir(target):
+                raise IsADirectoryError(target)
+            with open(target, "wb") as fh:
+                fh.write(content)
+        except (IsADirectoryError, NotADirectoryError, FileExistsError) as e:
+            raise ApiError(400, "INVALID_FIELD", f"cannot create file {rel!r}: {e}")
 
+
+def execute(command, env, files, stdin, timeout, track=None, continue_on_error=False,
+            workdir=None):
+    """Run a command (string) or chain (list of steps) inside ``workdir``.
+
+    If ``workdir`` is None a temporary directory is created and removed afterwards;
+    otherwise the caller owns the directory.
     Returns (response, total_duration, per_command_durations, total_commands).
     """
-    workdir = tempfile.mkdtemp(prefix="exec-")
+    owned = workdir is None
+    if owned:
+        workdir = tempfile.mkdtemp(prefix="exec-")
     try:
-        real_root = os.path.realpath(workdir)
-        for rel, content in files.items():
-            target = os.path.realpath(os.path.join(workdir, rel))
-            if not target.startswith(real_root + os.sep):
-                raise ApiError(400, "INVALID_FIELD", f"invalid file path: {rel!r}")
-            parent = os.path.dirname(target)
-            try:
-                os.makedirs(parent, exist_ok=True)
-                with open(target, "wb") as fh:
-                    fh.write(content)
-            except (IsADirectoryError, NotADirectoryError, FileExistsError) as e:
-                raise ApiError(400, "INVALID_FIELD", f"cannot create file {rel!r}: {e}")
+        write_files(workdir, files)
 
         run_env = dict(os.environ)
         run_env.update(env)
@@ -505,7 +528,219 @@ def execute(command, env, files, stdin, timeout, track=None, continue_on_error=F
         }
         return result, total, durations, len(command)
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        if owned:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Persistent environments
+
+CONCURRENCY_MODES = ("fork", "base", "never")
+ENV_NAME_MAX = 128
+
+
+def _valid_env_name(name):
+    if not isinstance(name, str) or not name or len(name) > ENV_NAME_MAX:
+        return False
+    if name in (".", ".."):
+        return False
+    return all(c.isascii() and (c.isalnum() or c in "-_.") for c in name)
+
+
+def hash_tree(root):
+    """Content hash of a directory tree (paths, file bytes, exec bits, symlinks)."""
+    h = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        rel_dir = os.path.relpath(dirpath, root)
+        h.update(b"D\0" + rel_dir.encode("utf-8", "surrogateescape") + b"\0")
+        entries = sorted(filenames + [d for d in dirnames
+                                      if os.path.islink(os.path.join(dirpath, d))])
+        for name in entries:
+            full = os.path.join(dirpath, name)
+            rel = os.path.join(rel_dir, name).encode("utf-8", "surrogateescape")
+            try:
+                if os.path.islink(full):
+                    h.update(b"L\0" + rel + b"\0" +
+                             os.readlink(full).encode("utf-8", "surrogateescape") + b"\0")
+                    continue
+                st = os.stat(full)
+                h.update(b"F\0" + rel + b"\0" + str(st.st_mode & 0o777).encode() + b"\0")
+                with open(full, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 16), b""):
+                        h.update(chunk)
+                h.update(b"\0")
+            except OSError:
+                h.update(b"E\0" + rel + b"\0")
+    return h.hexdigest()
+
+
+def copy_tree(src, dst):
+    shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+
+
+class Environment:
+    def __init__(self, name, mode, root):
+        self.name = name
+        self.mode = mode
+        self.lock = threading.Lock()
+        self.active = 0
+        self.root = root
+        self.base_dir = os.path.join(root, "base")       # immutable initial state
+        self.current_dir = os.path.join(root, "current")  # latest committed state
+        self.base_hash = None
+        self.current_hash = None
+        self.generation = 0
+
+
+class EnvironmentStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._envs = {}
+        self._root = None
+
+    def _root_dir(self):
+        if self._root is None or not os.path.isdir(self._root):
+            self._root = tempfile.mkdtemp(prefix="envs-")
+        return self._root
+
+    def create(self, name, mode, files):
+        with self._lock:
+            if name in self._envs:
+                raise ApiError(409, "ENVIRONMENT_EXISTS",
+                               f"Environment already exists: {name}")
+            root = tempfile.mkdtemp(prefix="env-", dir=self._root_dir())
+            env = Environment(name, mode, root)
+            try:
+                os.makedirs(env.base_dir)
+                write_files(env.base_dir, files)
+                copy_tree(env.base_dir, env.current_dir)
+                env.base_hash = hash_tree(env.base_dir)
+                env.current_hash = env.base_hash
+            except BaseException:
+                shutil.rmtree(root, ignore_errors=True)
+                raise
+            self._envs[name] = env
+            return env
+
+    def get(self, name):
+        with self._lock:
+            env = self._envs.get(name)
+        if env is None:
+            raise ApiError(404, "ENVIRONMENT_NOT_FOUND", "Environment not found")
+        return env
+
+
+ENVIRONMENTS = EnvironmentStore()
+
+
+def acquire(env, workdir):
+    """Claim the environment and populate ``workdir``.
+
+    Returns (snapshot_source, state_hash_before).
+    """
+    with env.lock:
+        if env.mode == "base":
+            source, src_dir, state = "base", env.base_dir, env.base_hash
+        elif env.active == 0:
+            source, src_dir, state = "exclusive", env.current_dir, env.current_hash
+        elif env.mode == "never":
+            raise ApiError(423, "ENVIRONMENT_LOCKED", "Environment is in use")
+        else:  # fork
+            source, src_dir, state = "current", env.current_dir, env.current_hash
+        copy_tree(src_dir, workdir)
+        env.active += 1
+    return source, state
+
+
+def release(env):
+    with env.lock:
+        env.active -= 1
+
+
+def commit(env, workdir, new_hash):
+    """Make ``workdir`` the environment's current state (takes ownership)."""
+    with env.lock:
+        old = env.current_dir + ".old-" + uuid.uuid4().hex
+        os.rename(env.current_dir, old)
+        os.rename(workdir, env.current_dir)
+        env.current_hash = new_hash
+        env.generation += 1
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def validate_environment_create(body):
+    if not isinstance(body, dict):
+        raise ApiError(400, "INVALID_REQUEST", "request body must be a JSON object")
+    if "name" not in body or body["name"] is None or body["name"] == "":
+        raise ApiError(400, "INVALID_ENVIRONMENT", "Missing required field: name")
+    name = body["name"]
+    if not _valid_env_name(name):
+        raise ApiError(400, "INVALID_ENVIRONMENT", f"invalid environment name: {name!r}")
+    mode = body.get("concurrency_mode", "never")
+    if mode is None:
+        mode = "never"
+    if not isinstance(mode, str) or mode not in CONCURRENCY_MODES:
+        raise ApiError(400, "INVALID_CONCURRENCY_MODE",
+                       "'concurrency_mode' must be one of: fork, base, never")
+    files = body.get("files", {})
+    if files is None:
+        files = {}
+    if not isinstance(files, dict):
+        raise ApiError(400, "INVALID_FIELD", "'files' must be an object")
+    return name, mode, encode_files(files)
+
+
+def validate_environment_ref(body):
+    if "environment" not in body or body["environment"] is None:
+        raise ApiError(400, "MISSING_ENVIRONMENT", "Missing required field: environment")
+    name = body["environment"]
+    if not isinstance(name, str):
+        raise ApiError(400, "INVALID_ENVIRONMENT", "'environment' must be a string")
+    if not name.strip():
+        raise ApiError(400, "MISSING_ENVIRONMENT", "Missing required field: environment")
+    return name
+
+
+def run_in_environment(args, force, env_name):
+    """Execute ``args`` against a persistent environment. Returns the response dict."""
+    env = ENVIRONMENTS.get(env_name)
+    workdir = tempfile.mkdtemp(prefix="exec-", dir=env.root)
+    try:
+        source, state = acquire(env, workdir)
+        try:
+            key = ResultCache.key(*args, environment=env.name, state=state)
+            meta = {"name": env.name, "snapshot_source": source,
+                    "committed": env.mode != "base"}
+            if not force:
+                cached = CACHE.get(key)
+                if cached is not None:
+                    STATS.record_hit()
+                    cached["id"] = str(uuid.uuid4())
+                    cached["cached"] = True
+                    cached["environment"] = meta
+                    return cached
+            result, duration, cmd_durations, cmd_total = execute(*args, workdir=workdir)
+            STATS.record(round(duration, 3), [round(x, 3) for x in cmd_durations], cmd_total)
+            STATS.record_miss()
+            if env.mode == "base":
+                CACHE.put(key, result)
+            else:
+                new_hash = hash_tree(workdir)
+                commit(env, workdir, new_hash)
+                workdir = None
+                # only replayable from cache when the run left the state untouched
+                if new_hash == state:
+                    CACHE.put(key, result)
+            result = dict(result)
+            result["cached"] = False
+            result["environment"] = meta
+            return result
+        finally:
+            release(env)
+    finally:
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -555,7 +790,8 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         try:
             path = self._path()
-            routes = {"/v1/execute": "POST", "/v1/stats/execution": "GET"}
+            routes = {"/v1/execute": "POST", "/v1/stats/execution": "GET",
+                      "/v1/environment": "POST"}
             if path not in routes:
                 # drain body to keep connection sane
                 if method in ("POST", "PUT", "PATCH"):
@@ -576,23 +812,20 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, ValueError):
                 raise ApiError(400, "INVALID_JSON", "request body is not valid JSON")
+            if path == "/v1/environment":
+                name, mode, files = validate_environment_create(body)
+                ENVIRONMENTS.create(name, mode, files)
+                self._send(201, {
+                    "name": name,
+                    "concurrency_mode": mode,
+                    "files": {p: {"written_bytes": len(d)} for p, d in files.items()},
+                })
+                return
+            if not isinstance(body, dict):
+                raise ApiError(400, "INVALID_REQUEST", "request body must be a JSON object")
+            env_name = validate_environment_ref(body)
             args, force = validate(body)
-            key = ResultCache.key(*args)
-            if not force:
-                cached = CACHE.get(key)
-                if cached is not None:
-                    STATS.record_hit()
-                    cached["id"] = str(uuid.uuid4())
-                    cached["cached"] = True
-                    self._send(201, cached)
-                    return
-            result, duration, cmd_durations, cmd_total = execute(*args)
-            STATS.record(round(duration, 3), [round(x, 3) for x in cmd_durations], cmd_total)
-            STATS.record_miss()
-            CACHE.put(key, result)
-            result = dict(result)
-            result["cached"] = False
-            self._send(201, result)
+            self._send(201, run_in_environment(args, force, env_name))
         except ApiError as e:
             self._error(e.status, e.code, e.message)
         except Exception as e:  # pragma: no cover
