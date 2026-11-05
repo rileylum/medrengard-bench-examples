@@ -58,8 +58,19 @@ def load(sde):
     return systems, stations, by_system
 
 
+def round_sec(sec):
+    return math.floor(sec * 10 + 0.5) / 10
+
+
 def is_highsec(sec):
-    return math.floor(sec * 10 + 0.5) / 10 >= 0.5
+    return round_sec(sec) >= 0.5
+
+
+def fmt_sec(sec):
+    r = round_sec(sec)
+    if r == 0:
+        r = 0.0
+    return "%.1f" % r
 
 
 def jumpable_dest(sid, sysinfo):
@@ -74,28 +85,71 @@ def dist(a, b):
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
 
 
-def build_graph(nodes, systems, rng):
-    """Adjacency (within range) among node ids using a spatial grid."""
-    cell = float(rng)
-    grid = {}
-    for n in nodes:
-        p = systems[n]["pos"]
-        key = (math.floor(p[0] / cell), math.floor(p[1] / cell), math.floor(p[2] / cell))
-        grid.setdefault(key, []).append(n)
-    adj = {n: [] for n in nodes}
-    for n in nodes:
-        p = systems[n]["pos"]
-        kx, ky, kz = (math.floor(p[0] / cell), math.floor(p[1] / cell), math.floor(p[2] / cell))
+class Grid:
+    """Spatial grid over node ids for range queries."""
+
+    def __init__(self, nodes, systems, rng):
+        self.cell = float(rng)
+        self.rng = rng
+        self.systems = systems
+        self.grid = {}
+        for n in nodes:
+            self.grid.setdefault(self.key(systems[n]["pos"]), []).append(n)
+
+    def key(self, p):
+        c = self.cell
+        return (math.floor(p[0] / c), math.floor(p[1] / c), math.floor(p[2] / c))
+
+    def near(self, p):
+        kx, ky, kz = self.key(p)
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 for dz in (-1, 0, 1):
-                    for m in grid.get((kx + dx, ky + dy, kz + dz), ()):
-                        if m == n:
-                            continue
-                        d = dist(p, systems[m]["pos"])
-                        if d <= rng:
-                            adj[n].append((m, d))
+                    for m in self.grid.get((kx + dx, ky + dy, kz + dz), ()):
+                        d = dist(p, self.systems[m]["pos"])
+                        if d <= self.rng:
+                            yield m, d
+
+
+def build_graph(nodes, systems, rng, gates=None):
+    """Adjacency among node ids: adj[n] = [(m, d, via)].
+
+    `via` is None for a direct jump from n, or the gate-neighbour system id
+    the jump is made from when the cloak trick is used (gates given).
+    For each (n, m) only the shortest option is kept (direct preferred on ties).
+    """
+    grid = Grid(nodes, systems, rng)
+    adj = {}
+    for n in nodes:
+        best = {}
+        for m, d in grid.near(systems[n]["pos"]):
+            if m != n:
+                best[m] = (d, 0, "", None)
+        if gates is not None:
+            for g in gates.get(n, ()):
+                if g not in systems:
+                    continue
+                gname = systems[g]["name"]
+                for m, d in grid.near(systems[g]["pos"]):
+                    if m == n or m == g:
+                        continue
+                    cand = (d, 1, gname, g)
+                    cur = best.get(m)
+                    if cur is None or cand[:3] < cur[:3]:
+                        best[m] = cand
+        adj[n] = sorted(((m, v[0], v[3]) for m, v in best.items()), key=lambda t: t[0])
     return adj
+
+
+def load_gates(sde):
+    gates = {}
+    with open_csv(sde, "mapSolarSystemJumps") as f:
+        for r in csv.DictReader(f):
+            a = int(r["fromSolarSystemID"])
+            b = int(r["toSolarSystemID"])
+            gates.setdefault(a, set()).add(b)
+            gates.setdefault(b, set()).add(a)
+    return gates
 
 
 def bfs(adj, src, allowed_next):
@@ -103,7 +157,7 @@ def bfs(adj, src, allowed_next):
     q = deque([src])
     while q:
         u = q.popleft()
-        for v, _ in adj[u]:
+        for v, _, _ in adj[u]:
             if v not in depth and allowed_next(v):
                 depth[v] = depth[u] + 1
                 q.append(v)
@@ -124,9 +178,9 @@ def apply_jump(tf, tc, eff):
 
 
 def dominates(a, b):
-    # label: (wait, tf, tc, ly, names, path)
+    # label: (wait, tf, tc, ly, names, path, dists, vias, gates_used)
     return (a[0] <= b[0] + EPS and a[1] <= b[1] + EPS and a[2] <= b[2] + EPS
-            and a[3] <= b[3] + EPS and a[4] <= b[4])
+            and a[3] <= b[3] + EPS and a[8] <= b[8] and a[4] <= b[4])
 
 
 def plan(adj, systems, start, end, factor):
@@ -134,7 +188,13 @@ def plan(adj, systems, start, end, factor):
     ds = bfs(adj, start, eligible)
     if end not in ds:
         return None
-    de = bfs(adj, end, eligible)
+    # edges may be asymmetric (cloak gate trick), so search backwards on
+    # the reversed graph
+    radj = {n: [] for n in adj}
+    for u, lst in adj.items():
+        for v, d, via in lst:
+            radj[v].append((u, d, via))
+    de = bfs(radj, end, eligible)
     total = ds[end]
     if total == 0:
         return []
@@ -143,20 +203,21 @@ def plan(adj, systems, start, end, factor):
         if n in de and d + de[n] == total:
             layers[d].append(n)
     # labels per node
-    labels = {start: [(0.0, 0.0, 0.0, 0.0, (systems[start]["name"],), (start,), ())]}
+    labels = {start: [(0.0, 0.0, 0.0, 0.0, (systems[start]["name"],), (start,), (), (), 0)]}
     for k in range(total):
         nxt = {}
         for u in layers[k]:
             for lab in labels.get(u, ()):
-                wait, tf, tc, ly, names, path, dists = lab
+                wait, tf, tc, ly, names, path, dists, vias, ng = lab
                 # wait out cooldown before jumping
                 w = wait + tc
                 ptf = max(0.0, tf - tc)
-                for v, d in adj[u]:
+                for v, d, via in adj[u]:
                     if ds.get(v) != k + 1 or de.get(v) != total - k - 1:
                         continue
                     ntf, ntc = apply_jump(ptf, 0.0, d * factor)
-                    new = (w, ntf, ntc, ly + d, names + (systems[v]["name"],), path + (v,), dists + (d,))
+                    new = (w, ntf, ntc, ly + d, names + (systems[v]["name"],), path + (v,), dists + (d,),
+                           vias + (via,), ng + (via is not None))
                     lst = nxt.setdefault(v, [])
                     if any(dominates(o, new) for o in lst):
                         continue
@@ -164,7 +225,7 @@ def plan(adj, systems, start, end, factor):
                     lst.append(new)
         labels = nxt
     finals = labels.get(end, [])
-    best = min(finals, key=lambda l: (ceil_min(l[0]), l[3], l[4]))
+    best = min(finals, key=lambda l: (ceil_min(l[0]), round(l[3], 9), l[8], l[4]))
     return best
 
 
@@ -189,6 +250,8 @@ def main(argv=None):
     ap.add_argument("--range", type=int, default=10)
     ap.add_argument("--fuel", type=int, default=10000)
     ap.add_argument("--reduction", type=int, default=90)
+    ap.add_argument("--cloak", action="store_true",
+                    help="allow taking one gate after each undock before jumping")
     a = ap.parse_args(argv)
     if not 5 <= a.range <= 10:
         ap.error("--range must be an int in [5,10]")
@@ -216,7 +279,8 @@ def main(argv=None):
     nodes = set(sid for sid in by_system if sid in systems and jumpable_dest(sid, systems[sid]))
     nodes.add(s_sys)
     nodes.add(e_sys)
-    adj = build_graph(nodes, systems, a.range)
+    gates = load_gates(a.sde) if a.cloak else None
+    adj = build_graph(nodes, systems, a.range, gates)
     factor = 1.0 - a.reduction / 100.0
     res = plan(adj, systems, s_sys, e_sys, factor)
     if res is None:
@@ -230,12 +294,18 @@ def main(argv=None):
         out.append("DOCK: %s" % a.end)
         total_k = 0
     else:
-        wait, tf, tc, ly, names, path, dists = res
+        wait, tf, tc, ly, names, path, dists, vias, _ = res
         total_k = 0
         for i, (sid, d) in enumerate(zip(path[1:], dists)):
             k = ceil_k(d * a.fuel)
             total_k += k
             out.append("UNDOCK")
+            via = vias[i]
+            if via is not None:
+                frm = path[i]
+                out.append("GO: %s (%s) -> %s (%s)" % (
+                    systems[frm]["name"], fmt_sec(systems[frm]["sec"]),
+                    systems[via]["name"], fmt_sec(systems[via]["sec"])))
             out.append("JUMP %.2f LY: %s (%sK isotopes)" % (d, systems[sid]["name"], format(k, ",")))
             dock = a.end if i == len(dists) - 1 else by_system[sid][0]
             out.append("DOCK: %s" % dock)
