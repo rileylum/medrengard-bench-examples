@@ -432,6 +432,8 @@ def sort_entries(entries):
 
 
 def sync_catalog(catalog, source, ts):
+    """Apply source metadata to catalog; return dict of added/removed/updated counts."""
+    counts = {"added": 0, "removed": 0, "updated": 0}
     for cat in CATEGORIES:
         entries = catalog[cat]
         by_id = {}
@@ -452,20 +454,373 @@ def sync_catalog(catalog, source, ts):
                 entry["removed"] = {ts: False}
                 entries.append(entry)
                 by_id[sid] = entry
+                counts["added"] += 1
                 continue
+            changed = False
             for field in SOURCE_TRACKED:
-                append_history(entry, field, item[field], ts)
+                if append_history(entry, field, item[field], ts):
+                    changed = True
             removed, has = current_value(entry.get("removed"))
             if not has or removed is not False:
                 append_history(entry, "removed", False, ts)
+                if has and removed is True:
+                    changed = True
+            if changed:
+                counts["updated"] += 1
         for e in entries:
             if e["id"] in src:
                 continue
             removed, has = current_value(e.get("removed"))
             if not has or removed is not True:
                 append_history(e, "removed", True, ts)
+                counts["removed"] += 1
         sort_entries(entries)
-    return catalog
+    return counts
+
+
+# ---------------------------------------------------------------- downloads
+
+DOWNLOAD_RETRIES = 3
+RETRY_DELAYS = (0.2, 0.5)
+PARTIAL_SUFFIXES = (".part", ".partial", ".tmp", ".download", ".crdownload")
+TRANSIENT_STATUSES = (408, 425, 429, 500, 502, 503, 504)
+
+CONTENT_TYPE_EXT = {
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/x-matroska": "mkv",
+    "video/matroska": "mkv",
+    "video/quicktime": "mov",
+    "video/x-msvideo": "avi",
+    "video/x-flv": "flv",
+    "video/mpeg": "mpeg",
+    "video/ogg": "ogv",
+    "video/mp2t": "ts",
+    "video/3gpp": "3gp",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/ogg": "ogg",
+    "audio/opus": "opus",
+    "audio/webm": "weba",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/flac": "flac",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/pjpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/avif": "avif",
+    "image/bmp": "bmp",
+    "image/svg+xml": "svg",
+    "application/octet-stream": "bin",
+    "application/json": "json",
+    "text/plain": "txt",
+    "text/html": "html",
+}
+
+
+class TransientDownloadError(Exception):
+    pass
+
+
+class PermanentDownloadError(Exception):
+    pass
+
+
+def ext_from_content_type(ctype):
+    import mimetypes
+    import re
+    if not ctype:
+        return "bin"
+    mime = ctype.split(";", 1)[0].strip().lower()
+    if not mime:
+        return "bin"
+    if mime in CONTENT_TYPE_EXT:
+        return CONTENT_TYPE_EXT[mime]
+    guess = mimetypes.guess_extension(mime, strict=False)
+    if guess:
+        return guess.lstrip(".")
+    sub = mime.split("/", 1)[-1]
+    if "+" in sub:
+        sub = sub.rsplit("+", 1)[-1]
+    if sub.startswith("x-"):
+        sub = sub[2:]
+    sub = re.sub(r"[^a-z0-9]+", "", sub)
+    return sub or "bin"
+
+
+def safe_filename_id(entry_id):
+    import urllib.parse
+    if entry_id in ("", ".", "..") or "/" in entry_id or "\\" in entry_id or "\0" in entry_id \
+            or entry_id.startswith("."):
+        q = urllib.parse.quote(entry_id, safe="")
+        if q.startswith("."):
+            q = "%2E" + q[1:]
+        return q
+    return entry_id
+
+
+def url_join(source, kind, tail):
+    import urllib.parse
+    return "%s/%s/%s" % (source.rstrip("/"), kind, urllib.parse.quote(tail, safe=".-_~"))
+
+
+def is_partial_name(fname):
+    return fname.startswith(".") or fname.lower().endswith(PARTIAL_SUFFIXES)
+
+
+def present_ids(directory):
+    """Return set of filename stems (and full names) of completed files in directory."""
+    found = set()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return found
+    for fname in names:
+        if is_partial_name(fname):
+            continue
+        if not os.path.isfile(os.path.join(directory, fname)):
+            continue
+        found.add(fname)
+        if "." in fname:
+            found.add(fname.rsplit(".", 1)[0])
+    return found
+
+
+def http_fetch_to(url, directory, fname_id, ext_override):
+    """Download url into directory/<fname_id>.<ext>. Raises Transient/Permanent errors."""
+    import socket
+    import urllib.error
+    try:
+        req = urllib.request.Request(url, method="GET")
+        resp = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:
+            pass
+        if exc.code in TRANSIENT_STATUSES or exc.code >= 500:
+            raise TransientDownloadError("HTTP %s" % exc.code)
+        raise PermanentDownloadError("HTTP %s" % exc.code)
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise TransientDownloadError(str(reason))
+    except ValueError as exc:
+        raise PermanentDownloadError(str(exc))
+    tmp = None
+    try:
+        with resp:
+            status = getattr(resp, "status", 200) or 200
+            if not (200 <= status < 300):
+                if status in TRANSIENT_STATUSES or status >= 500:
+                    raise TransientDownloadError("HTTP %s" % status)
+                raise PermanentDownloadError("HTTP %s" % status)
+            ext = ext_override if ext_override is not None else \
+                ext_from_content_type(resp.headers.get("Content-Type"))
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix="." + fname_id[:40] + ".", suffix=".part",
+                                       dir=directory)
+            with os.fdopen(fd, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            final = os.path.join(directory, "%s.%s" % (fname_id, ext) if ext else fname_id)
+            os.replace(tmp, final)
+            tmp = None
+            return final
+    except (TransientDownloadError, PermanentDownloadError):
+        raise
+    except (socket.timeout, TimeoutError, ConnectionError, urllib.error.URLError) as exc:
+        raise TransientDownloadError(str(getattr(exc, "reason", exc)))
+    except OSError as exc:
+        if exc.errno is None:
+            raise TransientDownloadError(str(exc))
+        raise PermanentDownloadError(str(exc))
+    except Exception as exc:  # e.g. http.client.IncompleteRead
+        raise TransientDownloadError(str(exc) or exc.__class__.__name__)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def download_with_retry(url, directory, fname_id, ext_override):
+    import time
+    last = None
+    for attempt in range(DOWNLOAD_RETRIES):
+        try:
+            return http_fetch_to(url, directory, fname_id, ext_override), None
+        except PermanentDownloadError as exc:
+            return None, "permanently unavailable (%s)" % exc
+        except TransientDownloadError as exc:
+            last = exc
+            if attempt + 1 < DOWNLOAD_RETRIES:
+                time.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+    return None, "failed after %d attempts (%s)" % (DOWNLOAD_RETRIES, last)
+
+
+def run_downloads(name, catalog, limits, fmt):
+    source = catalog["source"]
+    media_dir = os.path.join(name, "media")
+    preview_dir = os.path.join(name, "previews")
+    have_media = present_ids(media_dir)
+    have_preview = present_ids(preview_dir)
+    stats = {"media": 0, "previews": 0, "failed": 0}
+    for cat in CATEGORIES:
+        limit = limits.get(cat)
+        candidates = []
+        seen = set()
+        for e in catalog[cat]:
+            eid = e.get("id")
+            if not is_str(eid) or eid in seen:
+                continue
+            seen.add(eid)
+            fid = safe_filename_id(eid)
+            if fid in have_media:
+                continue
+            candidates.append((eid, fid))
+        if limit is not None:
+            candidates = candidates[:limit]
+        for eid, fid in candidates:
+            if fmt is not None:
+                url = url_join(source, "media", "%s.%s" % (eid, fmt))
+            else:
+                url = url_join(source, "media", eid)
+            path, err = download_with_retry(url, media_dir, fid, fmt)
+            if err:
+                stats["failed"] += 1
+                sys.stdout.flush()
+                eprint("warning: media download for %s entry '%s' %s" % (cat[:-1], eid, err))
+            else:
+                stats["media"] += 1
+                have_media.add(fid)
+                print("Downloaded media for '%s' -> %s" % (eid, os.path.basename(path)))
+            if fid in have_preview:
+                continue
+            ppath, perr = download_with_retry(url_join(source, "preview", eid),
+                                              preview_dir, fid, None)
+            if perr:
+                stats["failed"] += 1
+                sys.stdout.flush()
+                eprint("warning: preview download for %s entry '%s' %s" % (cat[:-1], eid, perr))
+            else:
+                stats["previews"] += 1
+                have_preview.add(fid)
+    return stats
+
+
+# ---------------------------------------------------------------- digest
+
+def _v1_key(k):
+    try:
+        return (0, float(k), k)
+    except (ValueError, TypeError):
+        return (1, 0.0, k)
+
+
+def _sorted_history(h, version):
+    if not isinstance(h, dict):
+        return []
+    if version == 1:
+        keys = sorted(h.keys(), key=_v1_key)
+    else:
+        keys = sorted(h.keys())
+    return [h[k] for k in keys]
+
+
+def _same(a, b):
+    return a == b and type(a) is type(b)
+
+
+def classify_entry(e, version):
+    """Return (group, changed_fields) where group in removed/added/updated/None."""
+    fields = TRACKED if version == 3 else SOURCE_TRACKED
+    hist = {f: _sorted_history(e.get(f), version) for f in fields}
+    if version == 3:
+        r = hist.get("removed", [])
+        if r and r[-1] is True and (len(r) < 2 or r[-2] is False):
+            return "removed", []
+    if all(len(v) < 2 for v in hist.values()):
+        return "added", []
+    changed = []
+    for f in fields:
+        v = hist[f]
+        if len(v) >= 2 and not _same(v[-1], v[-2]):
+            if f == "removed":
+                if v[-1] is False:
+                    changed.append("reappeared")
+                else:
+                    changed.append("removed")
+            else:
+                changed.append(f)
+    if changed:
+        return "updated", changed
+    return None, []
+
+
+def entry_title(e, version):
+    vals = _sorted_history(e.get("title"), version)
+    if vals and vals[-1] is not None:
+        return str(vals[-1])
+    return str(e.get("id"))
+
+
+GROUP_LABELS = (("removed", "Removed"), ("added", "Added"), ("updated", "Updated"))
+
+
+def build_digest(name, catalog, version, now=None):
+    if version == 1:
+        groups = [("Entries", catalog["entries"])]
+        source = v1_source_url(catalog["source_id"])
+    else:
+        groups = [(c.capitalize(), catalog[c]) for c in CATEGORIES]
+        source = catalog["source"]
+    lines = []
+    total = 0
+    for label, entries in groups:
+        buckets = {"removed": [], "added": [], "updated": []}
+        for e in entries:
+            group, changed = classify_entry(e, version)
+            if group is None:
+                continue
+            text = entry_title(e, version)
+            if group == "updated":
+                text += " (%s)" % ", ".join(changed)
+            buckets[group].append(text)
+        if not any(buckets.values()):
+            continue
+        if lines:
+            lines.append("")
+        lines.append("%s:" % label)
+        for key, glabel in GROUP_LABELS:
+            items = buckets[key]
+            if not items:
+                continue
+            lines.append("  %s (%d):" % (glabel, len(items)))
+            for t in items:
+                lines.append("    - %s" % t)
+                total += 1
+    if not lines:
+        lines.append("No notable changes found.")
+    if now is None:
+        now = fmt_dt(datetime.now().replace(microsecond=0))
+    lines.append("")
+    lines.append("Digest of vault '%s' (catalog version %d, %d change%s) generated at %s "
+                 "from %s" % (name, version, total, "" if total == 1 else "s", now, source))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- commands
@@ -492,12 +847,29 @@ def cmd_init(args):
 
 def cmd_sync(args):
     name = args.name
-    catalog, _version = load_vault(name)
-    source = fetch_source(catalog["source"])
-    ts = compute_sync_timestamp(catalog)
-    sync_catalog(catalog, source, ts)
-    write_catalog(name, catalog, backup=True)
-    print("Synced vault '%s' at %s" % (name, ts))
+    catalog, version = load_vault(name)
+    counts = None
+    if not args.skip_metadata:
+        source = fetch_source(catalog["source"])
+        ts = compute_sync_timestamp(catalog)
+        counts = sync_catalog(catalog, source, ts)
+        write_catalog(name, catalog, backup=True)
+        print("Synced vault '%s' at %s" % (name, ts))
+    if not args.skip_download:
+        sys.stdout.flush()
+        limits = {"episodes": args.episodes, "streams": args.streams, "clips": args.clips}
+        run_downloads(name, catalog, limits, args.format)
+    if counts is not None:
+        print("Summary: %d added, %d removed, %d updated"
+              % (counts["added"], counts["removed"], counts["updated"]))
+    return 0
+
+
+def cmd_digest(args):
+    name = args.name
+    raw, version = read_raw_catalog(name)
+    validate_catalog(name, raw, version)
+    print(build_digest(name, raw, version))
     return 0
 
 
@@ -514,23 +886,49 @@ def cmd_migrate(args):
     return 0
 
 
+def non_negative_int(text):
+    t = text.strip()
+    if not t or not t.isdigit() or not t.isascii():
+        raise argparse.ArgumentTypeError("invalid non-negative integer: %r" % text)
+    return int(t)
+
+
+def format_str(text):
+    t = text.strip()
+    if not t or "/" in t or "\\" in t or t.startswith(".") or "\0" in t:
+        raise argparse.ArgumentTypeError("invalid format: %r" % text)
+    return t
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="mvault.py",
+        prog="mvault.py", allow_abbrev=False,
         description="Create local vaults for media-platform metadata and record "
                     "tracked-field history by sync timestamp.")
-    sub = parser.add_subparsers(dest="command", metavar="{init,sync,migrate}",
+    sub = parser.add_subparsers(dest="command", metavar="{init,sync,migrate,digest}",
                                 title="subcommands")
-    p_init = sub.add_parser("init", help="create a new vault with an empty catalog")
+    p_init = sub.add_parser("init", allow_abbrev=False, help="create a new vault with an empty catalog")
     p_init.add_argument("name", help="vault directory name")
     p_init.add_argument("url", help="source metadata URL")
     p_init.set_defaults(func=cmd_init)
-    p_sync = sub.add_parser("sync", help="sync a vault with its source URL")
+    p_sync = sub.add_parser("sync", allow_abbrev=False, help="sync a vault with its source URL")
     p_sync.add_argument("name", help="vault directory name")
+    for cat in CATEGORIES:
+        p_sync.add_argument("--%s" % cat, type=non_negative_int, default=None, metavar="N",
+                            help="maximum number of %s media downloads" % cat[:-1])
+    p_sync.add_argument("--skip-metadata", action="store_true",
+                        help="skip source fetch and metadata update")
+    p_sync.add_argument("--skip-download", action="store_true",
+                        help="skip media and preview downloads")
+    p_sync.add_argument("--format", type=format_str, default=None, metavar="FMT",
+                        help="override media download format and extension")
     p_sync.set_defaults(func=cmd_sync)
-    p_mig = sub.add_parser("migrate", help="convert a legacy (v1/v2) vault catalog to v3")
+    p_mig = sub.add_parser("migrate", allow_abbrev=False, help="convert a legacy (v1/v2) vault catalog to v3")
     p_mig.add_argument("name", help="vault directory name")
     p_mig.set_defaults(func=cmd_migrate)
+    p_dig = sub.add_parser("digest", allow_abbrev=False, help="summarize notable changes in a vault")
+    p_dig.add_argument("name", help="vault directory name")
+    p_dig.set_defaults(func=cmd_digest)
     return parser
 
 
