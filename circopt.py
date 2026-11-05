@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """circopt - circuit tool (Part 1: CLI basics and `check`; Part 2: `eval`;
 Part 3: vectors, richer expressions and `--radix`;
-Parts 4-6: 3-valued eval, input formats, stats/lint/dot)."""
+Parts 4-6: 3-valued eval, input formats, stats/lint/dot; Part 7: cone,
+truth-table, equiv; Part 8: opt)."""
 
 import json
 import os
@@ -34,6 +35,12 @@ Commands:
                        Print the exhaustive truth table (2val only).
   equiv <a> <b> --max-input-bits N [--format ...] [--trials T] [--outputs y,z]
                        Check functional equivalence (exhaustive or randomized).
+  opt <file> -o <out_file> [--format ...] [--out-format circ|json|bench]
+      [--pipeline default|clean|area|depth] [--passes p1,p2,...]
+      [--max-iters K] [--fanin-limit none|2|3|4] [--rename keep|compact]
+      [--verify --max-input-bits N [--trials T]] [--report report.json]
+                       Optimize the circuit (passes: normalize, constfold,
+                       algebra, cse, dce, fanin).
 
 Global flags:
   --help               Show this help and exit.
@@ -1435,6 +1442,18 @@ def cmd_stats(args, opts):
     if len(args) != 1:
         raise CliUsageError("stats requires exactly one file argument")
     c, _fmt = load_circuit(args[0], get_format_opt(opts))
+    result = compute_stats(c)
+    hist = result["op_histogram"]
+    lines = ["%s: %s" % (k, result[k]) for k in
+             ("inputs_count", "outputs_count", "wires_count",
+              "assignments_count", "edges_count", "depth")]
+    lines.append("op_histogram:")
+    for k, v in hist.items():
+        lines.append("  %s: %d" % (k, v))
+    return result, "\n".join(lines)
+
+
+def compute_stats(c):
     outs = set(c.outputs)
     hist = {k: 0 for k in HIST_CATEGORIES}
     edges = 0
@@ -1453,13 +1472,7 @@ def cmd_stats(args, opts):
         "depth": max([depth.get(o, 0) for o in c.outputs] or [0]),
         "op_histogram": hist,
     }
-    lines = ["%s: %s" % (k, result[k]) for k in
-             ("inputs_count", "outputs_count", "wires_count",
-              "assignments_count", "edges_count", "depth")]
-    lines.append("op_histogram:")
-    for k, v in hist.items():
-        lines.append("  %s: %d" % (k, v))
-    return result, "\n".join(lines)
+    return result
 
 
 def _int_opt(opts, flag, default):
@@ -2012,7 +2025,12 @@ def cmd_equiv(args, opts):
                     "output %r range [%d:%d] vs [%d:%d]"
                     % (n, oa[n][0], oa[n][1], ob[n][0], ob[n][1]))
         compared = sorted(restrict)
+    return run_equiv(ca, cb, compared, limit, trials, seed)
 
+
+def run_equiv(ca, cb, compared, limit, trials, seed):
+    """Compare outputs `compared` of ca and cb; returns (result, text[, 10])."""
+    import random
     names, widths, shifts, total = input_layout(ca)
     fa = make_evaluator(ca, names, compared)
     fb = make_evaluator(cb, names, compared)
@@ -2066,9 +2084,917 @@ def cmd_equiv(args, opts):
     return result, "\n".join(lines), 10
 
 
+# ---------------------------------------------------------------------------
+# Optimization: opt
+# ---------------------------------------------------------------------------
+#
+# The optimizer works on a gate-level netlist: every assigned signal maps to a
+# right-hand side (rhs) that is either an *atom* or a single *node* whose
+# arguments are atoms.
+#
+#   atoms:  ('C', value, width)      literal
+#           ('R', name)              full reference to a signal
+#           ('I', name, idx)         single bit (absolute index)
+#           ('S', name, hi, lo)      slice (absolute indices)
+#   nodes:  ('OP', op, (atoms...))   operator application
+#           ('CAT', (atoms...))      concatenation (MSB part first)
+
+OPT_PASSES = ("normalize", "constfold", "algebra", "cse", "dce", "fanin")
+OPT_PIPELINES = {
+    "default": ["normalize", "constfold", "algebra", "cse", "dce"],
+    "clean": ["normalize", "constfold", "dce"],
+    "area": ["normalize", "constfold", "algebra", "cse", "dce", "fanin"],
+    "depth": ["normalize", "constfold", "algebra", "cse", "fanin", "dce"],
+}
+CANON_OPS = {"NOT", "AND", "OR", "XOR", "MUX", "BUF"}
+
+
+def _is_atom(x):
+    return x[0] in ("C", "R", "I", "S")
+
+
+class Netlist:
+    def __init__(self, c, fanin_limit=None):
+        self.ranges = dict(c.ranges)
+        self.inputs = list(c.inputs)
+        self.outputs = list(dict.fromkeys(c.outputs))
+        self.input_set = set(self.inputs)
+        self.output_set = set(self.outputs)
+        self.ports = self.input_set | self.output_set
+        self.used_names = set(c.ranges)
+        self.counter = 0
+        self.fanin_limit = fanin_limit
+        self.rhs = {}
+        for name in topo_order(c):
+            self.rhs[name] = self.lower(c.assigns[name], top=True)
+
+    # -- helpers ------------------------------------------------------------
+    def fresh(self):
+        while True:
+            n = "n%d" % self.counter
+            self.counter += 1
+            if n not in self.used_names:
+                self.used_names.add(n)
+                return n
+
+    def new_wire(self, node, width):
+        name = self.fresh()
+        self.ranges[name] = (width - 1, 0)
+        self.rhs[name] = node
+        return name
+
+    def as_atom(self, x):
+        """Return an atom for x, creating a wire if x is a node."""
+        if _is_atom(x):
+            return x
+        return ("R", self.new_wire(x, self.width(x)))
+
+    def sig_width(self, name):
+        msb, lsb = self.ranges[name]
+        return msb - lsb + 1
+
+    def width(self, x):
+        t = x[0]
+        if t == "C":
+            return x[2]
+        if t == "R":
+            return self.sig_width(x[1])
+        if t == "I":
+            return 1
+        if t == "S":
+            return x[2] - x[3] + 1
+        if t == "CAT":
+            return sum(self.width(a) for a in x[1])
+        op, args = x[1], x[2]
+        if op.startswith("REDUCE_") or op == "EQ":
+            return 1
+        if op in ("MUX", "ITE"):
+            return self.width(args[1])
+        return self.width(args[0])
+
+    def lower(self, e, top=False):
+        if isinstance(e, Const):
+            return ("C", e.value, e.width)
+        if isinstance(e, Ident):
+            return ("R", e.name)
+        if isinstance(e, Index):
+            return ("I", e.name, e.idx)
+        if isinstance(e, Slice):
+            return ("S", e.name, e.hi, e.lo)
+        if isinstance(e, Concat):
+            node = ("CAT", tuple(self.as_atom(self.lower(p)) for p in e.parts))
+        else:
+            node = ("OP", e.op, tuple(self.as_atom(self.lower(a)) for a in e.args))
+        return node
+
+    def canon_atom(self, a):
+        t = a[0]
+        if t == "I":
+            msb, lsb = self.ranges[a[1]]
+            if msb == lsb:
+                return ("R", a[1])
+        elif t == "S":
+            msb, lsb = self.ranges[a[1]]
+            if a[2] == msb and a[3] == lsb:
+                return ("R", a[1])
+            if a[2] == a[3]:
+                return self.canon_atom(("I", a[1], a[2]))
+        return a
+
+    def slice_of(self, a, h, l):
+        """Bits [h:l] (relative, LSB = 0) of atom a."""
+        t = a[0]
+        if t == "C":
+            w = h - l + 1
+            return ("C", (a[1] >> l) & mask(w), w)
+        if t == "R":
+            lsb = self.ranges[a[1]][1]
+            return self.canon_atom(("S", a[1], lsb + h, lsb + l))
+        if t == "I":
+            return a
+        return self.canon_atom(("S", a[1], a[3] + h, a[3] + l))
+
+    def bit_of(self, a, k):
+        return self.slice_of(a, k, k)
+
+    def rhs_of_ref(self, a):
+        """Defining node of a full-reference atom, or None."""
+        if a[0] == "R" and a[1] in self.rhs:
+            return self.rhs[a[1]]
+        return None
+
+    def refs_in(self, x):
+        if _is_atom(x):
+            return [x[1]] if x[0] != "C" else []
+        args = x[1] if x[0] == "CAT" else x[2]
+        return [a[1] for a in args if a[0] != "C"]
+
+    def use_counts(self):
+        cnt = {}
+        for x in self.rhs.values():
+            for n in self.refs_in(x):
+                cnt[n] = cnt.get(n, 0) + 1
+        return cnt
+
+    def map_atoms(self, fn):
+        """Apply fn to every argument atom (and atom rhs) of every signal."""
+        for name in list(self.rhs):
+            x = self.rhs[name]
+            if _is_atom(x):
+                self.rhs[name] = fn(x)
+            elif x[0] == "CAT":
+                self.rhs[name] = ("CAT", tuple(fn(a) for a in x[1]))
+            else:
+                self.rhs[name] = ("OP", x[1], tuple(fn(a) for a in x[2]))
+
+    def redirect(self, old, new):
+        """Replace references to signal `old` with signal `new` (same width)."""
+        d = self.ranges[new][1] - self.ranges[old][1]
+
+        def fn(a):
+            if a[0] == "C" or a[1] != old:
+                return a
+            if a[0] == "R":
+                return ("R", new)
+            if a[0] == "I":
+                return self.canon_atom(("I", new, a[2] + d))
+            return self.canon_atom(("S", new, a[2] + d, a[3] + d))
+        self.map_atoms(fn)
+
+    def snapshot(self):
+        return list(self.rhs.items())
+
+    def ones(self, w):
+        return ("C", mask(w), w)
+
+    def zero(self, w):
+        return ("C", 0, w)
+
+    # -- passes -------------------------------------------------------------
+    def run_pass(self, name):
+        before = self.snapshot()
+        getattr(self, "pass_" + name)()
+        return self.snapshot() != before
+
+    def pass_normalize(self):
+        cnt = self.use_counts()
+        merged = set()
+        for name in list(self.rhs):
+            x = self.rhs[name]
+            if _is_atom(x):
+                self.rhs[name] = self.canon_atom(x)
+                continue
+            if x[0] == "CAT":
+                parts = [self.canon_atom(a) for a in x[1]]
+                self.rhs[name] = self.norm_cat(parts)
+                continue
+            op = x[1]
+            args = [self.canon_atom(a) for a in x[2]]
+            if op == "ITE":
+                op = "MUX"
+            if op == "BUF":
+                self.rhs[name] = args[0]
+                continue
+            if op in ("NAND", "NOR", "XNOR"):
+                inner = self.as_atom(self.flat_sort(op[1:] if op != "XNOR" else "XOR",
+                                                    args))
+                self.rhs[name] = ("OP", "NOT", (inner,))
+                continue
+            if op.startswith("REDUCE_"):
+                a = args[0]
+                aw = self.width(a)
+                if aw == 1:
+                    self.rhs[name] = a
+                else:
+                    bits = [self.bit_of(a, k) for k in range(aw)]
+                    self.rhs[name] = self.flat_sort(op[len("REDUCE_"):], bits)
+                continue
+            if op == "EQ":
+                aw = self.width(args[0])
+                xr = self.as_atom(self.flat_sort("XOR", args))
+                if aw == 1:
+                    self.rhs[name] = ("OP", "NOT", (xr,))
+                else:
+                    bits = [self.bit_of(xr, k) for k in range(aw)]
+                    o = self.as_atom(self.flat_sort("OR", bits))
+                    self.rhs[name] = ("OP", "NOT", (o,))
+                continue
+            if op in ASSOC_OPS:
+                lim = self.fanin_limit
+                total = len(args)
+                out = []
+                for a in args:
+                    sub = self.rhs_of_ref(a)
+                    if (sub is not None and a[1] not in self.ports
+                            and a[1] not in merged and cnt.get(a[1], 0) == 1
+                            and sub[0] == "OP" and sub[1] == op
+                            and (lim is None or total - 1 + len(sub[2]) <= lim)):
+                        merged.add(a[1])
+                        total += len(sub[2]) - 1
+                        out.extend(sub[2])
+                    else:
+                        out.append(a)
+                self.rhs[name] = self.flat_sort(op, out)
+                continue
+            self.rhs[name] = ("OP", op, tuple(args))
+
+    def flat_sort(self, op, args):
+        args = [self.canon_atom(a) for a in args]
+        if len(args) == 1:
+            return args[0]
+        return ("OP", op, tuple(sorted(args)))
+
+    def norm_cat(self, parts):
+        out = []
+        for p in parts:
+            if out:
+                q = out[-1]
+                if q[0] == "C" and p[0] == "C":
+                    out[-1] = ("C", (q[1] << p[2]) | p[1], q[2] + p[2])
+                    continue
+                qs = self.as_slice(q)
+                ps = self.as_slice(p)
+                if qs and ps and qs[0] == ps[0] and qs[2] == ps[1] + 1:
+                    out[-1] = self.canon_atom(("S", qs[0], qs[1], ps[2]))
+                    continue
+            out.append(p)
+        if len(out) == 1:
+            return out[0]
+        return ("CAT", tuple(out))
+
+    def as_slice(self, a):
+        if a[0] == "R":
+            msb, lsb = self.ranges[a[1]]
+            return (a[1], msb, lsb)
+        if a[0] == "I":
+            return (a[1], a[2], a[2])
+        if a[0] == "S":
+            return (a[1], a[2], a[3])
+        return None
+
+    def resolve_atom(self, a):
+        """Constant / alias / concat-part propagation for an argument atom."""
+        for _ in range(1000):
+            if a[0] == "C" or a[1] not in self.rhs:
+                return a
+            d = self.rhs[a[1]]
+            lsb = self.ranges[a[1]][1]
+            if a[0] == "R":
+                h, l = self.sig_width(a[1]) - 1, 0
+            elif a[0] == "I":
+                h = l = a[2] - lsb
+            else:
+                h, l = a[2] - lsb, a[3] - lsb
+            if _is_atom(d):
+                a = self.slice_of(d, h, l)
+                continue
+            if d[0] == "CAT" and a[0] != "R":
+                off = self.width(d)
+                found = None
+                for p in d[1]:
+                    pw = self.width(p)
+                    off -= pw
+                    if l >= off and h < off + pw:
+                        found = self.slice_of(p, h - off, l - off)
+                        break
+                if found is None:
+                    return a
+                a = found
+                continue
+            return a
+        return a
+
+    def pass_constfold(self):
+        for name in list(self.rhs):
+            x = self.rhs[name]
+            if _is_atom(x):
+                self.rhs[name] = self.canon_atom(self.resolve_atom(x))
+                continue
+            if x[0] == "CAT":
+                parts = [self.canon_atom(self.resolve_atom(a)) for a in x[1]]
+                self.rhs[name] = self.norm_cat(parts)
+                continue
+            args = tuple(self.canon_atom(self.resolve_atom(a)) for a in x[2])
+            self.rhs[name] = self.fold(("OP", x[1], args))
+
+    def fold(self, x):
+        if _is_atom(x) or x[0] != "OP":
+            return x
+        op, args = x[1], list(x[2])
+        if op not in CANON_OPS:
+            return x
+        w = self.width(x)
+        if op == "BUF":
+            return args[0]
+        if op == "NOT":
+            a = args[0]
+            if a[0] == "C":
+                return ("C", ~a[1] & mask(w), w)
+            return x
+        if op == "MUX":
+            s, a, b = args
+            if s[0] == "C":
+                return a if s[1] else b
+            if a == b:
+                return a
+            return x
+        consts = [a for a in args if a[0] == "C"]
+        rest = [a for a in args if a[0] != "C"]
+        if not consts:
+            return x
+        m = mask(w)
+        if op == "AND":
+            v = m
+            for c_ in consts:
+                v &= c_[1]
+            if v == 0:
+                return self.zero(w)
+            if v != m:
+                rest.append(("C", v, w))
+            if not rest:
+                return ("C", v, w)
+        elif op == "OR":
+            v = 0
+            for c_ in consts:
+                v |= c_[1]
+            if v == m:
+                return self.ones(w)
+            if v != 0:
+                rest.append(("C", v, w))
+            if not rest:
+                return ("C", v, w)
+        else:  # XOR
+            v = 0
+            for c_ in consts:
+                v ^= c_[1]
+            if not rest:
+                return ("C", v, w)
+            if v == m:
+                inner = self.as_atom(self.flat_sort("XOR", rest))
+                return ("OP", "NOT", (inner,))
+            if v != 0:
+                rest.append(("C", v, w))
+        return self.flat_sort(op, rest)
+
+    def pass_algebra(self):
+        for name in list(self.rhs):
+            x = self.rhs[name]
+            if _is_atom(x) or x[0] != "OP":
+                continue
+            new = self.simplify(x)
+            if new != x:
+                self.rhs[name] = new
+
+    def simplify(self, x):
+        op, args = x[1], list(x[2])
+        w = self.width(x)
+        if op == "NOT":
+            d = self.rhs_of_ref(args[0])
+            if d is not None and d[0] == "OP" and d[1] == "NOT":
+                return d[2][0]
+            return self.fold(x)
+        if op == "MUX":
+            s, a, b = args
+            d = self.rhs_of_ref(s)
+            if d is not None and d[0] == "OP" and d[1] == "NOT":
+                return ("OP", "MUX", (d[2][0], b, a))
+            if a == b:
+                return a
+            if s[0] == "C":
+                return a if s[1] else b
+            if w == 1:
+                one, zero = ("C", 1, 1), ("C", 0, 1)
+                if a == one and b == zero:
+                    return s
+                if a == zero and b == one:
+                    return ("OP", "NOT", (s,))
+                if a == one or a == s:
+                    return self.flat_sort("OR", [s, b])
+                if b == zero or b == s:
+                    return self.flat_sort("AND", [s, a])
+                if a == zero:
+                    ns = self.as_atom(("OP", "NOT", (s,)))
+                    return self.flat_sort("AND", [ns, b])
+                if b == one:
+                    ns = self.as_atom(("OP", "NOT", (s,)))
+                    return self.flat_sort("OR", [ns, a])
+            return x
+        if op in ("AND", "OR"):
+            uniq = list(dict.fromkeys(args))
+            argset = set(uniq)
+            for a in uniq:
+                d = self.rhs_of_ref(a)
+                if (d is not None and d[0] == "OP" and d[1] == "NOT"
+                        and d[2][0] in argset):
+                    return self.zero(w) if op == "AND" else self.ones(w)
+            dual = "OR" if op == "AND" else "AND"
+            keep = []
+            for a in uniq:
+                d = self.rhs_of_ref(a)
+                if (d is not None and d[0] == "OP" and d[1] == dual
+                        and any(b in argset and b != a for b in d[2])):
+                    continue  # absorption: a AND (a OR b) = a
+                keep.append(a)
+            if not keep:
+                keep = uniq[:1]
+            return self.fold(self.wrap(op, keep, w))
+        if op == "XOR":
+            cnt = {}
+            for a in args:
+                cnt[a] = cnt.get(a, 0) + 1
+            odd = [a for a in dict.fromkeys(args) if cnt[a] % 2 == 1]
+            flip = False
+            changed = True
+            while changed:
+                changed = False
+                for a in odd:
+                    d = self.rhs_of_ref(a)
+                    if (d is not None and d[0] == "OP" and d[1] == "NOT"
+                            and d[2][0] in odd):
+                        odd.remove(a)
+                        odd.remove(d[2][0])
+                        flip = not flip
+                        changed = True
+                        break
+            if flip:
+                odd.append(self.ones(w))
+            return self.fold(self.wrap(op, odd, w))
+        return self.fold(x)
+
+    def wrap(self, op, args, w):
+        if not args:
+            return self.zero(w)
+        if len(args) == 1:
+            return args[0]
+        return ("OP", op, tuple(sorted(args)))
+
+    def pass_cse(self):
+        # Outputs aliasing an internal wire take over its definition.
+        for y in self.outputs:
+            x = self.rhs.get(y)
+            if (x is not None and x[0] == "R" and x[1] in self.rhs
+                    and x[1] not in self.ports):
+                t = x[1]
+                self.rhs[y] = self.rhs[t]
+                self.rhs[t] = ("R", y)
+                self.redirect(t, y)
+                del self.rhs[t]
+        # Structural hashing (single sweep in dependency order).
+        level = self.levels()
+        order = sorted(self.rhs, key=lambda n: (level[n], n not in self.output_set,
+                                                _natural_key(n)))
+        repl = {}
+
+        def fn(a):
+            if a[0] == "C" or a[1] not in repl:
+                return a
+            old, new = a[1], repl[a[1]]
+            d = self.ranges[new][1] - self.ranges[old][1]
+            if a[0] == "R":
+                return ("R", new)
+            if a[0] == "I":
+                return self.canon_atom(("I", new, a[2] + d))
+            return self.canon_atom(("S", new, a[2] + d, a[3] + d))
+        table = {}
+        for name in order:
+            x = self.rhs[name]
+            if repl:
+                if _is_atom(x):
+                    x = fn(x)
+                elif x[0] == "CAT":
+                    x = ("CAT", tuple(fn(a) for a in x[1]))
+                else:
+                    x = ("OP", x[1], tuple(fn(a) for a in x[2]))
+                self.rhs[name] = x
+            if _is_atom(x):
+                continue
+            key = x
+            if x[0] == "OP" and x[1] in ASSOC_OPS:
+                key = ("OP", x[1], tuple(sorted(x[2])))
+            rep = table.get(key)
+            if rep is None:
+                table[key] = name
+            elif name in self.output_set:
+                self.rhs[name] = ("R", rep)
+            else:
+                repl[name] = rep
+                del self.rhs[name]
+
+    def cse_order(self):
+        outs = sorted(n for n in self.rhs if n in self.output_set)
+        rest = sorted(n for n in self.rhs if n not in self.output_set)
+        return outs + rest
+
+    def pass_dce(self):
+        seen = set()
+        stack = [o for o in self.outputs]
+        while stack:
+            n = stack.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            if n in self.rhs:
+                stack.extend(self.refs_in(self.rhs[n]))
+        for n in list(self.rhs):
+            if n not in seen and n not in self.ports:
+                del self.rhs[n]
+
+    def pass_fanin(self):
+        k = self.fanin_limit
+        if k is None:
+            return
+        for name in list(self.rhs):
+            x = self.rhs[name]
+            if _is_atom(x) or x[0] != "OP" or x[1] not in ASSOC_OPS:
+                continue
+            if len(x[2]) <= k:
+                continue
+            op = x[1]
+            w = self.width(x)
+            args = list(x[2])
+            while len(args) > k:
+                nxt = []
+                for i in range(0, len(args), k):
+                    chunk = args[i:i + k]
+                    if len(chunk) == 1:
+                        nxt.append(chunk[0])
+                    else:
+                        nxt.append(("R", self.new_wire(("OP", op, tuple(chunk)), w)))
+                args = nxt
+            self.rhs[name] = ("OP", op, tuple(sorted(args)))
+
+    # -- output -------------------------------------------------------------
+    def levels(self):
+        level = {}
+
+        def lv(n):
+            if n not in self.rhs:
+                return 0
+            if n in level:
+                return level[n]
+            stack = [n]
+            while stack:
+                m = stack[-1]
+                pend = [d for d in self.refs_in(self.rhs[m])
+                        if d in self.rhs and d not in level]
+                if pend:
+                    stack.extend(pend)
+                    continue
+                stack.pop()
+                level[m] = 1 + max([level.get(d, 0) for d in self.refs_in(self.rhs[m])
+                                    if d in self.rhs] or [0])
+            return level[n]
+        for n in self.rhs:
+            lv(n)
+        return level
+
+    def order(self):
+        """Dependency order: by logic level, ties by (natural) name."""
+        level = self.levels()
+        return sorted(self.rhs, key=lambda n: (level[n], _natural_key(n)))
+
+    def rename_compact(self, order):
+        mapping = {}
+        i = 0
+        for n in order:
+            if n in self.ports:
+                continue
+            while "n%d" % i in self.ports:
+                i += 1
+            mapping[n] = "n%d" % i
+            i += 1
+        if all(k == v for k, v in mapping.items()):
+            return order
+
+        def fn(a):
+            if a[0] == "C" or a[1] not in mapping:
+                return a
+            return (a[0], mapping[a[1]]) + tuple(a[2:])
+        self.map_atoms(fn)
+        new_rhs = {}
+        new_ranges = {}
+        for n, x in self.rhs.items():
+            new_rhs[mapping.get(n, n)] = x
+        for n, r in self.ranges.items():
+            if n in mapping:
+                new_ranges[mapping[n]] = r
+            elif n in self.ports:
+                new_ranges[n] = r
+        for n in self.rhs:
+            if n in self.ports:
+                new_ranges[n] = self.ranges[n]
+        self.ranges = new_ranges
+        self.rhs = new_rhs
+        self.used_names = set(self.ports) | set(new_rhs)
+        return self.order()
+
+    def fmt_atom(self, a):
+        t = a[0]
+        if t == "C":
+            if a[2] == 1:
+                return str(a[1])
+            return "0b" + format(a[1], "0%db" % a[2])
+        if t == "R":
+            return a[1]
+        if t == "I":
+            return "%s[%d]" % (a[1], a[2])
+        return "%s[%d:%d]" % (a[1], a[2], a[3])
+
+    def fmt_rhs(self, x, sep=", ", bench=False):
+        if _is_atom(x):
+            s = self.fmt_atom(x)
+            return "BUF(%s)" % s if bench else s
+        if x[0] == "CAT":
+            return "{" + sep.join(self.fmt_atom(a) for a in x[1]) + "}"
+        parts = [self.fmt_atom(a) for a in x[2]]
+        if x[1] in ASSOC_OPS:
+            parts.sort()
+        return "%s(%s)" % (x[1], sep.join(parts))
+
+
+def _natural_key(name):
+    return [(0, int(p), "") if p.isdigit() else (1, 0, p)
+            for p in re.split(r"(\d+)", name) if p != ""]
+
+
+def finalize(net, max_rounds=60):
+    passes = ["normalize", "constfold", "algebra", "cse", "dce"]
+    if net.fanin_limit is not None:
+        passes.append("fanin")
+    for _ in range(max_rounds):
+        changed = False
+        for p in passes:
+            if net.run_pass(p):
+                changed = True
+        if not changed:
+            return
+
+
+def bench_lower_mux(net):
+    """BENCH has no MUX: MUX(s, a, b) -> OR(AND(s, a), AND(NOT(s), b))."""
+    found = False
+    for n in list(net.rhs):
+        x = net.rhs[n]
+        if x[0] == "OP" and x[1] == "MUX":
+            found = True
+            s_, a, b = x[2]
+            ns = ("R", net.new_wire(("OP", "NOT", (s_,)), 1))
+            t1 = ("R", net.new_wire(net.flat_sort("AND", [s_, a]), 1))
+            t2 = ("R", net.new_wire(net.flat_sort("AND", [ns, b]), 1))
+            net.rhs[n] = net.flat_sort("OR", [t1, t2])
+    if found:
+        finalize(net)
+
+
+def bench_dedupe_bufs(net):
+    """Outputs that alias the same signal: later ones alias the first."""
+    seen = {}
+    for n in sorted(net.outputs):
+        x = net.rhs.get(n)
+        if x is None or not _is_atom(x):
+            continue
+        if x in seen:
+            net.rhs[n] = ("R", seen[x])
+        else:
+            seen[x] = n
+
+
+def bench_constants(net):
+    """BENCH has no literals: synthesize constant outputs from an input."""
+    names = [n for n, x in net.rhs.items() if x[0] == "C"]
+    if not names:
+        return
+    if not net.inputs:
+        raise UnsupportedFeatureError(
+            "BENCH format cannot represent constant signals in a circuit "
+            "without inputs")
+    i = ("R", sorted(net.inputs)[0])
+    ni = ("R", net.new_wire(("OP", "NOT", (i,)), 1))
+    first = {}
+    for n in sorted(names, key=lambda m: (m not in net.output_set, m)):
+        v = net.rhs[n][1]
+        if v in first:
+            net.rhs[n] = ("R", first[v])
+            continue
+        first[v] = n
+        net.rhs[n] = ("OP", "OR" if v else "AND", tuple(sorted([i, ni])))
+    net.run_pass("cse")
+    net.run_pass("dce")
+
+
+def write_net(net, order, out_fmt):
+    inputs = sorted(net.inputs)
+    outputs = sorted(net.outputs)
+    wires = sorted(n for n in net.rhs if n not in net.ports)
+
+    def label(n):
+        msb, lsb = net.ranges[n]
+        if (msb, lsb) == (0, 0):
+            return n
+        return "%s[%d:%d]" % (n, msb, lsb)
+    if out_fmt == "bench":
+        lines = ["INPUT(%s)" % n for n in inputs]
+        lines += ["OUTPUT(%s)" % n for n in outputs]
+        for n in order:
+            lines.append("%s = %s" % (n, net.fmt_rhs(net.rhs[n], ",", True)))
+        return "\n".join(lines) + "\n"
+    if out_fmt == "circ":
+        lines = []
+        if inputs:
+            lines.append("input " + " ".join(label(n) for n in inputs))
+        lines.append("output " + " ".join(label(n) for n in outputs))
+        if wires:
+            lines.append("wire " + " ".join(label(n) for n in wires))
+        lines.append("")
+        for n in order:
+            lines.append("%s = %s" % (n, net.fmt_rhs(net.rhs[n])))
+        return "\n".join(lines) + "\n"
+
+    def ports(ns):
+        return [{"name": n, "msb": net.ranges[n][0], "lsb": net.ranges[n][1]}
+                for n in ns]
+    doc = {
+        "format_version": 1,
+        "inputs": ports(inputs),
+        "outputs": ports(outputs),
+        "wires": ports(wires),
+        "assignments": [{"lhs": n, "rhs": net.fmt_rhs(net.rhs[n])} for n in order],
+    }
+    return json.dumps(doc, indent=2) + "\n"
+
+
+def _choice_opt(opts, flag, choices, default):
+    if not opts.get(flag):
+        return default
+    raw = opts[flag][-1]
+    v = raw.strip().lower()
+    if v not in choices:
+        raise CliUsageError("invalid %s %r (expected %s)"
+                            % (flag, raw, "|".join(choices)))
+    return v
+
+
+def cmd_opt(args, opts):
+    if len(args) != 1:
+        raise CliUsageError("opt requires exactly one file argument")
+    fmt = get_format_opt(opts)
+    if not opts.get("-o") or not opts["-o"][-1]:
+        raise CliUsageError("opt requires -o <out_file>")
+    out_path = opts["-o"][-1]
+    if opts.get("--out-format"):
+        out_fmt = _choice_opt(opts, "--out-format", ("circ", "json", "bench"), None)
+    else:
+        ext = os.path.splitext(out_path)[1].lower()
+        if ext not in FORMAT_BY_EXT:
+            raise UnknownOutputFormatError(
+                "cannot infer output format from extension %r of %s "
+                "(use --out-format circ|json|bench)" % (ext, out_path))
+        out_fmt = FORMAT_BY_EXT[ext]
+    pipeline = _choice_opt(opts, "--pipeline", tuple(OPT_PIPELINES), "default")
+    if opts.get("--passes"):
+        passes = []
+        for raw in opts["--passes"]:
+            for p in raw.split(","):
+                p = p.strip().lower()
+                if not p:
+                    continue
+                if p not in OPT_PASSES:
+                    raise CliUsageError("unknown pass %r (expected one of %s)"
+                                        % (p, ",".join(OPT_PASSES)))
+                passes.append(p)
+        if not passes:
+            raise CliUsageError("--passes requires at least one pass name")
+    else:
+        passes = list(OPT_PIPELINES[pipeline])
+    max_iters = _int_opt(opts, "--max-iters", 6)
+    fl = _choice_opt(opts, "--fanin-limit", ("none", "2", "3", "4"), "none")
+    fanin_limit = None if fl == "none" else int(fl)
+    if fanin_limit is not None and not opts.get("--passes") and "fanin" not in passes:
+        passes.append("fanin")
+    rename = _choice_opt(opts, "--rename", ("keep", "compact"), "keep")
+    verify = bool(opts.get("--verify"))
+    if verify:
+        limit = required_int(opts, "--max-input-bits", "opt --verify")
+        trials = _int_opt(opts, "--trials", 10000)
+        if trials < 1:
+            raise CliUsageError("--trials must be a positive integer")
+        seed = _int_opt(opts, "--seed", 0)
+    else:
+        if opts.get("--max-input-bits"):
+            _int_opt(opts, "--max-input-bits", 0)
+        if opts.get("--trials"):
+            _int_opt(opts, "--trials", 0)
+    report_path = None
+    if opts.get("--report"):
+        report_path = opts["--report"][-1]
+        if not report_path:
+            raise CliUsageError("--report requires a file path")
+
+    c, _ = load_circuit(args[0], fmt)
+    for n in c.outputs:
+        if n in c.inputs:
+            if out_fmt != "bench":
+                raise UnsupportedFeatureError(
+                    "output %r is also an input; cannot be represented in %s"
+                    % (n, out_fmt))
+    if out_fmt == "bench":
+        for n in c.inputs + c.outputs:
+            if c.ranges[n] != (0, 0):
+                raise UnsupportedFeatureError(
+                    "BENCH format requires scalar-only circuits")
+
+    net = Netlist(c, fanin_limit)
+    log = []
+    for _ in range(max_iters):
+        changed = False
+        for p in passes:
+            ch = net.run_pass(p)
+            log.append({"name": p, "changed": ch})
+            changed = changed or ch
+        if not changed:
+            break
+    finalize(net)
+    if out_fmt == "bench":
+        for n in net.rhs:
+            if net.ranges[n] != (0, 0):
+                raise UnsupportedFeatureError(
+                    "BENCH format requires scalar-only circuits")
+        bench_lower_mux(net)
+        bench_constants(net)
+        bench_dedupe_bufs(net)
+    order = net.order()
+    if rename == "compact":
+        order = net.rename_compact(order)
+    text = write_net(net, order, out_fmt)
+    write_file(out_path, text)
+
+    cout, _ = load_circuit(out_path, out_fmt)
+    if report_path is not None:
+        report = {
+            "input_stats": compute_stats(c),
+            "output_stats": compute_stats(cout),
+            "passes": log,
+        }
+        write_file(report_path, json.dumps(report, indent=2) + "\n")
+    if verify:
+        compared = sorted(dict.fromkeys(c.outputs))
+        ret = run_equiv(c, cout, compared, limit, trials, seed)
+        if len(ret) > 2:
+            res = {"equivalent": False,
+                   "counterexample": ret[0]["counterexample"]}
+            return res, ret[1], 10
+    result = {"out_path": out_path}
+    msg = "wrote %s" % out_path
+    if report_path is not None:
+        result["report_path"] = report_path
+        msg += "\nwrote %s" % report_path
+    return result, msg
+
+
 COMMANDS = {"check": cmd_check, "eval": cmd_eval, "stats": cmd_stats,
             "lint": cmd_lint, "dot": cmd_dot, "cone": cmd_cone,
-            "truth-table": cmd_truth_table, "equiv": cmd_equiv}
+            "truth-table": cmd_truth_table, "equiv": cmd_equiv,
+            "opt": cmd_opt}
 # command -> {flag: takes_value}
 COMMAND_FLAGS = {
     "check": {"--format": True},
@@ -2082,6 +3008,10 @@ COMMAND_FLAGS = {
                     "-o": True, "--out-format": True, "--mode": True},
     "equiv": {"--format": True, "--max-input-bits": True, "--trials": True,
               "--outputs": True},
+    "opt": {"--format": True, "-o": True, "--out-format": True, "--pipeline": True,
+            "--passes": True, "--max-iters": True, "--fanin-limit": True,
+            "--rename": True, "--verify": False, "--max-input-bits": True,
+            "--trials": True, "--report": True},
 }
 for _flags in COMMAND_FLAGS.values():
     _flags["--seed"] = True
