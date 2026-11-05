@@ -31,6 +31,7 @@ MAX_ATTEMPTS = 3
 PAYLOAD_MAGIC = b"PWDV1"
 DEFAULT_CLIPBOARD_TTL = 15
 DEFAULT_HIDE_DELAY = 5
+DEFAULT_AUTO_LOCK = 900
 SUGGESTION_LENGTH = 20
 
 BANNER = r"""
@@ -47,6 +48,10 @@ class QuitProgram(Exception):
 
 class DecryptionError(Exception):
     pass
+
+
+class AutoLocked(Exception):
+    """Raised when the vault was idle for longer than the auto-lock timeout."""
 
 
 # ---------------------------------------------------------------- crypto ---
@@ -123,6 +128,8 @@ def write_config(salt):
         "iterations": KDF_ITERATIONS,
         "salt": base64.b64encode(salt).decode("ascii"),
     }
+    if SETTINGS:
+        cfg["settings"] = dict(SETTINGS)
     _atomic_write(CONFIG_PATH, json.dumps(cfg, indent=2).encode("utf-8"))
     return cfg
 
@@ -215,23 +222,80 @@ def empty_vault_data():
 
 # -------------------------------------------------------------------- io ---
 
+_stdin_buf = b""
+_lock_armed = False
+
+
+def _remaining_lock_time(started):
+    timeout = auto_lock_seconds()
+    if not _lock_armed or timeout <= 0:
+        return None
+    return timeout - (time.monotonic() - started)
+
+
+def _check_idle(started):
+    """Raise AutoLocked if input arrived after the auto-lock timeout."""
+    remaining = _remaining_lock_time(started)
+    if remaining is not None and remaining < 0:
+        raise AutoLocked()
+
+
+def _raw_readline(started):
+    """Read one line from fd 0 (own buffer so select() stays accurate).
+
+    Returns None on EOF with no pending data.
+    """
+    global _stdin_buf
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, ValueError, OSError):
+        fd = None
+    if fd is None:
+        line = sys.stdin.readline()
+        return line if line != "" else None
+    import select
+    while b"\n" not in _stdin_buf:
+        remaining = _remaining_lock_time(started)
+        if remaining is not None and os.name != "nt":
+            if remaining <= 0:
+                raise AutoLocked()
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise AutoLocked()
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            if _stdin_buf:
+                data, _stdin_buf = _stdin_buf, b""
+                return data.decode("utf-8", "replace")
+            return None
+        _stdin_buf += chunk
+    idx = _stdin_buf.index(b"\n") + 1
+    data, _stdin_buf = _stdin_buf[:idx], _stdin_buf[idx:]
+    return data.decode("utf-8", "replace")
+
+
 def read_line(prompt=""):
     sys.stdout.write(prompt)
     sys.stdout.flush()
-    line = sys.stdin.readline()
-    if line == "":
+    started = time.monotonic()
+    line = _raw_readline(started)
+    if line is None:
         sys.stdout.write("\n")
         raise QuitProgram()
+    _check_idle(started)
     return line.rstrip("\r\n")
 
 
 def read_secret(prompt):
     if sys.stdin.isatty():
         import getpass
+        started = time.monotonic()
         try:
-            return getpass.getpass(prompt)
+            value = getpass.getpass(prompt)
         except EOFError:
             raise QuitProgram()
+        _check_idle(started)
+        return value
     return read_line(prompt)
 
 
@@ -251,14 +315,69 @@ def _env_seconds(names, default):
     return default
 
 
+# Persisted runtime settings (stored in the metadata/config file).
+SETTINGS = {}
+
+
+def _setting(key, env_names, default):
+    if key in SETTINGS:
+        return SETTINGS[key]
+    return _env_seconds(env_names, default)
+
+
 def clipboard_ttl():
-    return _env_seconds(("PWD_MANAGER_CLIPBOARD_TTL", "VAULT_CLIPBOARD_TTL",
-                         "CLIPBOARD_TTL"), DEFAULT_CLIPBOARD_TTL)
+    return _setting("clipboard_ttl", ("PWD_MANAGER_CLIPBOARD_TTL",
+                                      "VAULT_CLIPBOARD_TTL", "CLIPBOARD_TTL"),
+                    DEFAULT_CLIPBOARD_TTL)
 
 
 def hide_delay():
-    return _env_seconds(("PWD_MANAGER_HIDE_DELAY", "VAULT_HIDE_DELAY",
-                         "HIDE_DELAY"), DEFAULT_HIDE_DELAY)
+    return _setting("hide_delay", ("PWD_MANAGER_HIDE_DELAY", "VAULT_HIDE_DELAY",
+                                   "HIDE_DELAY"), DEFAULT_HIDE_DELAY)
+
+
+def auto_lock_seconds():
+    return _setting("auto_lock", ("PWD_MANAGER_AUTO_LOCK", "VAULT_AUTO_LOCK",
+                                  "AUTO_LOCK"), DEFAULT_AUTO_LOCK)
+
+
+def load_settings():
+    """Load persisted settings from the active config file, if any."""
+    SETTINGS.clear()
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return
+    stored = cfg.get("settings") if isinstance(cfg, dict) else None
+    if not isinstance(stored, dict):
+        return
+    for key in ("clipboard_ttl", "hide_delay", "auto_lock"):
+        value = stored.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            SETTINGS[key] = value
+
+
+def save_settings():
+    """Persist settings into the active config file (if it exists yet).
+
+    When no vault exists yet the settings are written by ``write_config``
+    during first-run setup.
+    """
+    if not os.path.isfile(CONFIG_PATH):
+        return True
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if not isinstance(cfg, dict):
+            raise ValueError("config is not a JSON object")
+        cfg["settings"] = dict(SETTINGS)
+        _atomic_write(CONFIG_PATH, json.dumps(cfg, indent=2).encode("utf-8"))
+        return True
+    except (OSError, ValueError) as exc:
+        print("Warning: could not save settings to %s (%s)."
+              % (CONFIG_PATH, exc))
+        return False
 
 
 def _fmt_seconds(value):
@@ -448,7 +567,7 @@ def reveal_password(password, delay=None):
     sys.stdout.write(label + password)
     sys.stdout.flush()
     try:
-        time.sleep(delay)
+        time.sleep(max(0, delay))
     except KeyboardInterrupt:
         pass
     # Overwrite the cleartext in place (clear the whole line, then mask).
@@ -676,9 +795,22 @@ def run_setup():
             print("Error: master keys do not match. Please start again.")
             continue
         break
-    salt = secrets.token_bytes(16)
-    cfg = write_config(salt)
-    vault = Vault(derive_keys(key, salt), empty_vault_data())
+    cfg = None
+    iterations = KDF_ITERATIONS
+    if os.path.isfile(CONFIG_PATH):
+        # The metadata file may be shared with another vault payload (e.g.
+        # only -v was given); reuse it rather than overwriting its salt.
+        try:
+            cfg, salt, iterations = load_config()
+            if "settings" not in cfg and SETTINGS:
+                save_settings()
+        except (OSError, ValueError, KeyError, TypeError):
+            cfg = None
+    if cfg is None:
+        salt = secrets.token_bytes(16)
+        cfg = write_config(salt)
+        iterations = KDF_ITERATIONS
+    vault = Vault(derive_keys(key, salt, iterations), empty_vault_data())
     vault.save()
     print("Vault created successfully.")
     print("Your config salt is: %s" % cfg["salt"])
@@ -974,22 +1106,275 @@ def main_menu(vault):
                 action = add_secret(vault)
 
 
-def main():
+# --------------------------------------------------------- import/export ---
+
+SUPPORTED_FORMATS = ("json",)
+EXPORT_FIELDS = ("name", "url", "login", "password", "notes", "category")
+
+
+def export_records(vault):
+    records = []
+    for it in vault.sorted_items():
+        records.append({
+            "name": it.get("name", "") or "",
+            "url": it.get("url", "") or "",
+            "login": it.get("login", "") or "",
+            "password": it.get("password", "") or "",
+            "notes": it.get("notes", "") or "",
+            "category": vault.category_name(it.get("category")),
+        })
+    return records
+
+
+def run_export(vault, path):
+    data = json.dumps(export_records(vault), indent=2, ensure_ascii=False)
     try:
-        os.makedirs(VAULT_DIR, exist_ok=True)
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data + "\n")
+    except OSError as exc:
+        print("Error: could not write export file %s: %s" % (path, exc))
+        return 1
+    print("Exported %d item(s) to %s" % (len(vault.items), path))
+    return 0
+
+
+def _field_str(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return json.dumps(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def load_import_file(path):
+    """Return (records, error_message)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, "Error: could not open import file %s: %s" % (path, exc)
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return None, ("Error: import file %s is not valid JSON: %s"
+                      % (path, exc))
+    if not isinstance(data, list):
+        return None, ("Error: import file %s must contain a JSON array of "
+                      "objects." % path)
+    records = []
+    for idx, element in enumerate(data, 1):
+        if not isinstance(element, dict):
+            return None, ("Error: element %d in import file %s is not a JSON "
+                          "object; nothing was imported." % (idx, path))
+        records.append({f: _field_str(element.get(f)) for f in EXPORT_FIELDS})
+    return records, None
+
+
+def render_import_preview(records):
+    if not records:
+        return "Empty!"
+    rows = [[r["name"], r["url"], r["login"], r["category"]] for r in records]
+    return _grid(["Name", "URL", "Login", "Category"], rows)
+
+
+def import_records(vault, records):
+    by_name = {}
+    for c in vault.sorted_categories():
+        by_name.setdefault(c["name"], c["id"])
+    for r in records:
+        cat_name = r["category"]
+        cat_id = None
+        if cat_name.strip() != "":
+            if cat_name not in by_name:
+                cid = vault.data.setdefault("next_category_id", 1)
+                vault.data["next_category_id"] = cid + 1
+                vault.categories.append({"id": cid, "name": cat_name})
+                by_name[cat_name] = cid
+            cat_id = by_name[cat_name]
+        item_id = vault.data["next_id"]
+        vault.data["next_id"] = item_id + 1
+        vault.items.append({
+            "id": item_id, "name": r["name"], "url": r["url"],
+            "login": r["login"], "password": r["password"],
+            "notes": r["notes"], "category": cat_id,
+        })
+    vault.save()
+    return len(records)
+
+
+def run_import(path):
+    print("Warning: importing will add secrets to your vault. "
+          "Please back up your vault (%s and %s) before continuing."
+          % (VAULT_PATH, CONFIG_PATH))
+    vault = unlock()
+    records, error = load_import_file(path)
+    if error:
+        print(error)
+        print("The vault was not modified.")
+        return 1
+    print(render_import_preview(records))
+    if not ask_yes_no("Import these %d item(s)?" % len(records)):
+        print("Import cancelled; the vault was not modified.")
+        return 0
+    original = json.loads(json.dumps(vault.data))
+    try:
+        count = import_records(vault, records)
+    except OSError as exc:
+        vault.data = original
+        print("Error: could not save the vault: %s. Nothing was imported."
+              % exc)
+        return 1
+    print("%d items have been imported." % count)
+    return 0
+
+
+# ------------------------------------------------------------------- cli ---
+
+def _parse_seconds(flag, raw):
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is None or value != value or value in (float("inf"),
+                                                    float("-inf")):
+        print("Error: %s expects a number of seconds, got '%s'." % (flag, raw))
+        sys.exit(2)
+    return value
+
+
+def build_parser():
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="pwd_manager.py", allow_abbrev=False,
+        description="Interactive password manager with an encrypted vault.")
+    parser.add_argument("-t", metavar="N", dest="clipboard_ttl",
+                        help="clipboard auto-clear seconds (default %d)"
+                        % DEFAULT_CLIPBOARD_TTL)
+    parser.add_argument("-p", metavar="N", dest="hide_delay",
+                        help="password hide delay seconds (default %d)"
+                        % DEFAULT_HIDE_DELAY)
+    parser.add_argument("-a", metavar="N", dest="auto_lock",
+                        help="auto-lock seconds (default %d)"
+                        % DEFAULT_AUTO_LOCK)
+    parser.add_argument("-v", metavar="PATH", dest="vault_path",
+                        help="custom vault payload path")
+    parser.add_argument("-c", metavar="PATH", dest="config_path",
+                        help="custom metadata (config) path")
+    parser.add_argument("-i", metavar="FILE", dest="import_file",
+                        help="import secrets from FILE and exit")
+    parser.add_argument("-x", metavar="FILE", dest="export_file",
+                        help="export secrets to FILE and exit")
+    parser.add_argument("-f", metavar="FORMAT", dest="format", default="json",
+                        help="import/export file format (only 'json')")
+    return parser
+
+
+def _ensure_parent(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+
+
+def apply_paths(args):
+    global VAULT_PATH, CONFIG_PATH
+    if args.vault_path is not None:
+        VAULT_PATH = os.path.abspath(os.path.expanduser(args.vault_path))
+    if args.config_path is not None:
+        CONFIG_PATH = os.path.abspath(os.path.expanduser(args.config_path))
+    if VAULT_PATH == CONFIG_PATH:
+        print("Error: the vault path and the config path must differ.")
+        sys.exit(2)
+    for path in (VAULT_PATH, CONFIG_PATH):
         try:
-            os.chmod(VAULT_DIR, 0o700)
-        except OSError:
-            pass
-        if not os.path.isfile(VAULT_PATH):
-            run_setup()
-        elif not os.path.isfile(CONFIG_PATH):
-            print("Error: vault data exists at %s but the config file %s is "
-                  "missing. The vault cannot be opened without its salt."
-                  % (VAULT_PATH, CONFIG_PATH))
+            _ensure_parent(path)
+        except OSError as exc:
+            print("Error: could not create directory for %s: %s" % (path, exc))
             sys.exit(2)
-        vault = unlock()
-        main_menu(vault)
+    try:
+        if os.path.isdir(VAULT_DIR) and VAULT_PATH.startswith(VAULT_DIR):
+            os.chmod(VAULT_DIR, 0o700)
+    except OSError:
+        pass
+
+
+TTL_FLAGS = (
+    ("clipboard_ttl", "-t", "Clipboard auto-clear timeout"),
+    ("hide_delay", "-p", "Password hide delay"),
+    ("auto_lock", "-a", "Auto-lock timeout"),
+)
+
+
+def apply_ttl_flags(args):
+    changed = False
+    for key, flag, label in TTL_FLAGS:
+        raw = getattr(args, key)
+        if raw is None:
+            continue
+        value = _parse_seconds(flag, raw)
+        SETTINGS[key] = value
+        changed = True
+        print("%s set to %s seconds." % (label, _fmt_seconds(value)))
+    if changed:
+        save_settings()
+
+
+def ensure_vault():
+    """Run first-time setup if needed; exit if the metadata is missing."""
+    if not os.path.isfile(VAULT_PATH):
+        run_setup()
+    elif not os.path.isfile(CONFIG_PATH):
+        print("Error: vault data exists at %s but the config file %s is "
+              "missing. The vault cannot be opened without its salt."
+              % (VAULT_PATH, CONFIG_PATH))
+        sys.exit(2)
+
+
+def run_interactive():
+    global _lock_armed
+    vault = unlock()
+    while True:
+        _lock_armed = True
+        try:
+            main_menu(vault)
+        except AutoLocked:
+            _lock_armed = False
+            print()
+            print("Vault locked after %s second(s) of inactivity."
+                  % _fmt_seconds(auto_lock_seconds()))
+            vault = unlock()
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    one_shot = args.import_file is not None or args.export_file is not None
+    if one_shot:
+        if args.import_file is not None and args.export_file is not None:
+            print("Error: -i and -x cannot be used together.")
+            return 2
+        fmt = (args.format or "").strip().lower()
+        if fmt not in SUPPORTED_FORMATS:
+            print("Error: unsupported format '%s'. Only 'json' is supported."
+                  % args.format)
+            return 2
+    try:
+        apply_paths(args)
+        load_settings()
+        apply_ttl_flags(args)
+        ensure_vault()
+        if args.export_file is not None:
+            vault = unlock()
+            return run_export(vault, args.export_file)
+        if args.import_file is not None:
+            return run_import(args.import_file)
+        run_interactive()
     except (QuitProgram, KeyboardInterrupt):
         print("Goodbye!")
     return 0
