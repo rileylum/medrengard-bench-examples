@@ -5,6 +5,10 @@ Usage:
     python sith.py complete <file> <line> <col> [--fuzzy] [--project DIR]
     python sith.py infer <file> <line> <col> [--project DIR]
     python sith.py goto <file> <line> <col> [--follow-imports] [--project DIR]
+    python sith.py signatures <file> <line> <col> [--project DIR]
+    python sith.py references <file> <line> <col> [--scope file|project] [--project DIR]
+    python sith.py search <query> [--project DIR]
+    python sith.py names <file> [--all-scopes] [--project DIR]
 """
 import ast
 import builtins
@@ -814,6 +818,37 @@ class ModuleInfo(object):
         self._by_node = None
         self._all = False
         self._busy = False
+        self.is_stub = path.endswith('.pyi')
+        self.source = None      # for stubs: the runtime module (if any)
+        self.qual_name = None   # explicit dotted module name override
+        self._stub = False
+        self._parents = None
+
+    def parents(self):
+        if self._parents is None:
+            par = {}
+            if self.tree is not None:
+                for node in ast.walk(self.tree):
+                    for c in ast.iter_child_nodes(node):
+                        par[c] = node
+            self._parents = par
+        return self._parents
+
+    def stub(self):
+        """The stub module providing type information for this module."""
+        if self._stub is not False:
+            return self._stub
+        self._stub = None
+        if self.is_stub or self.namespace:
+            return None
+        sp = find_stub_path(self.path, module_name_of(self))
+        if sp is not None:
+            st = load_local_module(sp, self.name)
+            if st is not None and st is not self:
+                st.source = self
+                st.qual_name = module_name_of(self)
+                self._stub = st
+        return self._stub
 
     def set_tree(self, tree):
         self.tree = tree
@@ -844,9 +879,15 @@ class ModuleInfo(object):
             return []
         self._busy = True
         try:
-            return list(self.scope.visible(None).keys())
+            names = list(self.scope.visible(None).keys())
         finally:
             self._busy = False
+        st = self.stub()
+        if st is not None:
+            for n in st.top_names():
+                if n not in names and not _stub_private_import(st, n):
+                    names.append(n)
+        return names
 
     def dunder_all(self):
         """Names listed in __all__ (or None when not defined)."""
@@ -910,6 +951,11 @@ class ModuleInfo(object):
     def attr(self, name):
         if self._busy:
             return False, []
+        st = self.stub()
+        if st is not None and not _stub_private_import(st, name):
+            ok, vals = st.attr(name)
+            if ok and vals:
+                return ok, vals
         self._busy = True
         try:
             ds = self.attr_defs(name)
@@ -975,11 +1021,67 @@ class ModuleInfo(object):
         mv = self._local_module(_root(), dotted, display)
         if mv is not None:
             return mv
+        sp = find_stub_only(dotted)
+        if sp is not None:
+            mi = load_local_module(sp, dotted)
+            if mi is not None:
+                mi.qual_name = dotted
+                return ModVal(display, local=mi)
         if is_stdlib(dotted):
             mod = real_import(dotted)
             if mod is not None:
                 return ModVal(display, real=mod)
         return None
+
+
+def _stub_private_import(st, name):
+    """Stub-only imports (e.g. `from typing import overload`) are not re-exported."""
+    ds = st.scope.defs.get(name, ()) if st.scope is not None else ()
+    if not ds:
+        return False
+    for d in ds:
+        if d.kind not in ('import', 'importfrom'):
+            return False
+        if d.kind == 'import' and d.extra[1] and d.extra[1] == d.extra[0]:
+            return False
+        if d.kind == 'importfrom' and d.extra[1] == name and \
+                any(a.asname == a.name for a in d.node.names if a.name == name):
+            return False
+    return True
+
+
+def _stubs_dir():
+    return os.path.join(_root(), 'stubs')
+
+
+def find_stub_path(py_path, dotted):
+    """Locate the stub for runtime module at py_path (dotted name `dotted`)."""
+    base, ext = os.path.splitext(os.path.abspath(py_path))
+    if ext == '.py':
+        cand = base + '.pyi'
+        if os.path.isfile(cand):
+            return cand
+    if dotted and dotted != '__main__':
+        return find_stub_only(dotted)
+    return None
+
+
+def find_stub_only(dotted):
+    if not dotted:
+        return None
+    parts = dotted.split('.')
+    if not all(_is_ident(p) for p in parts):
+        return None
+    sd = _stubs_dir()
+    if not os.path.isdir(sd):
+        return None
+    p1 = os.path.join(sd, *parts) + '.pyi'
+    if os.path.isfile(p1):
+        return p1
+    p2 = os.path.join(sd, *(parts + ['__init__.pyi']))
+    if os.path.isfile(p2):
+        return p2
+    return None
 
 
 def _str_elts(node):
@@ -1411,12 +1513,24 @@ def _infer_def(d):
             v = env[d.name]()
             if v:
                 return v
+        if isinstance(fnode, FUNC_TYPES) and s.parent is not None and not is_self:
+            grp, gsc = stub_group(FuncVal(fnode, s.parent))
+            for gn in grp:
+                for gp in func_params(gn) + list(gn.args.kwonlyargs):
+                    if gp.arg == d.name and gp.annotation is not None:
+                        v = annotation_vals(gp.annotation, gsc, (gn.lineno, gn.col_offset))
+                        if v:
+                            return v
         if par.annotation is not None:
             v = annotation_vals(par.annotation, s.parent, (fnode.lineno, fnode.col_offset))
             if v:
                 return v
         if env is not None and d.name in env:
             v = env[d.name]()
+            if v:
+                return v
+        if env is None and not is_self and isinstance(fnode, FUNC_TYPES) and not s.module.is_stub:
+            v = callsite_param_vals(d)
             if v:
                 return v
         if is_self:
@@ -1480,6 +1594,10 @@ def _infer_def(d):
             return path_of_vals(el, path)
     if k == 'annassign':
         value, ann, stmt = d.extra
+        if s.module.is_stub:
+            v = annotation_vals(ann, s, ctx_pos)
+            if v:
+                return v
         if value is not None:
             v = infer_vals(value, s, ctx_pos)
             if v:
@@ -1508,6 +1626,81 @@ def _infer_def(d):
         el = element_vals(iter_node, s.parent if s.parent else s, INF_POS)
         return path_of_vals(el, path)
     return []
+
+
+def _call_targets(fnode, s):
+    """Callees whose calls bind fnode's parameters: (name, kind)."""
+    fs = s.parent
+    if fs is not None and fs.kind == 'class' and fnode.name == '__init__':
+        return fs.node.name, 'init'
+    return fnode.name, 'func'
+
+
+def callsite_param_vals(d):
+    """Dynamic parameter inference: union of argument types at call sites in the same file."""
+    fnode, idx, pkind = d.extra
+    s = d.scope
+    mi = s.module
+    if mi.tree is None or pkind in ('vararg', 'kwarg'):
+        return []
+    cname, ckind = _call_targets(fnode, s)
+    parents = mi.parents()
+    params = func_params(fnode)
+    out = []
+    found = False
+    for call in ast.walk(mi.tree):
+        if not isinstance(call, ast.Call):
+            continue
+        fn = call.func
+        nm = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else None)
+        if nm != cname:
+            continue
+        cs = scope_of_node(mi, call, parents)
+        off = None
+        for v in infer_vals(fn, cs, _start(call)):
+            if ckind == 'func' and isinstance(v, FuncVal) and v.node is fnode:
+                off = 1 if v.bound is not None else 0
+                break
+            if ckind == 'init' and isinstance(v, ClassVal):
+                for c in class_mro(v):
+                    hit = [st for st in c.node.body if isinstance(st, FUNC_TYPES) and st.name == '__init__']
+                    if hit:
+                        if hit[-1] is fnode:
+                            off = 1
+                        break
+                if off is not None:
+                    break
+        if off is None:
+            continue
+        found = True
+        arg = None
+        if pkind == 'pos':
+            k = idx - off
+            if k >= 0:
+                stars = False
+                for i, a in enumerate(call.args):
+                    if isinstance(a, ast.Starred):
+                        stars = True
+                        break
+                    if i == k:
+                        arg = a
+                        break
+                if stars:
+                    continue
+        if arg is None:
+            for kw in call.keywords:
+                if kw.arg == d.name:
+                    arg = kw.value
+                    break
+        if arg is None:
+            dflt = param_default(fnode, d.node)
+            if dflt is not None and s.parent is not None:
+                out.extend(infer_vals(dflt, s.parent, (fnode.lineno, fnode.col_offset)))
+            continue
+        out.extend(infer_vals(arg, cs, _start(call)))
+    if not found:
+        return []
+    return uniq(out)
 
 
 def path_of_vals(vals, path):
@@ -1826,7 +2019,7 @@ def call_vals(f, node=None, s=None, pos=None):
             mapping = bind_args(f.node, node, s, pos, f.bound)
         else:
             mapping = bind_args(f.node, node, s, pos, None)
-        return return_vals(f, mapping)
+        return return_vals(f, mapping, call=(node, s, pos) if node is not None else None)
     if isinstance(f, InstVal):
         thunks = []
         if node is not None and s is not None:
@@ -1844,7 +2037,7 @@ def call_value(f, node=None, s=None, pos=None):
 _ret_active = {}
 
 
-def return_vals(f, mapping=None):
+def return_vals(f, mapping=None, call=None):
     node = f.node
     cnt = _ret_active.get(id(node), 0)
     if cnt >= 2 or sum(_ret_active.values()) > 30:
@@ -1853,7 +2046,7 @@ def return_vals(f, mapping=None):
     _ret_active[id(node)] = cnt + 1
     try:
         with pushed_env(node, mapping):
-            return uniq(_return_vals(f, mapping))
+            return uniq(_return_vals(f, mapping, call))
     except RecursionError:
         return []
     finally:
@@ -1862,7 +2055,7 @@ def return_vals(f, mapping=None):
             del _ret_active[id(node)]
 
 
-def _return_vals(f, mapping):
+def _return_vals(f, mapping, call=None):
     node = f.node
     if isinstance(node, ast.Lambda):
         fs = f.scope.module.node_scope.get(node) if f.scope else None
@@ -1871,6 +2064,21 @@ def _return_vals(f, mapping):
         return infer_vals(node.body, fs, INF_POS)
     if f.scope is None:
         return []
+    grp, gsc = stub_group(f)
+    if grp:
+        chosen = choose_overloads(grp, gsc, f, call)
+        v = []
+        for n in chosen:
+            if n.returns is not None:
+                v.extend(annotation_vals(n.returns, gsc, INF_POS))
+        if v:
+            return uniq(v)
+    if f.scope.module.is_stub:
+        src = source_func(f)
+        if src is not None:
+            return return_vals(src, mapping, call)
+        if node.returns is None:
+            return []
     if node.returns is not None:
         v = annotation_vals(node.returns, f.scope, INF_POS)
         if v:
@@ -1924,6 +2132,132 @@ def _return_vals(f, mapping):
         else:
             vals.extend(infer_vals(r.value, fs, (r.lineno, r.col_offset)))
     return vals
+
+
+# --- stubs: counterparts -------------------------------------------------------
+
+def find_qual(mi, chain):
+    """Nodes named chain[-1] inside the class/def path chain[:-1] of module mi."""
+    if mi is None or mi.tree is None or not chain:
+        return [], None
+    owner = mi.tree
+    for nm in chain[:-1]:
+        cand = [n for n in owner.body if isinstance(n, FUNC_TYPES + (ast.ClassDef,)) and n.name == nm]
+        if not cand:
+            return [], None
+        owner = cand[-1]
+    nodes = [n for n in owner.body if isinstance(n, FUNC_TYPES + (ast.ClassDef,)) and n.name == chain[-1]]
+    return nodes, mi.node_scope.get(owner)
+
+
+def overload_filter(funcs):
+    ov = [n for n in funcs if 'overload' in deco_names(n)]
+    return ov or funcs[-1:]
+
+
+def stub_group(f):
+    """(stub function nodes, their container scope) providing types for FuncVal f."""
+    node = f.node
+    if not isinstance(node, FUNC_TYPES) or f.scope is None:
+        return [], None
+    mi = f.scope.module
+    chain = scope_chain(f.scope) + [node.name]
+    if mi.is_stub:
+        nodes, sc = find_qual(mi, chain)
+    else:
+        st = mi.stub()
+        if st is None:
+            return [], None
+        nodes, sc = find_qual(st, chain)
+    funcs = [n for n in nodes if isinstance(n, FUNC_TYPES)]
+    if not funcs or sc is None:
+        return [], None
+    return overload_filter(funcs), sc
+
+
+def source_func(f):
+    """Runtime FuncVal corresponding to stub FuncVal f (or None)."""
+    mi = f.scope.module
+    if not mi.is_stub or mi.source is None:
+        return None
+    nodes, sc = find_qual(mi.source, scope_chain(f.scope) + [f.node.name])
+    funcs = [n for n in nodes if isinstance(n, FUNC_TYPES)]
+    if not funcs or sc is None:
+        return None
+    return FuncVal(funcs[-1], sc, bound=f.bound)
+
+
+def source_class_node(mi, scope, node):
+    """For a stub class/function, the runtime (node, scope) when it exists."""
+    if not mi.is_stub or mi.source is None:
+        return None
+    nodes, sc = find_qual(mi.source, scope_chain(scope) + [node.name])
+    want = ast.ClassDef if isinstance(node, ast.ClassDef) else FUNC_TYPES
+    nodes = [n for n in nodes if isinstance(n, want)]
+    if not nodes or sc is None:
+        return None
+    return nodes[-1], sc
+
+
+def _vals_compatible(args, anns):
+    if not args or not anns:
+        return True
+    for a in args:
+        for t in anns:
+            if isinstance(a, RealInst) and isinstance(t, RealInst):
+                try:
+                    if a.typ is t.typ or issubclass(a.typ, t.typ):
+                        return True
+                except Exception:
+                    return True
+            elif isinstance(a, InstVal) and isinstance(t, InstVal):
+                if is_subclass_val(a.cls, t.cls):
+                    return True
+            elif isinstance(t, RealInst) and t.typ is object:
+                return True
+            elif type(a) is not type(t) and not (isinstance(a, (RealInst, InstVal)) and
+                                                 isinstance(t, (RealInst, InstVal))):
+                return True
+    return False
+
+
+def choose_overloads(grp, sc, f, call):
+    if len(grp) <= 1 or call is None or call[0] is None:
+        return grp
+    cnode, cs, cpos = call
+    if any(isinstance(a, ast.Starred) for a in cnode.args) or any(k.arg is None for k in cnode.keywords):
+        return grp
+    for ov in grp:
+        params = func_params(ov)
+        off = 1 if f.bound is not None and params else 0
+        a = ov.args
+        pos_params = params[off:]
+        if len(cnode.args) > len(pos_params) and a.vararg is None:
+            continue
+        names = set(p.arg for p in params[off:]) | set(p.arg for p in a.kwonlyargs)
+        posonly = set(p.arg for p in getattr(a, 'posonlyargs', []))
+        if any(k.arg not in names or k.arg in posonly for k in cnode.keywords) and a.kwarg is None:
+            continue
+        supplied = set(p.arg for p in pos_params[:len(cnode.args)]) | set(k.arg for k in cnode.keywords)
+        ndef = len(a.defaults)
+        required = [p.arg for i, p in enumerate(params) if off <= i < len(params) - ndef]
+        required += [p.arg for p, dv in zip(a.kwonlyargs, a.kw_defaults) if dv is None]
+        if any(r not in supplied for r in required):
+            continue
+        ok = True
+        bound_args = list(zip(pos_params, cnode.args)) + \
+            [(p, k.value) for k in cnode.keywords for p in params[off:] + a.kwonlyargs if p.arg == k.arg]
+        for p, argnode in bound_args:
+            if p.annotation is None:
+                continue
+            av = infer_vals(argnode, cs, cpos)
+            tv = annotation_vals(p.annotation, sc, INF_POS)
+            if not _vals_compatible(av, tv):
+                ok = False
+                break
+        if ok:
+            return [ov]
+    return grp
 
 
 def infer_return(f):
@@ -2522,32 +2856,77 @@ def class_attr_map(cls, instance):
 def _class_attr_map(cls, instance):
     """{name: [(kind, obj, ClassVal)]} with kind in 'def', 'field', 'self'."""
     out = {}
-    for c in reversed(class_mro(cls)):
-        cs = class_scope_of(c)
-        dc = instance and is_dataclass(c)
-        body = {}
-        if cs is not None:
-            for name in cs.visible(None):
-                ds = _class_body_reaching(cs, name)
-                if not ds:
-                    continue
-                ents = []
-                for d in ds:
-                    kind = 'def'
-                    if dc and not isinstance(d, StarHit) and d.kind == 'annassign':
-                        kind = 'field'
-                    ents.append((kind, d, c))
-                body[name] = ents
-                out[name] = ents
-        if instance:
-            for name, ads in self_attrs(c).items():
-                ents = [('self', a, c) for a in ads]
-                if name in body and all(not isinstance(d, StarHit) and d.kind not in ('def', 'class')
-                                        for _, d, _ in body[name]):
-                    ents = ents + body[name]
-                out[name] = ents
+    for c0 in reversed(class_mro(cls)):
+        for c, is_stub in class_pairs(c0):
+            cs = class_scope_of(c)
+            if is_stub:
+                if cs is not None:
+                    for name in cs.visible(None):
+                        ds = _class_body_reaching(cs, name)
+                        if not ds:
+                            continue
+                        ents = [('stub', d, c) for d in ds]
+                        out[name] = ents + [e for e in out.get(name, []) if e[0] != 'stub']
+                continue
+            dc = instance and is_dataclass(c)
+            body = {}
+            if cs is not None:
+                for name in cs.visible(None):
+                    ds = _class_body_reaching(cs, name)
+                    if not ds:
+                        continue
+                    ents = []
+                    for d in ds:
+                        kind = 'def'
+                        if dc and not isinstance(d, StarHit) and d.kind == 'annassign':
+                            kind = 'field'
+                        ents.append((kind, d, c))
+                    body[name] = ents
+                    out[name] = ents
+            if instance:
+                for name, ads in self_attrs(c).items():
+                    ents = [('self', a, c) for a in ads]
+                    if name in body and all(not isinstance(d, StarHit) and d.kind not in ('def', 'class')
+                                            for _, d, _ in body[name]):
+                        ents = ents + body[name]
+                    out[name] = ents
     out.pop(PLACEHOLDER, None)
     return out
+
+
+def class_pairs(c):
+    """[(ClassVal, is_stub)] for a class: runtime version first, then its stub."""
+    if c.scope is None:
+        return [(c, False)]
+    mi = c.scope.module
+    chain = scope_chain(c.scope) + [c.node.name]
+    if mi.is_stub:
+        out = []
+        if mi.source is not None:
+            nodes, sc = find_qual(mi.source, chain)
+            nodes = [n for n in nodes if isinstance(n, ast.ClassDef)]
+            if nodes and sc is not None:
+                out.append((ClassVal(nodes[-1], sc), False))
+        out.append((c, True))
+        return out
+    st = mi.stub()
+    out = [(c, False)]
+    if st is not None:
+        nodes, sc = find_qual(st, chain)
+        nodes = [n for n in nodes if isinstance(n, ast.ClassDef)]
+        if nodes and sc is not None:
+            out.append((ClassVal(nodes[-1], sc), True))
+    return out
+
+
+def type_ents(ents):
+    st = [e for e in ents if e[0] == 'stub']
+    return st or ents
+
+
+def nav_ents(ents):
+    src = [e for e in ents if e[0] != 'stub']
+    return src or ents
 
 
 def _source_vals(ent, v, eval_property=True):
@@ -2623,7 +3002,7 @@ def attributes(v):
             if n == PLACEHOLDER:
                 continue
             vals = []
-            for e in ents:
+            for e in type_ents(ents):
                 vals.extend(_source_vals(e, v, eval_property=False))
             res.append((n, same_val(vals)))
         return res
@@ -2666,7 +3045,7 @@ def attr_vals(v, name):
         m = class_attr_map(cls, isinstance(v, InstVal))
         if name in m:
             out = []
-            for e in m[name]:
+            for e in type_ents(m[name]):
                 out.extend(_source_vals(e, v))
             return True, uniq(out)
         if isinstance(v, ClassVal) and name in ('__name__', '__qualname__', '__module__', '__doc__'):
@@ -3339,6 +3718,8 @@ def defnode_name_pos(mi, n):
 
 
 def module_name_of(mi):
+    if getattr(mi, 'qual_name', None):
+        return mi.qual_name
     path = os.path.abspath(mi.path)
     root = _root()
     rel = os.path.relpath(path, root)
@@ -3348,6 +3729,8 @@ def module_name_of(mi):
         rel = os.path.basename(path)
     if rel.endswith('.py'):
         rel = rel[:-3]
+    elif rel.endswith('.pyi'):
+        rel = rel[:-4]
     parts = [p for p in rel.replace(os.sep, '/').split('/') if p]
     if parts and parts[-1] == '__init__':
         parts = parts[:-1]
@@ -3521,6 +3904,10 @@ def class_out(cv, typ):
     n = cv.node
     s = cv.scope
     mi = s.module
+    m = source_class_node(mi, s, n)
+    if m is not None:
+        n, s = m
+        mi = s.module
     line, bcol = defnode_name_pos(mi, n)
     desc = 'class %s' % n.name if typ == 'class' else 'instance of %s' % n.name
     return mk(n.name, typ, full_name_for(s, n.name), rel_module_path(mi.path), line,
@@ -3531,6 +3918,11 @@ def func_out(fv):
     n = fv.node
     s = fv.scope
     mi = s.module
+    if isinstance(n, FUNC_TYPES):
+        m = source_class_node(mi, s, n)
+        if m is not None:
+            n, s = m
+            mi = s.module
     if isinstance(n, ast.Lambda):
         return mk('<lambda>', 'function', full_name_for(s, '<lambda>'), rel_module_path(mi.path),
                   n.lineno, _char_col(mi, n.lineno, n.col_offset), 'lambda', '')
@@ -3601,6 +3993,14 @@ def alias_name_pos(mi, stmt, alias, which):
 _FOLLOW = [False]
 
 
+def stub_attr_defs(local, name):
+    """Definitions that only exist in the stub of module `local`."""
+    st = local.stub() if not local.is_stub else None
+    if st is None or _stub_private_import(st, name):
+        return []
+    return st.attr_defs(name)
+
+
 def _alias_target(d):
     """For an import definition: (dotted module, level, imported name or None)."""
     if d.kind == 'import':
@@ -3651,7 +4051,7 @@ def follow_def(d, seen=None):
 
 
 def follow_module_attr(local, name, seen):
-    ds = local.attr_defs(name)
+    ds = local.attr_defs(name) or stub_attr_defs(local, name)
     if ds:
         out = []
         for x in ds:
@@ -3764,7 +4164,7 @@ def attr_def_outs(v, name):
     """Definition sites of attribute `name` on value v."""
     if isinstance(v, ModVal):
         if v.local is not None:
-            ds = v.local.attr_defs(name)
+            ds = v.local.attr_defs(name) or stub_attr_defs(v.local, name)
             if ds:
                 out = []
                 for d in ds:
@@ -3782,7 +4182,7 @@ def attr_def_outs(v, name):
         cls = v if isinstance(v, ClassVal) else v.cls
         m = class_attr_map(cls, isinstance(v, InstVal))
         out = []
-        for kind, x, c in m.get(name, ()):
+        for kind, x, c in nav_ents(m.get(name, ())):
             out.extend(def_out(x))
         return out
     ok, vals = attr_vals(v, name)
@@ -3827,7 +4227,7 @@ def collect_occurrences(mi, line_no):
     for node in ast.walk(tree):
         ln = getattr(node, 'lineno', None)
         eln = getattr(node, 'end_lineno', None) or ln
-        if ln is None or not (ln <= line_no <= eln):
+        if line_no is not None and (ln is None or not (ln <= line_no <= eln)):
             if not isinstance(node, (ast.Module,)):
                 continue
         if isinstance(node, ast.Name):
@@ -4216,9 +4616,874 @@ def navigate_file(path, line_no, col, mode):
     return finalize(outs)
 
 
+# ---------------------------------------------------------------------------
+# Shared target loading
+# ---------------------------------------------------------------------------
+
+def load_target(path, line_no=None, col=None):
+    """Parse the target file and register it as a local module.
+
+    Returns (ModuleInfo, lines)."""
+    source = read_source(path)
+    lines = [l[:-1] if l.endswith('\r') else l for l in source.split('\n')]
+    tree, mods, fixed = fix_and_parse(lines)
+    if line_no is not None:
+        if line_no < 1 or line_no > len(lines):
+            raise SithError('line out of range')
+        cur = lines[line_no - 1]
+        if col < 0 or col > len(cur):
+            raise SithError('column out of range')
+        if mods and fixed[line_no - 1] != cur:
+            j = col
+            while j < len(cur) and is_ident_char(cur[j]):
+                j += 1
+            head = cur[:j]
+            for cand in (head + bracket_closers(head), head + bracket_closers(head) + ': pass'):
+                trial = list(lines)
+                trial[line_no - 1] = cand
+                t2, m2, f2 = fix_and_parse(trial)
+                if f2[line_no - 1] == cand and m2 <= mods:
+                    tree = t2
+                    break
+    apath = os.path.abspath(path)
+    mi = ModuleInfo(apath, os.path.splitext(os.path.basename(apath))[0])
+    mi.lines = lines
+    mi.set_tree(tree)
+    _local_modules[apath] = mi
+    return mi, lines
+
+
+_SKIP_DIRS = {'__pycache__', 'node_modules', 'site-packages'}
+
+
+def project_files():
+    root = _root()
+    out = []
+    for dp, dns, fns in os.walk(root):
+        dns[:] = sorted(d for d in dns if not d.startswith('.') and d not in _SKIP_DIRS
+                        and not os.path.isfile(os.path.join(dp, d, 'pyvenv.cfg')))
+        for fn in sorted(fns):
+            if fn.endswith('.py'):
+                out.append(os.path.abspath(os.path.join(dp, fn)))
+    return out
+
+
+def load_project_module(path):
+    path = os.path.abspath(path)
+    if path in _local_modules and _local_modules[path] is not None:
+        return _local_modules[path]
+    rel = os.path.relpath(path, _root())
+    name = rel[:-3].replace(os.sep, '.') if rel.endswith('.py') else os.path.basename(path)
+    if name.endswith('.__init__'):
+        name = name[:-9]
+    return load_local_module(path, name)
+
+
+# ---------------------------------------------------------------------------
+# Signatures
+# ---------------------------------------------------------------------------
+
+def blank_code(text):
+    """Copy of text with string contents replaced by 'x' and comments by spaces."""
+    out = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '#':
+            while i < n and text[i] != '\n':
+                out[i] = ' '
+                i += 1
+            continue
+        if c in '"\'':
+            q = c * 3 if text[i:i + 3] == c * 3 else c
+            j = i + len(q)
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j:j + len(q)] == q:
+                    break
+                if len(q) == 1 and text[j] == '\n':
+                    break
+                j += 1
+            end = min(j + len(q), n) if j < n and text[j:j + len(q)] == q else min(j, n)
+            for k in range(i, end):
+                if out[k] != '\n':
+                    out[k] = 'x'
+            i = end
+            continue
+        i += 1
+    return ''.join(out)
+
+
+def _is_call_paren(code, i):
+    j = i - 1
+    while j >= 0 and code[j] in ' \t\r\n\\':
+        j -= 1
+    if j < 0:
+        return False
+    c = code[j]
+    if c in ')]':
+        return True
+    if not is_ident_char(c):
+        return False
+    k = j
+    while k >= 0 and is_ident_char(code[k]):
+        k -= 1
+    word = code[k + 1:j + 1]
+    if not word or word[0].isdigit():
+        return False
+    if keyword.iskeyword(word):
+        return False
+    m = k
+    while m >= 0 and code[m] in ' \t':
+        m -= 1
+    e = m
+    while m >= 0 and is_ident_char(code[m]):
+        m -= 1
+    prev = code[m + 1:e + 1]
+    if prev in ('def', 'class'):
+        return False
+    return True
+
+
+def _split_args(code):
+    segs = []
+    depth = 0
+    start = 0
+    for i, c in enumerate(code):
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            segs.append(code[start:i])
+            start = i + 1
+    segs.append(code[start:])
+    return segs
+
+
+def _classify_seg(seg):
+    import re
+    st = seg.strip()
+    if st.startswith('**'):
+        return ('dstar', None)
+    if st.startswith('*'):
+        return ('star', None)
+    m = re.match(r'^([^\W\d]\w*)\s*=(?!=)', st)
+    if m:
+        return ('kw', m.group(1))
+    return ('pos', None)
+
+
+def _offset_to_pos(text, off):
+    line = text.count('\n', 0, off) + 1
+    ls = text.rfind('\n', 0, off) + 1
+    return line, off - ls
+
+
+def _find_call(mi, pline, pcol_char):
+    """ast.Call whose argument list opens at (pline, pcol_char)."""
+    if not (1 <= pline <= len(mi.lines)):
+        return None
+    pb = len(mi.lines[pline - 1][:pcol_char].encode('utf-8'))
+    best = None
+    for node in ast.walk(mi.tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        el, ec = getattr(f, 'end_lineno', None), getattr(f, 'end_col_offset', None)
+        if el is None or (el, ec) > (pline, pb):
+            continue
+        between = _src_between(mi, (el, ec), (pline, pb))
+        if between.replace('\\', '').strip() == '' and _line_bytes(mi, pline)[pb:pb + 1] == b'(':
+            if best is None or _start(node) > _start(best):
+                best = node
+    return best
+
+
+class SigParam(object):
+    def __init__(self, text, kind, name):
+        self.text = text
+        self.kind = kind      # posonly, pos, var, kwonly, kw
+        self.name = name
+
+
+def _fmt_param(name, ann, dflt):
+    t = name
+    if ann:
+        t += ': ' + ann
+    if dflt is not None:
+        t += '=' + dflt
+    return t
+
+
+def ast_params(mi, node, skip_first):
+    a = node.args
+    posonly = list(getattr(a, 'posonlyargs', []))
+    args = list(a.args)
+    allpos = posonly + args
+    ndef = len(a.defaults)
+    dmap = {}
+    for i, p in enumerate(allpos):
+        if i >= len(allpos) - ndef:
+            dmap[id(p)] = a.defaults[i - (len(allpos) - ndef)]
+    if skip_first and allpos:
+        first = allpos[0]
+        if posonly:
+            posonly = posonly[1:]
+        else:
+            args = args[1:]
+        allpos = allpos[1:]
+        dmap.pop(id(first), None)
+
+    def ann_of(p):
+        return node_text(mi, p.annotation) if getattr(p, 'annotation', None) is not None else ''
+
+    out = []
+    for p in posonly:
+        d = dmap.get(id(p))
+        out.append(SigParam(_fmt_param(p.arg, ann_of(p), node_text(mi, d) if d is not None else None),
+                            'posonly', p.arg))
+    for p in args:
+        d = dmap.get(id(p))
+        out.append(SigParam(_fmt_param(p.arg, ann_of(p), node_text(mi, d) if d is not None else None),
+                            'pos', p.arg))
+    if a.vararg:
+        out.append(SigParam(_fmt_param('*' + a.vararg.arg, ann_of(a.vararg), None), 'var', a.vararg.arg))
+    for p, d in zip(a.kwonlyargs, a.kw_defaults):
+        out.append(SigParam(_fmt_param(p.arg, ann_of(p), node_text(mi, d) if d is not None else None),
+                            'kwonly', p.arg))
+    if a.kwarg:
+        out.append(SigParam(_fmt_param('**' + a.kwarg.arg, ann_of(a.kwarg), None), 'kw', a.kwarg.arg))
+    return out
+
+
+def _sig_description(name, params, ret):
+    parts = []
+    has_var = any(p.kind == 'var' for p in params)
+    for i, p in enumerate(params):
+        if p.kind == 'kwonly' and not has_var and (i == 0 or params[i - 1].kind != 'kwonly'):
+            parts.append('*')
+        parts.append(p.text)
+        if p.kind == 'posonly' and (i + 1 == len(params) or params[i + 1].kind != 'posonly'):
+            parts.append('/')
+    d = 'def %s(%s)' % (name, ', '.join(parts))
+    if ret:
+        d += ' -> ' + ret
+    return d
+
+
+def _sig(name, params, ret, doc, path, line):
+    return {'name': name, 'params': params, 'ret': ret, 'docstring': doc or '',
+            'key': (path, line)}
+
+
+def _overload_siblings(mi, scope, node):
+    nodes, sc = find_qual(mi, scope_chain(scope) + [node.name])
+    funcs = [n for n in nodes if isinstance(n, FUNC_TYPES)]
+    ov = [n for n in funcs if 'overload' in deco_names(n)]
+    return ov or [node]
+
+
+def func_sigs(f, name=None, skip_first=None, is_class=False, doc=None):
+    node = f.node
+    mi = f.scope.module if f.scope else None
+    if mi is None:
+        return []
+    if isinstance(node, ast.Lambda):
+        ps = ast_params(mi, node, f.bound is not None)
+        return [_sig(name or '<lambda>', ps, None, doc or '', rel_module_path(mi.path), node.lineno)]
+    if skip_first is None:
+        decos = deco_names(node)
+        skip_first = 'staticmethod' not in decos and (
+            f.bound is not None or (f.scope.kind == 'class'))
+    grp, gsc = stub_group(f)
+    if grp and gsc is not None:
+        tmi = gsc.module
+        nodes = grp
+    else:
+        tmi = mi
+        nodes = _overload_siblings(mi, f.scope, node)
+    if doc is None:
+        doc = ''
+        srcf = source_func(f) if mi.is_stub else f
+        if srcf is not None:
+            doc = _docstring(srcf.node)
+        if not doc:
+            doc = _docstring(node)
+    out = []
+    for n in nodes:
+        ps = ast_params(tmi, n, skip_first)
+        ret = None if is_class or n.returns is None else node_text(tmi, n.returns)
+        d = doc
+        if not is_class:
+            d = _docstring(n) or doc
+        out.append(_sig(name or n.name, ps, ret, d, rel_module_path(tmi.path), n.lineno))
+    return out
+
+
+def class_sigs(cv):
+    n = cv.node
+    sm = source_class_node(cv.scope.module, cv.scope, n)
+    doc = _docstring(sm[0]) if sm else ''
+    doc = doc or _docstring(n)
+    for c0 in class_mro(cv):
+        pairs = class_pairs(c0)
+        for c, is_stub in reversed(pairs):
+            inits = [st for st in c.node.body if isinstance(st, FUNC_TYPES) and st.name == '__init__']
+            if inits:
+                cs = class_scope_of(c)
+                if cs is None:
+                    continue
+                return func_sigs(FuncVal(inits[-1], cs), name=n.name, skip_first=True, is_class=True,
+                                 doc=doc or _docstring(inits[-1]))
+    if any(is_dataclass(c) for c in class_mro(cv)):
+        fields = {}
+        order = []
+        for c in reversed(class_mro(cv)):
+            mi = c.scope.module
+            for st in c.node.body:
+                if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                    if _ann_name(st.annotation.value if isinstance(st.annotation, ast.Subscript)
+                                 else st.annotation) == 'ClassVar':
+                        continue
+                    nm = st.target.id
+                    if nm not in fields:
+                        order.append(nm)
+                    dflt = None
+                    if st.value is not None:
+                        v = st.value
+                        if isinstance(v, ast.Call) and _ann_name(v.func) == 'field':
+                            dflt = None
+                            for kw in v.keywords:
+                                if kw.arg == 'default':
+                                    dflt = node_text(mi, kw.value)
+                                elif kw.arg == 'default_factory':
+                                    dflt = '<factory>'
+                        else:
+                            dflt = node_text(mi, v)
+                    fields[nm] = SigParam(_fmt_param(nm, node_text(mi, st.annotation), dflt), 'pos', nm)
+        ps = [fields[k] for k in order]
+        mi = cv.scope.module
+        return [_sig(n.name, ps, None, doc, rel_module_path(mi.path), n.lineno)]
+    mi = cv.scope.module
+    return [_sig(n.name, [], None, doc, rel_module_path(mi.path), n.lineno)]
+
+
+def real_sigs(obj):
+    try:
+        sig = inspect.signature(obj)
+    except Exception:
+        return []
+    name = getattr(obj, '__name__', None) or type(obj).__name__
+    ps = []
+    for p in sig.parameters.values():
+        ann = '' if p.annotation is inspect.Parameter.empty else inspect.formatannotation(p.annotation)
+        dflt = None if p.default is inspect.Parameter.empty else repr(p.default)
+        k = p.kind
+        if k == p.VAR_POSITIONAL:
+            ps.append(SigParam(_fmt_param('*' + p.name, ann, None), 'var', p.name))
+        elif k == p.VAR_KEYWORD:
+            ps.append(SigParam(_fmt_param('**' + p.name, ann, None), 'kw', p.name))
+        else:
+            kind = {p.POSITIONAL_ONLY: 'posonly', p.KEYWORD_ONLY: 'kwonly'}.get(k, 'pos')
+            ps.append(SigParam(_fmt_param(p.name, ann, dflt), kind, p.name))
+    ret = None
+    if not inspect.isclass(obj) and sig.return_annotation is not inspect.Signature.empty:
+        ret = inspect.formatannotation(sig.return_annotation)
+    path, line, _ = _real_location(obj) if not _is_builtin_obj(obj) else ('', 0, 0)
+    return [_sig(name, ps, ret, inspect.getdoc(obj) or '', path, line)]
+
+
+def value_sigs(v):
+    if isinstance(v, FuncVal):
+        return func_sigs(v)
+    if isinstance(v, ClassVal):
+        return class_sigs(v)
+    if isinstance(v, InstVal):
+        ok, ms = attr_vals(v, '__call__')
+        out = []
+        for m in ms if ok else []:
+            if isinstance(m, FuncVal):
+                out.extend(func_sigs(m))
+        return out
+    if isinstance(v, RealVal):
+        return real_sigs(v.obj)
+    return []
+
+
+def param_index(params, segs):
+    """Python-style binding of the argument under the cursor (last segment)."""
+    prev = segs[:-1]
+    cur_kind, cur_name = _classify_seg(segs[-1])
+    npos = 0
+    star_seen = False
+    for sg in prev:
+        k, nm = _classify_seg(sg)
+        if k == 'pos':
+            npos += 1
+        elif k == 'star':
+            star_seen = True
+    positional = [i for i, p in enumerate(params) if p.kind in ('posonly', 'pos')]
+    var = [i for i, p in enumerate(params) if p.kind == 'var']
+    kw = [i for i, p in enumerate(params) if p.kind == 'kw']
+    if cur_kind == 'kw':
+        for i, p in enumerate(params):
+            if p.name == cur_name and p.kind in ('pos', 'kwonly'):
+                return i
+        return kw[0] if kw else None
+    if cur_kind == 'dstar':
+        return kw[0] if kw else None
+    if cur_kind == 'star':
+        return var[0] if var else None
+    if star_seen:
+        return var[0] if var else None
+    if npos < len(positional):
+        return positional[npos]
+    return var[0] if var else None
+
+
+def signatures(path, line_no, col):
+    reset_state()
+    source = read_source(path)
+    lines = [l[:-1] if l.endswith('\r') else l for l in source.split('\n')]
+    if line_no < 1 or line_no > len(lines):
+        raise SithError('line out of range')
+    cur = lines[line_no - 1]
+    if col < 0 or col > len(cur):
+        raise SithError('column out of range')
+    prefix = '\n'.join(lines[:line_no - 1] + [cur[:col]])
+    code = blank_code(prefix)
+    stack = []
+    for i, c in enumerate(code):
+        if c in '([{':
+            stack.append(i)
+        elif c in ')]}':
+            if stack:
+                stack.pop()
+    popen = None
+    for i in reversed(stack):
+        if code[i] == '(' and _is_call_paren(code, i):
+            popen = i
+            break
+    if popen is None:
+        return []
+    pline, pcol = _offset_to_pos(prefix, popen)
+    segs = _split_args(code[popen + 1:])
+
+    apath = os.path.abspath(path)
+    closers = ''.join({'(': ')', '[': ']', '{': '}'}[code[i]] for i in reversed(stack))
+    head = cur[:col]
+    cands = [None, head + closers, head + closers + ':', head + closers + ': pass']
+    mi = call = None
+    for cand in cands:
+        trial = list(lines)
+        if cand is not None:
+            trial[line_no - 1] = cand
+        tree, mods, fixed = fix_and_parse(trial)
+        m = ModuleInfo(apath, os.path.splitext(os.path.basename(apath))[0])
+        m.lines = fixed if cand is None else trial
+        m.set_tree(tree)
+        c = _find_call(m, pline, pcol)
+        if c is not None:
+            mi, call = m, c
+            break
+    if call is None:
+        return []
+    _local_modules[apath] = mi
+    parents = mi.parents()
+    s = scope_of_node(mi, call, parents)
+    vals = infer_vals(call.func, s, _start(call))
+    sigs = []
+    seen = set()
+    for v in vals:
+        for sg in value_sigs(v):
+            k = (sg['key'], sg['name'], tuple(p.text for p in sg['params']))
+            if k in seen:
+                continue
+            seen.add(k)
+            sigs.append(sg)
+    sigs.sort(key=lambda sg: sg['key'])
+    out = []
+    for sg in sigs:
+        ps = sg['params']
+        out.append({'name': sg['name'], 'params': [p.text for p in ps],
+                    'index': param_index(ps, segs),
+                    'description': _sig_description(sg['name'], ps, sg['ret']),
+                    'docstring': sg['docstring']})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# References
+# ---------------------------------------------------------------------------
+
+def _mod_key(mv, dotted):
+    if mv is not None and mv.local is not None:
+        return ('mod', os.path.abspath(mv.local.path))
+    if mv is not None and mv.real is not None:
+        return ('ext', mv.real.__name__)
+    return ('ext', dotted)
+
+
+def def_keys(d, seen=None):
+    if seen is None:
+        seen = set()
+    if d is None:
+        return set()
+    if id(d) in seen:
+        return set()
+    seen.add(id(d))
+    if isinstance(d, StarHit):
+        mv = d.star.module_value()
+        if mv is not None and mv.local is not None:
+            out = set()
+            for x in mv.local.attr_defs(d.name):
+                out |= def_keys(x, seen)
+            return out or {('mattr', os.path.abspath(mv.local.path), d.name)}
+        return {('ext', d.star.module, d.name)}
+    if isinstance(d, AttrDef):
+        return {('cls', id(d.cls.node), d.name)}
+    k = d.kind
+    mi = d.scope.module
+    if k == 'import':
+        name, asname = d.extra
+        dotted = name if asname else name.split('.')[0]
+        return {_mod_key(mi.resolve_import(dotted, 0), dotted)}
+    if k == 'importfrom':
+        modname, name, level = d.extra
+        mv = mi.resolve_import(modname, level)
+        if mv is not None and mv.local is not None:
+            ds = mv.local.attr_defs(name)
+            out = set()
+            for x in ds:
+                out |= def_keys(x, seen)
+            if out:
+                return out
+            if mv.local.is_package:
+                sub = mv.local.submodule(name)
+                if sub is not None:
+                    return {_mod_key(sub, name)}
+            return {('mattr', os.path.abspath(mv.local.path), name)}
+        sub = (modname + '.' + name) if modname else name
+        mv2 = mi.resolve_import(sub, level)
+        if mv2 is not None and mv2.local is not None:
+            return {_mod_key(mv2, sub)}
+        return {('ext', ('.' * level) + modname, name)}
+    if d.scope.kind == 'class':
+        return {('cls', id(d.scope.node), d.name)}
+    if d.scope.kind == 'module':
+        return {('mattr', os.path.abspath(mi.path), d.name)} | {('scope', id(d.scope.node), d.name)}
+    return {('scope', id(d.scope.node), d.name)}
+
+
+def _norm_keys(keys):
+    return set(keys)
+
+
+def _value_attr_keys(v, name):
+    if isinstance(v, ModVal):
+        if v.local is not None:
+            ds = v.local.attr_defs(name)
+            if ds:
+                out = set()
+                for d in ds:
+                    out |= def_keys(d)
+                return out
+            if v.local.is_package:
+                sub = v.local.submodule(name)
+                if sub is not None:
+                    return {_mod_key(sub, name)}
+            return {('mattr', os.path.abspath(v.local.path), name)}
+        if v.real is not None:
+            return {('ext', v.real.__name__, name)}
+        return set()
+    if isinstance(v, (ClassVal, InstVal)):
+        cls = v if isinstance(v, ClassVal) else v.cls
+        m = class_attr_map(cls, isinstance(v, InstVal))
+        ents = m.get(name)
+        if not ents and isinstance(v, ClassVal):
+            ents = class_attr_map(cls, True).get(name)
+        if ents:
+            out = set()
+            for kind, x, c in nav_ents(ents):
+                if kind == 'stub':
+                    continue
+                out |= def_keys(x)
+            if out:
+                return out
+        return {('cls', id(cls.node), name)}
+    if isinstance(v, RealInst):
+        return {('ext', v.typ.__module__ + '.' + v.typ.__name__, name)}
+    if isinstance(v, RealVal):
+        return {('ext', _real_full_name(v.obj), name)}
+    return set()
+
+
+def occ_keys(mi, occ, parents):
+    k = occ.kind
+    node = occ.node
+    try:
+        if k == 'name':
+            s = scope_of_node(mi, node, parents)
+            if isinstance(node.ctx, ast.Store):
+                ds = [d for d in mi.defs_by_node(node) if d.name == node.id]
+                if not ds:
+                    ds = lookup_defs(node.id, s, INF_POS)
+            else:
+                ds = lookup_defs(node.id, s, _start(node))
+                if not ds:
+                    ds = lookup_defs(node.id, s, INF_POS)
+            out = set()
+            for d in ds:
+                out |= def_keys(d)
+            if not out:
+                if hasattr(builtins, node.id):
+                    return {('builtin', node.id)}
+                return {('free', node.id)}
+            return out
+        if k == 'attr':
+            s = scope_of_node(mi, node, parents)
+            out = set()
+            for v in infer_vals(node.value, s, _start(node)):
+                out |= _value_attr_keys(v, node.attr)
+            return out
+        if k in ('defname', 'arg', 'binder'):
+            ds = [d for d in mi.defs_by_node(node) if d.name == occ.name]
+            out = set()
+            for d in ds[:1]:
+                out |= def_keys(d)
+            return out
+        if k == 'keyword':
+            call = parents.get(node)
+            if not isinstance(call, ast.Call):
+                return set()
+            s = scope_of_node(mi, call, parents)
+            fvals = infer_vals(call.func, s, _start(call))
+            out = set()
+            for d in _callable_params(fvals, node.arg):
+                out |= def_keys(d)
+            return out
+        if k == 'importname':
+            a = occ.extra
+            ds = [d for d in mi.defs_by_node(node) if d.name == (a.asname or a.name)]
+            out = set()
+            for d in ds[:1]:
+                out |= def_keys(d)
+            return out
+        if k in ('importmod', 'importas'):
+            dotted, level, alias = occ.extra
+            return {_mod_key(mi.resolve_import(dotted, level), ('.' * level) + dotted)}
+        if k in ('global', 'nonlocal'):
+            s = scope_of_node(mi, node, parents)
+            target = mi.scope if k == 'global' else (s.parent if s is not None else None)
+            while target is not None:
+                if target.kind != 'class':
+                    ds = reaching_defs(target, occ.name, INF_POS)
+                    if ds or k == 'global':
+                        out = set()
+                        for d in ds:
+                            out |= def_keys(d)
+                        if not out:
+                            out = def_keys(Def(occ.name, 'assign', node, target, (0, 0)))
+                        return out
+                target = target.parent
+            return set()
+    except RecursionError:
+        return set()
+    return set()
+
+
+def occ_is_definition(mi, occ):
+    k = occ.kind
+    node = occ.node
+    if k == 'name':
+        return isinstance(node.ctx, ast.Store)
+    if k == 'attr':
+        return isinstance(node.ctx, ast.Store)
+    if k in ('defname', 'arg', 'binder', 'importas'):
+        return True
+    if k == 'importname':
+        a = occ.extra
+        if not a.asname:
+            return True
+        return alias_name_pos(mi, node, a, 'as') == (occ.line, occ.bcol)
+    if k == 'importmod':
+        dotted, level, alias = occ.extra
+        return isinstance(node, ast.Import) and alias is not None and not alias.asname \
+            and '.' not in dotted
+    return False
+
+
+def _all_occurrences(mi):
+    occs, parents = collect_occurrences(mi, None)
+    return occs, parents
+
+
+def _occ_out(mi, occ):
+    return {'module_path': rel_module_path(mi.path), 'line': occ.line,
+            'column': _char_col(mi, occ.line, occ.bcol), 'is_definition': occ_is_definition(mi, occ)}
+
+
+def references(path, line_no, col, scope):
+    reset_state()
+    _deadline[0] = time.time() + 30
+    mi, lines = load_target(path, line_no, col)
+    cur = lines[line_no - 1]
+    bcol = len(cur[:col].encode('utf-8'))
+    occ, parents = find_occurrence(mi, line_no, bcol)
+    if occ is None or occ.kind == 'const':
+        raise NotAName()
+    target = _norm_keys(occ_keys(mi, occ, parents))
+    name = occ.name
+    modules = [mi]
+    if scope == 'project':
+        for p in project_files():
+            if p == mi.path:
+                continue
+            m = load_project_module(p)
+            if m is not None and m.tree is not None:
+                modules.append(m)
+    results = {}
+    for m in modules:
+        occs, pars = _all_occurrences(m)
+        for o in occs:
+            if o.name != name or o.kind == 'const':
+                continue
+            if m is mi and o.line == occ.line and o.bcol == occ.bcol:
+                hit = True
+            elif target:
+                hit = bool(_norm_keys(occ_keys(m, o, pars)) & target)
+            else:
+                hit = False
+            if hit:
+                r = _occ_out(m, o)
+                key = (r['module_path'], r['line'], r['column'])
+                if key in results:
+                    results[key]['is_definition'] = results[key]['is_definition'] or r['is_definition']
+                else:
+                    results[key] = r
+    out = list(results.values())
+    out.sort(key=lambda r: (r['module_path'], r['line'], r['column']))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Search / names
+# ---------------------------------------------------------------------------
+
+_SEARCH_KINDS = ('def', 'class', 'assign', 'annassign')
+
+
+def _searchable_defs(mi):
+    out = []
+
+    def visit(s, top):
+        for name, ds in s.defs.items():
+            for d in ds:
+                if d.kind in ('def', 'class') or (top and d.kind in ('assign', 'annassign')):
+                    out.append(d)
+                if d.kind == 'class':
+                    cs = mi.node_scope.get(d.node)
+                    if cs is not None:
+                        visit(cs, False)
+    visit(mi.scope, True)
+    return out
+
+
+def search(query):
+    reset_state()
+    _deadline[0] = time.time() + 30
+    q = query.lower()
+    hits = []
+    for p in project_files():
+        mi = load_project_module(p)
+        if mi is None or mi.scope is None:
+            continue
+        for d in _searchable_defs(mi):
+            nl = d.name.lower()
+            if q not in nl:
+                continue
+            rank = 0 if nl == q else (1 if nl.startswith(q) else 2)
+            for o in def_out(d, follow=False):
+                if o is None:
+                    continue
+                o = dict(o)
+                o.pop('docstring', None)
+                hits.append((rank, o))
+    seen = set()
+    res = []
+    hits.sort(key=lambda h: (h[0], h[1]['module_path'], h[1]['line'], h[1]['column']))
+    for rank, o in hits:
+        k = (o['module_path'], o['line'], o['column'], o['name'])
+        if k in seen:
+            continue
+        seen.add(k)
+        res.append(o)
+    return res
+
+
+def names(path, all_scopes):
+    reset_state()
+    mi, lines = load_target(path)
+    items = []
+    scopes = mi.all_scopes() if all_scopes else [mi.scope]
+    for s in scopes:
+        for nm, ds in s.defs.items():
+            for d in ds:
+                if nm == PLACEHOLDER:
+                    continue
+                items.extend(def_out(d, follow=False))
+    if all_scopes:
+        for node in ast.walk(mi.tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            cs = mi.node_scope.get(node)
+            if cs is None:
+                continue
+            cv = ClassVal(node, cs.parent)
+            for m in node.body:
+                if not isinstance(m, FUNC_TYPES):
+                    continue
+                decos = deco_names(m)
+                params = func_params(m)
+                if 'staticmethod' in decos or 'classmethod' in decos or not params:
+                    continue
+                fs = mi.node_scope.get(m)
+                if fs is None:
+                    continue
+
+                def cb(name, t, kind, value, path_, stmt, fs=fs, m=m):
+                    items.append(attrdef_out(AttrDef(name, t, kind, value, path_, stmt, fs, m, cv)))
+                collect_attr_assigns(m.body, params[0].arg, cb)
+    seen = set()
+    out = []
+    for o in items:
+        if not o:
+            continue
+        k = (o['line'], o['column'], o['name'])
+        if k in seen:
+            continue
+        seen.add(k)
+        o = dict(o)
+        o['is_definition'] = True
+        out.append(o)
+    out.sort(key=lambda o: (o['line'], o['column']))
+    return out
+
+
 USAGE = ('usage: sith.py complete <file> <line> <col> [--fuzzy] [--project DIR]\n'
          '       sith.py infer <file> <line> <col> [--project DIR]\n'
-         '       sith.py goto <file> <line> <col> [--follow-imports] [--project DIR]\n')
+         '       sith.py goto <file> <line> <col> [--follow-imports] [--project DIR]\n'
+         '       sith.py signatures <file> <line> <col> [--project DIR]\n'
+         '       sith.py references <file> <line> <col> [--scope file|project] [--project DIR]\n'
+         '       sith.py search <query> [--project DIR]\n'
+         '       sith.py names <file> [--all-scopes] [--project DIR]\n')
+
+_ARITY = {'complete': 4, 'infer': 4, 'goto': 4, 'signatures': 4, 'references': 4,
+          'search': 2, 'names': 2}
 
 
 def _emit(obj):
@@ -4236,6 +5501,8 @@ def main(argv):
     args = list(argv)
     fuzzy = False
     project = None
+    scope = 'file'
+    all_scopes = False
     rest = []
     i = 0
     while i < len(args):
@@ -4244,48 +5511,68 @@ def main(argv):
             fuzzy = True
         elif a == '--follow-imports':
             _FOLLOW[0] = True
-        elif a == '--project':
+        elif a == '--all-scopes':
+            all_scopes = True
+        elif a in ('--project', '--scope'):
             if i + 1 >= len(args):
                 sys.stderr.write(USAGE)
                 return 1
-            project = args[i + 1]
+            if a == '--project':
+                project = args[i + 1]
+            else:
+                scope = args[i + 1]
             i += 1
         elif a.startswith('--project='):
             project = a.split('=', 1)[1]
+        elif a.startswith('--scope='):
+            scope = a.split('=', 1)[1]
         else:
             rest.append(a)
         i += 1
     args = rest
-    if len(args) != 4 or args[0] not in ('complete', 'infer', 'goto'):
+    if not args or args[0] not in _ARITY or len(args) != _ARITY[args[0]]:
         sys.stderr.write(USAGE)
         return 1
-    cmd, path, line_s, col_s = args
-    try:
-        line_no = int(line_s)
-        col = int(col_s)
-    except ValueError:
-        sys.stderr.write('error: line and column must be integers\n')
+    if scope not in ('file', 'project'):
+        sys.stderr.write('error: --scope must be "file" or "project"\n')
         return 1
+    cmd = args[0]
+    line_no = col = None
+    if _ARITY[cmd] == 4:
+        try:
+            line_no = int(args[2])
+            col = int(args[3])
+        except ValueError:
+            sys.stderr.write('error: line and column must be integers\n')
+            return 1
     if project:
         if not os.path.isdir(project):
             sys.stderr.write('error: project directory does not exist: %s\n' % project)
             return 1
         _PROJECT_ROOT = os.path.abspath(project)
+    elif cmd == 'search':
+        _PROJECT_ROOT = os.getcwd()
     else:
-        _PROJECT_ROOT = os.path.dirname(os.path.abspath(path))
+        _PROJECT_ROOT = os.path.dirname(os.path.abspath(args[1]))
     try:
         if cmd == 'complete':
-            comps = complete(path, line_no, col, fuzzy)
-            _emit({'completions': comps})
-            return 0
-        defs = navigate_file(path, line_no, col, cmd)
+            _emit({'completions': complete(args[1], line_no, col, fuzzy)})
+        elif cmd in ('infer', 'goto'):
+            _emit({'definitions': navigate_file(args[1], line_no, col, cmd)})
+        elif cmd == 'signatures':
+            _emit({'signatures': signatures(args[1], line_no, col)})
+        elif cmd == 'references':
+            _emit({'references': references(args[1], line_no, col, scope)})
+        elif cmd == 'search':
+            _emit({'definitions': search(args[1])})
+        elif cmd == 'names':
+            _emit({'definitions': names(args[1], all_scopes)})
     except NotAName:
         sys.stderr.write('error: no name at cursor position\n')
         return 1
     except SithError as e:
         sys.stderr.write('error: %s\n' % e)
         return 1
-    _emit({'definitions': defs})
     return 0
 
 
