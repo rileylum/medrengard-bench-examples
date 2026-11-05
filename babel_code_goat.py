@@ -4,12 +4,14 @@ for python / javascript / typescript, and run that tester against a solution.
 
 Commands:
     generate <tests_dir> --entrypoint <name> --lang <python|javascript|typescript>
-    test <solution_path> <tests_dir> --lang <python|javascript|typescript> [--timeout SECONDS]
+    test <solution_path> <tests_dir> --lang <python|javascript|typescript> [--timeout SECONDS] [--tol FLOAT]
 """
 from __future__ import annotations
 
 import argparse
 import ast
+import collections
+import decimal
 import io
 import json
 import math
@@ -28,6 +30,7 @@ LANG_EXT = {"python": "py", "javascript": "js", "typescript": "ts"}
 MARKER = "@@BABEL_CODE_GOAT@@ "
 META_PREFIX = "BABEL_CODE_GOAT_META: "
 DEFAULT_TIMEOUT = 10.0
+DEFAULT_TOL = 1e-9
 
 
 class DiscoveryError(Exception):
@@ -38,36 +41,276 @@ class DiscoveryError(Exception):
 # tests.py parsing / discovery
 # --------------------------------------------------------------------------
 
-def _is_literal(node: ast.AST) -> bool:
+# Canonical names for bare identifiers when they were not explicitly imported.
+_BARE_CANON = {
+    "Counter": "collections.Counter",
+    "deque": "collections.deque",
+    "defaultdict": "collections.defaultdict",
+    "OrderedDict": "collections.OrderedDict",
+    "Decimal": "decimal.Decimal",
+    "isclose": "math.isclose",
+    "inf": "math.inf",
+    "nan": "math.nan",
+}
+
+# Helper callables that are never the entrypoint (used when the entrypoint
+# name is unknown during discovery).
+_HELPER_CALLS = {
+    "set", "frozenset", "tuple", "list", "dict", "float", "int", "str", "abs",
+    "collections.Counter", "collections.deque", "collections.defaultdict",
+    "collections.OrderedDict", "decimal.Decimal", "math.isclose",
+    "re.search", "re.match", "re.fullmatch", "re.compile", "isinstance", "len",
+    "sorted", "round",
+}
+
+_DD_FACTORIES = {
+    "int": int, "float": float, "str": str, "list": list, "set": set,
+    "dict": dict, "tuple": tuple, "frozenset": frozenset, "bool": bool,
+    "collections.Counter": collections.Counter, "collections.deque": collections.deque,
+    "collections.OrderedDict": collections.OrderedDict,
+    "collections.defaultdict": collections.defaultdict,
+    "decimal.Decimal": decimal.Decimal,
+}
+_DD_FACTORY_NAMES = {v: k for k, v in _DD_FACTORIES.items()}
+
+_RE_FLAG_VALUES = {
+    "I": re.I, "IGNORECASE": re.I, "M": re.M, "MULTILINE": re.M,
+    "S": re.S, "DOTALL": re.S, "X": re.X, "VERBOSE": re.X,
+    "A": re.A, "ASCII": re.A, "U": re.U, "UNICODE": re.U,
+}
+
+
+class _Ctx:
+    def __init__(self, ep_name, aliases):
+        self.ep = ep_name
+        self.aliases = aliases
+
+    def qual(self, node):
+        """Canonical dotted name of a Name/Attribute chain, or None."""
+        if isinstance(node, ast.Name):
+            if node.id in self.aliases:
+                return self.aliases[node.id]
+            return _BARE_CANON.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            base = self.qual(node.value)
+            if base is None:
+                return None
+            return base + "." + node.attr
+        return None
+
+
+def _collect_aliases(tree):
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    aliases[a.asname] = a.name
+                else:
+                    top = a.name.split(".")[0]
+                    aliases[top] = top
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            for a in node.names:
+                if a.name == "*":
+                    continue
+                aliases[a.asname or a.name] = node.module + "." + a.name
+    return aliases
+
+
+def _err(node, what="unsupported value"):
+    return DiscoveryError(f"line {getattr(node, 'lineno', '?')}: {what}")
+
+
+def _hashable(v, node):
+    try:
+        hash(v)
+    except TypeError:
+        raise _err(node, "unhashable key/element")
+    return v
+
+
+def _iter_value(v, node):
+    if isinstance(v, (list, tuple, set, frozenset, str, collections.deque, dict)):
+        return list(v)
+    raise _err(node, "unsupported iterable")
+
+
+def _value(node, ctx):
+    """Evaluate a restricted literal expression into a Python value."""
     if isinstance(node, ast.Constant):
         v = node.value
-        return v is None or isinstance(v, (bool, int, float, str))
+        if v is None or isinstance(v, (bool, int, float, str)):
+            return v
+        raise _err(node)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-        o = node.operand
-        return (isinstance(o, ast.Constant) and isinstance(o.value, (int, float))
-                and not isinstance(o.value, bool))
-    if isinstance(node, (ast.List, ast.Tuple)):
-        return all(not isinstance(e, ast.Starred) and _is_literal(e) for e in node.elts)
+        v = _value(node.operand, ctx)
+        if isinstance(v, bool) or not isinstance(v, (int, float, decimal.Decimal)):
+            raise _err(node)
+        return -v if isinstance(node.op, ast.USub) else +v
+    if isinstance(node, ast.List):
+        return [_value(e, ctx) for e in _plain_elts(node)]
+    if isinstance(node, ast.Tuple):
+        return tuple(_value(e, ctx) for e in _plain_elts(node))
+    if isinstance(node, ast.Set):
+        return {_hashable(_value(e, ctx), node) for e in _plain_elts(node)}
     if isinstance(node, ast.Dict):
+        d = {}
         for k, v in zip(node.keys, node.values):
             if k is None:
-                return False
-            if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
-                return False
-            if not _is_literal(v):
-                return False
+                raise _err(node)
+            kv = _hashable(_value(k, ctx), node)
+            d[kv] = _value(v, ctx)
+        return d
+    if isinstance(node, ast.Attribute):
+        q = ctx.qual(node)
+        if q == "math.inf":
+            return math.inf
+        if q == "math.nan":
+            return math.nan
+        if q == "math.pi":
+            return math.pi
+        if q == "math.e":
+            return math.e
+        if q == "math.tau":
+            return math.tau
+        raise _err(node)
+    if isinstance(node, ast.Name):
+        q = ctx.qual(node)
+        if q == "math.inf":
+            return math.inf
+        if q == "math.nan":
+            return math.nan
+        raise _err(node)
+    if isinstance(node, ast.Call):
+        return _value_call(node, ctx)
+    raise _err(node)
+
+
+def _plain_elts(node):
+    for e in node.elts:
+        if isinstance(e, ast.Starred):
+            raise _err(node)
+    return node.elts
+
+
+def _value_call(node, ctx):
+    q = ctx.qual(node.func)
+    for a in node.args:
+        if isinstance(a, ast.Starred):
+            raise _err(node)
+    for kw in node.keywords:
+        if kw.arg is None:
+            raise _err(node)
+    args = node.args
+    kws = node.keywords
+    if q in ("set", "frozenset", "tuple", "list", "collections.deque"):
+        maxlen = None
+        if q == "collections.deque":
+            for kw in kws:
+                if kw.arg != "maxlen":
+                    raise _err(node)
+                maxlen = _value(kw.value, ctx)
+            if len(args) == 2 and maxlen is None:
+                maxlen = _value(args[1], ctx)
+                args = args[:1]
+            if maxlen is not None and (isinstance(maxlen, bool) or not isinstance(maxlen, int)):
+                raise _err(node)
+        elif kws:
+            raise _err(node)
+        if len(args) > 1:
+            raise _err(node)
+        items = _iter_value(_value(args[0], ctx), node) if args else []
+        if q in ("set", "frozenset"):
+            s = {_hashable(x, node) for x in items}
+            return s if q == "set" else frozenset(s)
+        if q == "tuple":
+            return tuple(items)
+        if q == "list":
+            return list(items)
+        return collections.deque(items, maxlen)
+    if q in ("dict", "collections.OrderedDict", "collections.Counter", "collections.defaultdict"):
+        factory = None
+        if q == "collections.defaultdict":
+            if args:
+                f = args[0]
+                if isinstance(f, ast.Constant) and f.value is None:
+                    factory = None
+                else:
+                    fq = ctx.qual(f)
+                    if fq not in _DD_FACTORIES:
+                        raise _err(node, "unsupported defaultdict factory")
+                    factory = _DD_FACTORIES[fq]
+                args = args[1:]
+        if len(args) > 1:
+            raise _err(node)
+        if q == "collections.Counter":
+            out = collections.Counter()
+            if args:
+                src = _value(args[0], ctx)
+                if isinstance(src, dict):
+                    out.update(dict(src))
+                else:
+                    out.update(_hashable(x, node) for x in _iter_value(src, node))
+            for kw in kws:
+                out[kw.arg] = _value(kw.value, ctx)
+            return out
+        base = {}
+        if args:
+            src = _value(args[0], ctx)
+            if isinstance(src, dict):
+                base.update(src)
+            else:
+                for pair in _iter_value(src, node):
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        raise _err(node)
+                    base[_hashable(pair[0], node)] = pair[1]
+        for kw in kws:
+            base[kw.arg] = _value(kw.value, ctx)
+        if q == "dict":
+            return base
+        if q == "collections.OrderedDict":
+            return collections.OrderedDict(base)
+        return collections.defaultdict(factory, base)
+    if q == "decimal.Decimal":
+        if kws or len(args) > 1:
+            raise _err(node)
+        if not args:
+            return decimal.Decimal()
+        v = _value(args[0], ctx)
+        if isinstance(v, bool) or not isinstance(v, (int, float, str, tuple)):
+            raise _err(node)
+        try:
+            return decimal.Decimal(v)
+        except Exception:
+            raise _err(node, "invalid Decimal")
+    if q == "float":
+        if kws or len(args) != 1:
+            raise _err(node)
+        v = _value(args[0], ctx)
+        if isinstance(v, bool) or not isinstance(v, (int, float, str, decimal.Decimal)):
+            raise _err(node)
+        try:
+            return float(v)
+        except ValueError:
+            raise _err(node, "invalid float")
+    raise _err(node)
+
+
+def _is_value(node, ctx) -> bool:
+    try:
+        _value(node, ctx)
         return True
-    return False
+    except DiscoveryError:
+        return False
 
 
-def _literal_value(node: ast.AST):
-    if not _is_literal(node):
-        raise DiscoveryError(f"line {getattr(node, 'lineno', '?')}: unsupported value")
-    return ast.literal_eval(node)
-
-
-def _call_matches(func: ast.AST, ep_name):
+def _call_matches(func: ast.AST, ctx):
     """Return True if ``func`` refers to the entrypoint."""
+    ep_name = ctx.ep
+    if ep_name is None:
+        q = ctx.qual(func)
+        if q in _HELPER_CALLS or (q and q.split(".")[0] in ("math", "re", "collections", "decimal")):
+            return False
     if isinstance(func, ast.Name):
         return ep_name is None or func.id == ep_name
     if isinstance(func, ast.Attribute):
@@ -82,19 +325,19 @@ def _call_matches(func: ast.AST, ep_name):
     return False
 
 
-def _parse_call(node: ast.AST, ep_name):
-    if not isinstance(node, ast.Call) or not _call_matches(node.func, ep_name):
+def _parse_call(node: ast.AST, ctx):
+    if not isinstance(node, ast.Call) or not _call_matches(node.func, ctx):
         return None
     args = []
     for a in node.args:
-        if isinstance(a, ast.Starred) or not _is_literal(a):
+        if isinstance(a, ast.Starred):
             raise DiscoveryError(f"line {node.lineno}: unsupported argument")
-        args.append(_literal_value(a))
+        args.append(_value(a, ctx))
     kwargs = []
     for kw in node.keywords:
-        if kw.arg is None or not _is_literal(kw.value):
+        if kw.arg is None:
             raise DiscoveryError(f"line {node.lineno}: unsupported keyword argument")
-        kwargs.append([kw.arg, _literal_value(kw.value)])
+        kwargs.append([kw.arg, _value(kw.value, ctx)])
     return {"args": args, "kwargs": kwargs}
 
 
@@ -102,53 +345,329 @@ def _msg_ok(msg) -> bool:
     return msg is None or (isinstance(msg, ast.Constant) and isinstance(msg.value, str))
 
 
-def _parse_assert(stmt: ast.Assert, ep_name):
-    if not _msg_ok(stmt.msg):
-        raise DiscoveryError(f"line {stmt.lineno}: unsupported assert message")
-    t = stmt.test
-    call = _parse_call(t, ep_name)
+def _num_const(node, ctx, what="tolerance"):
+    v = _value(node, ctx)
+    if isinstance(v, bool) or not isinstance(v, (int, float, decimal.Decimal)):
+        raise _err(node, f"{what} must be a number")
+    v = float(v)
+    if math.isnan(v) or v < 0:
+        raise _err(node, f"invalid {what}")
+    return v
+
+
+def _call_vs_value(a, b, ctx, lineno):
+    """One of a/b is the entrypoint call, the other a value."""
+    call = _parse_call(a, ctx)
+    other = b
+    if call is None:
+        call = _parse_call(b, ctx)
+        other = a
+    if call is None:
+        return None
+    try:
+        expected = _value(other, ctx)
+    except DiscoveryError:
+        raise DiscoveryError(f"line {lineno}: unsupported expected value")
+    return call, expected
+
+
+def _parse_check(t, ctx, lineno):
+    """Parse an assertion expression into a test dict (without line)."""
+    call = _parse_call(t, ctx)
     if call is not None:
         return dict(kind="truthy", **call)
     if isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not):
-        call = _parse_call(t.operand, ep_name)
-        if call is not None:
-            return dict(kind="falsy", **call)
-    if (isinstance(t, ast.Compare) and len(t.ops) == 1
-            and isinstance(t.ops[0], (ast.Eq, ast.NotEq))):
-        kind = "eq" if isinstance(t.ops[0], ast.Eq) else "ne"
+        inner = _parse_check(t.operand, ctx, lineno)
+        if inner is not None:
+            flip = {"truthy": "falsy", "falsy": "truthy", "eq": "ne", "ne": "eq"}
+            inner["kind"] = flip[inner["kind"]]
+            return inner
+        return None
+    if isinstance(t, ast.Compare) and len(t.ops) == 1:
+        op = t.ops[0]
         left, right = t.left, t.comparators[0]
-        call = _parse_call(left, ep_name)
-        other = right
-        if call is None:
-            call = _parse_call(right, ep_name)
-            other = left
-        if call is not None:
-            if not _is_literal(other):
-                raise DiscoveryError(f"line {stmt.lineno}: unsupported expected value")
-            return dict(kind=kind, expected=_literal_value(other), **call)
-    raise DiscoveryError(f"line {stmt.lineno}: unsupported assertion")
+        if isinstance(op, (ast.Eq, ast.NotEq)):
+            r = _call_vs_value(left, right, ctx, lineno)
+            if r is not None:
+                call, expected = r
+                kind = "eq" if isinstance(op, ast.Eq) else "ne"
+                return dict(kind=kind, expected=expected, **call)
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            for a, b in ((left, right), (right, left)):
+                if isinstance(b, ast.Constant) and b.value is None:
+                    call = _parse_call(a, ctx)
+                    if call is not None:
+                        kind = "eq" if isinstance(op, ast.Is) else "ne"
+                        return dict(kind=kind, expected=None, **call)
+        # abs(call - value) < tol  /  tol > abs(call - value)
+        absnode = tolnode = None
+        strict = None
+        if isinstance(op, (ast.Lt, ast.LtE)):
+            absnode, tolnode, strict = left, right, isinstance(op, ast.Lt)
+        elif isinstance(op, (ast.Gt, ast.GtE)):
+            absnode, tolnode, strict = right, left, isinstance(op, ast.Gt)
+        if absnode is not None and _is_abs_diff(absnode, ctx):
+            d = absnode.args[0]
+            r = _call_vs_value(d.left, d.right, ctx, lineno)
+            if r is not None:
+                call, expected = r
+                tol = _num_const(tolnode, ctx)
+                cmp = {"mode": "abs_lt" if strict else "abs_le", "tol": tol}
+                return dict(kind="eq", expected=expected, cmp=cmp, **call)
+    if isinstance(t, ast.Call) and ctx.qual(t.func) == "math.isclose":
+        if len(t.args) != 2 or any(isinstance(a, ast.Starred) for a in t.args):
+            raise DiscoveryError(f"line {lineno}: unsupported isclose call")
+        rel, abs_ = 1e-9, 0.0
+        for kw in t.keywords:
+            if kw.arg == "rel_tol":
+                rel = _num_const(kw.value, ctx)
+            elif kw.arg == "abs_tol":
+                abs_ = _num_const(kw.value, ctx)
+            else:
+                raise DiscoveryError(f"line {lineno}: unsupported isclose argument")
+        r = _call_vs_value(t.args[0], t.args[1], ctx, lineno)
+        if r is not None:
+            call, expected = r
+            cmp = {"mode": "isclose", "rel": rel, "abs": abs_}
+            return dict(kind="eq", expected=expected, cmp=cmp, **call)
+    return None
 
 
-def _parse_try(stmt: ast.Try, ep_name):
+def _is_abs_diff(node, ctx):
+    return (isinstance(node, ast.Call) and ctx.qual(node.func) == "abs"
+            and len(node.args) == 1 and not node.keywords
+            and isinstance(node.args[0], ast.BinOp) and isinstance(node.args[0].op, ast.Sub))
+
+
+def _parse_assert(stmt: ast.Assert, ctx):
+    if not _msg_ok(stmt.msg):
+        raise DiscoveryError(f"line {stmt.lineno}: unsupported assert message")
+    t = _parse_check(stmt.test, ctx, stmt.lineno)
+    if t is None:
+        raise DiscoveryError(f"line {stmt.lineno}: unsupported assertion")
+    return t
+
+
+# ---- typed raises -------------------------------------------------------
+
+def _exc_names(node, ctx):
+    if node is None:
+        return None
+    nodes = node.elts if isinstance(node, ast.Tuple) else [node]
+    names = []
+    for n in nodes:
+        if isinstance(n, ast.Name):
+            names.append(n.id)
+        elif isinstance(n, ast.Attribute):
+            names.append(n.attr)
+        else:
+            return False
+    if any(n in ("Exception", "BaseException") for n in names):
+        return None
+    return names
+
+
+def _is_str_of(node, var):
+    return (var is not None and isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "str" and len(node.args) == 1 and not node.keywords
+            and isinstance(node.args[0], ast.Name) and node.args[0].id == var)
+
+
+def _str_const(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _re_flags(node, ctx):
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _re_flags(node.left, ctx) | _re_flags(node.right, ctx)
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return node.value
+    q = ctx.qual(node)
+    if q and q.startswith("re."):
+        name = q[3:]
+        if name.startswith("RegexFlag."):
+            name = name[len("RegexFlag."):]
+        if name in _RE_FLAG_VALUES:
+            return int(_RE_FLAG_VALUES[name])
+    raise _err(node, "unsupported regex flags")
+
+
+def _py_re_to_js(pattern, flags):
+    """Convert a Python regex to a JS (source, flags) pair."""
+    jsflags = ""
+    m = re.match(r"^\(\?([aiLmsux]+)\)", pattern)
+    if m:
+        for ch in m.group(1):
+            flags |= {"i": re.I, "m": re.M, "s": re.S, "x": re.X, "a": re.A,
+                      "u": re.U, "L": 0}[ch]
+        pattern = pattern[m.end():]
+    if flags & re.X:
+        # strip verbose-mode whitespace and comments (outside classes)
+        out, i, in_cls = [], 0, False
+        while i < len(pattern):
+            c = pattern[i]
+            if c == "\\" and i + 1 < len(pattern):
+                out.append(pattern[i:i + 2])
+                i += 2
+                continue
+            if in_cls:
+                if c == "]":
+                    in_cls = False
+                out.append(c)
+            elif c == "[":
+                in_cls = True
+                out.append(c)
+            elif c in " \t\n\r\f\v":
+                pass
+            elif c == "#":
+                while i < len(pattern) and pattern[i] != "\n":
+                    i += 1
+            else:
+                out.append(c)
+            i += 1
+        pattern = "".join(out)
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            n = pattern[i + 1]
+            if n == "A":
+                out.append("(?<![\\s\\S])")
+            elif n == "Z":
+                out.append("(?![\\s\\S])")
+            else:
+                out.append(pattern[i:i + 2])
+            i += 2
+            continue
+        if pattern.startswith("(?P<", i):
+            out.append("(?<")
+            i += 4
+            continue
+        if pattern.startswith("(?P=", i):
+            j = pattern.find(")", i)
+            if j > 0:
+                out.append("\\k<" + pattern[i + 4:j] + ">")
+                i = j + 1
+                continue
+        out.append(c)
+        i += 1
+    if flags & re.I:
+        jsflags += "i"
+    if flags & re.M:
+        jsflags += "m"
+    if flags & re.S:
+        jsflags += "s"
+    return "".join(out), jsflags
+
+
+def _parse_msg_check(test, var, ctx, lineno):
+    err = DiscoveryError(f"line {lineno}: unsupported exception assertion")
+    negate = False
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        negate = True
+        test = test.operand
+    chk = None
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        op, l, r = test.ops[0], test.left, test.comparators[0]
+        if isinstance(op, (ast.In, ast.NotIn)) and _str_const(l) is not None and _is_str_of(r, var):
+            chk = {"op": "in", "v": _str_const(l)}
+            if isinstance(op, ast.NotIn):
+                negate = not negate
+        elif isinstance(op, (ast.Eq, ast.NotEq)):
+            s = None
+            if _is_str_of(l, var):
+                s = _str_const(r)
+            elif _is_str_of(r, var):
+                s = _str_const(l)
+            if s is not None:
+                chk = {"op": "eq", "v": s}
+                if isinstance(op, ast.NotEq):
+                    negate = not negate
+    elif isinstance(test, ast.Call):
+        q = ctx.qual(test.func)
+        if q in ("re.search", "re.match", "re.fullmatch"):
+            args = list(test.args)
+            flags_node = None
+            for kw in test.keywords:
+                if kw.arg == "flags":
+                    flags_node = kw.value
+                elif kw.arg == "pattern" and not args:
+                    args.insert(0, kw.value)
+                elif kw.arg == "string" and len(args) == 1:
+                    args.append(kw.value)
+                else:
+                    raise err
+            if len(args) == 3 and flags_node is None:
+                flags_node = args.pop()
+            if len(args) != 2:
+                raise err
+            pat = _str_const(args[0])
+            if pat is None or not _is_str_of(args[1], var):
+                raise err
+            flags = _re_flags(flags_node, ctx) if flags_node is not None else 0
+            try:
+                re.compile(pat, flags)
+            except re.error:
+                raise DiscoveryError(f"line {lineno}: invalid regex")
+            jspat, jsflags = _py_re_to_js(pat, flags)
+            chk = {"op": q[3:], "v": pat, "flags": flags, "js": jspat, "jsflags": jsflags}
+        elif (isinstance(test.func, ast.Attribute) and test.func.attr in ("startswith", "endswith")
+              and _is_str_of(test.func.value, var) and len(test.args) == 1
+              and not test.keywords and _str_const(test.args[0]) is not None):
+            chk = {"op": test.func.attr, "v": _str_const(test.args[0])}
+    if chk is None:
+        raise err
+    chk["neg"] = negate
+    return chk
+
+
+def _is_assert_false(stmt):
+    if isinstance(stmt, ast.Assert):
+        return (isinstance(stmt.test, ast.Constant) and stmt.test.value in (False, 0, None)
+                and not isinstance(stmt.test.value, str) and _msg_ok(stmt.msg))
+    if isinstance(stmt, ast.Raise) and stmt.exc is not None and stmt.cause is None:
+        e = stmt.exc
+        if isinstance(e, ast.Name) and e.id == "AssertionError":
+            return True
+        if (isinstance(e, ast.Call) and isinstance(e.func, ast.Name)
+                and e.func.id == "AssertionError" and all(_str_const(a) is not None for a in e.args)):
+            return True
+    return False
+
+
+def _parse_try(stmt: ast.Try, ctx):
     err = DiscoveryError(f"line {stmt.lineno}: unsupported try block")
     if stmt.orelse or stmt.finalbody or len(stmt.handlers) != 1 or len(stmt.body) != 2:
         raise err
     first, second = stmt.body
-    if not isinstance(first, ast.Expr):
+    if isinstance(first, ast.Expr):
+        callnode = first.value
+    elif isinstance(first, ast.Assign) and len(first.targets) == 1 and isinstance(first.targets[0], ast.Name):
+        callnode = first.value
+    else:
         raise err
-    call = _parse_call(first.value, ep_name)
+    call = _parse_call(callnode, ctx)
     if call is None:
         raise err
-    if not (isinstance(second, ast.Assert) and isinstance(second.test, ast.Constant)
-            and second.test.value is False and _msg_ok(second.msg)):
+    if not _is_assert_false(second):
         raise err
     h = stmt.handlers[0]
-    if h.type is not None and not (isinstance(h.type, ast.Name)
-                                   and h.type.id in ("Exception", "BaseException")):
+    exc = _exc_names(h.type, ctx)
+    if exc is False:
         raise err
-    if len(h.body) != 1 or not isinstance(h.body[0], ast.Pass):
+    checks = []
+    for s in h.body:
+        if isinstance(s, ast.Pass):
+            continue
+        if isinstance(s, ast.Expr) and _str_const(s.value) is not None:
+            continue
+        if isinstance(s, ast.Assert) and _msg_ok(s.msg):
+            checks.append(_parse_msg_check(s.test, h.name, ctx, s.lineno))
+            continue
         raise err
-    return dict(kind="raises", **call)
+    return dict(kind="raises", exc=exc, checks=checks, **call)
 
 
 EXPECT_RE = re.compile(r"^#\s*expect_(stdout|stderr)\s*:\s*(.*?)\s*$")
@@ -204,24 +723,25 @@ def discover(tests_dir: str, ep_name=None):
     except (SyntaxError, ValueError) as e:
         raise DiscoveryError(f"syntax error: {e}")
     comments, lines = _comment_lines(source)
+    ctx = _Ctx(ep_name, _collect_aliases(tree))
 
     tests = []
 
-    def walk(body, top=False):
-        for i, stmt in enumerate(body):
+    def walk(body):
+        for stmt in body:
             if isinstance(stmt, ast.FunctionDef):
                 if stmt.decorator_list:
                     raise DiscoveryError(f"line {stmt.lineno}: decorators not allowed")
                 walk(stmt.body)
             elif isinstance(stmt, ast.Assert):
-                t = _parse_assert(stmt, ep_name)
+                t = _parse_assert(stmt, ctx)
                 t["line"] = stmt.lineno
                 tests.append(t)
             elif isinstance(stmt, ast.Try):
-                t = _parse_try(stmt, ep_name)
+                t = _parse_try(stmt, ctx)
                 t["line"] = stmt.lineno
                 tests.append(t)
-            elif isinstance(stmt, ast.Pass):
+            elif isinstance(stmt, (ast.Pass, ast.Import, ast.ImportFrom)):
                 pass
             elif (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
                   and isinstance(stmt.value.value, str)):
@@ -230,7 +750,7 @@ def discover(tests_dir: str, ep_name=None):
                 raise DiscoveryError(
                     f"line {stmt.lineno}: unsupported statement {type(stmt).__name__}")
 
-    walk(tree.body, top=True)
+    walk(tree.body)
 
     counts = {}
     for t in tests:
@@ -254,6 +774,14 @@ def discover(tests_dir: str, ep_name=None):
 # Serialization helpers
 # --------------------------------------------------------------------------
 
+def _sorted_items(items):
+    items = list(items)
+    try:
+        return sorted(items, key=lambda x: (type(x).__name__, repr(x)))
+    except Exception:
+        return items
+
+
 def py_literal(v) -> str:
     if v is None or isinstance(v, bool):
         return repr(v)
@@ -267,26 +795,76 @@ def py_literal(v) -> str:
         return repr(v)
     if isinstance(v, str):
         return repr(v)
+    if isinstance(v, decimal.Decimal):
+        return "_decimal.Decimal(" + repr(str(v)) + ")"
+    if isinstance(v, collections.deque):
+        inner = "[" + ", ".join(py_literal(x) for x in v) + "]"
+        if v.maxlen is not None:
+            return "_collections.deque(" + inner + ", " + repr(v.maxlen) + ")"
+        return "_collections.deque(" + inner + ")"
     if isinstance(v, list):
         return "[" + ", ".join(py_literal(x) for x in v) + "]"
     if isinstance(v, tuple):
         if len(v) == 1:
             return "(" + py_literal(v[0]) + ",)"
         return "(" + ", ".join(py_literal(x) for x in v) + ")"
+    if isinstance(v, (set, frozenset)):
+        inner = "{" + ", ".join(py_literal(x) for x in _sorted_items(v)) + "}"
+        if isinstance(v, frozenset):
+            return "frozenset(" + (inner if v else "") + ")"
+        return inner if v else "set()"
     if isinstance(v, dict):
-        return "{" + ", ".join(py_literal(k) + ": " + py_literal(x) for k, x in v.items()) + "}"
+        inner = "{" + ", ".join(py_literal(k) + ": " + py_literal(x) for k, x in v.items()) + "}"
+        if isinstance(v, collections.Counter):
+            return "_collections.Counter(" + inner + ")"
+        if isinstance(v, collections.defaultdict):
+            f = v.default_factory
+            fname = "None" if f is None else _DD_FACTORY_NAMES.get(f, "None")
+            if fname.startswith("collections."):
+                fname = "_" + fname
+            elif fname.startswith("decimal."):
+                fname = "_" + fname
+            return "_collections.defaultdict(" + fname + ", " + inner + ")"
+        if isinstance(v, collections.OrderedDict):
+            return "_collections.OrderedDict(" + inner + ")"
+        return inner
     raise TypeError(type(v))
 
 
-def json_safe(v):
-    """Convert to JSON-compatible data; special floats become sentinels."""
-    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-        return {"$bcg_float": "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")}
-    if isinstance(v, (list, tuple)):
-        return [json_safe(x) for x in v]
-    if isinstance(v, dict):
-        return {k: json_safe(x) for k, x in v.items()}
+def _js_float(v):
+    if math.isnan(v):
+        return {"$bcg": "float", "v": "nan"}
+    if math.isinf(v):
+        return {"$bcg": "float", "v": "inf" if v > 0 else "-inf"}
     return v
+
+
+def json_safe(v):
+    """Convert a value to tagged JSON-compatible data for the JS testers."""
+    if v is None or isinstance(v, (bool, str)):
+        return v
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return _js_float(v)
+    if isinstance(v, decimal.Decimal):
+        return {"$bcg": "dec", "v": str(v)}
+    if isinstance(v, (list, tuple, collections.deque)):
+        return [json_safe(x) for x in v]
+    if isinstance(v, (set, frozenset)):
+        return {"$bcg": "set", "v": [json_safe(x) for x in _sorted_items(v)]}
+    if isinstance(v, dict):
+        return {"$bcg": "dict", "c": isinstance(v, collections.Counter),
+                "v": [[json_safe(k), json_safe(x)] for k, x in v.items()]}
+    raise TypeError(type(v))
+
+
+def json_safe_record(r):
+    out = dict(r)
+    out["args"] = [json_safe(a) for a in r["args"]]
+    out["kwargs"] = [[k, json_safe(v)] for k, v in r["kwargs"]]
+    out["expected"] = json_safe(r.get("expected"))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -296,18 +874,24 @@ def json_safe(v):
 PY_TEMPLATE = r'''# Auto-generated by babel_code_goat.py -- do not edit.
 # __META__
 # Usage: python tester.py <solution.py> [--start N]
+import collections as _collections
+import collections.abc as _abc
 import copy
+import decimal as _decimal
 import importlib.util
 import inspect
 import io
 import json
+import math
 import os
+import re
 import sys
 
 MARKER = __MARKER__
 ENTRYPOINT = __ENTRYPOINT__
 CLASS_HINT = __CLASS_HINT__
 TESTS = __TESTS__
+TOL = __DEFAULT_TOL__
 
 _REAL_OUT = sys.stdout
 
@@ -378,29 +962,168 @@ def resolve(mod, name):
     return None
 
 
-def deep_eq(a, b):
+def _is_num(x):
+    return isinstance(x, (int, float, _decimal.Decimal))
+
+
+def num_eq(a, b, cmp):
+    mode = cmp["mode"] if cmp else "default"
+    try:
+        if a == b:
+            return True
+    except Exception:
+        pass
+    if mode == "default" and isinstance(a, int) and isinstance(b, int):
+        return False
+    try:
+        if isinstance(a, _decimal.Decimal) and isinstance(b, _decimal.Decimal):
+            if not (a.is_finite() and b.is_finite()):
+                return False
+            diff = float(abs(a - b))
+            fa, fb = float(a), float(b)
+        else:
+            fa, fb = float(a), float(b)
+            if math.isnan(fa) or math.isnan(fb):
+                return False
+            if math.isinf(fa) or math.isinf(fb):
+                return fa == fb
+            diff = abs(fa - fb)
+    except Exception:
+        return False
+    if math.isnan(diff):
+        return False
+    if mode == "default":
+        return diff <= TOL
+    if mode == "isclose":
+        return diff <= max(cmp["rel"] * max(abs(fa), abs(fb)), cmp["abs"])
+    if mode == "abs_lt":
+        return diff < cmp["tol"]
+    if mode == "abs_le":
+        return diff <= cmp["tol"]
+    return False
+
+
+_SEQ = (list, tuple, _collections.deque)
+
+
+def _contains(container, x):
+    try:
+        return x in container
+    except TypeError:
+        return False
+
+
+def _nonzero(m):
+    out = {}
+    for k, v in m.items():
+        try:
+            z = (v == 0)
+        except Exception:
+            z = False
+        if not z:
+            out[k] = v
+    return out
+
+
+def deep_eq(a, b, cmp=None):
     if b is None:
         return a is None
-    if isinstance(b, (list, tuple)):
-        if not isinstance(a, (list, tuple)) or len(a) != len(b):
+    if isinstance(b, bool):
+        if _is_num(a):
+            try:
+                return bool(a == b)
+            except Exception:
+                return False
+        return False
+    if _is_num(b):
+        if _is_num(a):
+            return num_eq(a, b, cmp)
+        return False
+    if isinstance(b, str):
+        return isinstance(a, str) and a == b
+    if isinstance(b, _SEQ):
+        if not isinstance(a, _SEQ) or len(a) != len(b):
             return False
-        return all(deep_eq(x, y) for x, y in zip(a, b))
-    if isinstance(b, dict):
-        if not isinstance(a, dict) or len(a) != len(b):
+        return all(deep_eq(x, y, cmp) for x, y in zip(a, b))
+    if isinstance(b, _collections.Counter):
+        if not isinstance(a, _abc.Mapping):
             return False
-        for k, v in b.items():
-            if k not in a or not deep_eq(a[k], v):
+        bm, am = _nonzero(b), _nonzero(a)
+        if len(am) != len(bm):
+            return False
+        for k, v in bm.items():
+            if not _contains(am, k) or not deep_eq(am[k], v, cmp):
                 return False
         return True
-    if isinstance(a, (list, tuple, dict)) or a is None:
+    if isinstance(b, dict):
+        if not isinstance(a, _abc.Mapping) or len(a) != len(b):
+            return False
+        for k, v in b.items():
+            if not _contains(a, k) or not deep_eq(a[k], v, cmp):
+                return False
+        return True
+    if isinstance(b, (set, frozenset)):
+        if not isinstance(a, (set, frozenset)) or len(a) != len(b):
+            return False
+        rest = [x for x in b if not _contains(a, x)]
+        if not rest:
+            return True
+        pool = [y for y in a if not _contains(b, y)]
+        for x in rest:
+            for j, y in enumerate(pool):
+                if deep_eq(y, x, cmp):
+                    del pool[j]
+                    break
+            else:
+                return False
+        return True
+    try:
+        return bool(a == b)
+    except Exception:
         return False
-    return bool(a == b)
+
+
+def _exc_matches(e, names):
+    if names is None:
+        return isinstance(e, Exception)
+    mro_names = {c.__name__ for c in type(e).__mro__}
+    return any(n in mro_names for n in names)
+
+
+def _check_msg(e, chk):
+    try:
+        s = str(e)
+    except Exception:
+        return False
+    op = chk["op"]
+    v = chk["v"]
+    try:
+        if op == "in":
+            r = v in s
+        elif op == "eq":
+            r = s == v
+        elif op == "startswith":
+            r = s.startswith(v)
+        elif op == "endswith":
+            r = s.endswith(v)
+        elif op == "search":
+            r = re.search(v, s, chk.get("flags", 0)) is not None
+        elif op == "match":
+            r = re.match(v, s, chk.get("flags", 0)) is not None
+        elif op == "fullmatch":
+            r = re.fullmatch(v, s, chk.get("flags", 0)) is not None
+        else:
+            return False
+    except Exception:
+        return False
+    return (not r) if chk.get("neg") else r
 
 
 def run_test(factory, t):
     kind = t["kind"]
     args = copy.deepcopy(t["args"])
     kwargs = {k: copy.deepcopy(v) for k, v in t["kwargs"]}
+    cmp = t.get("cmp")
     ok = False
     with _Capture() as cap:
         try:
@@ -412,17 +1135,20 @@ def run_test(factory, t):
                 try:
                     fn(*args, **kwargs)
                     ok = False
-                except Exception:
-                    ok = True
-                except BaseException:
-                    ok = False
+                except BaseException as e:
+                    ok = _exc_matches(e, t.get("exc"))
+                    if ok:
+                        for chk in t.get("checks") or []:
+                            if not _check_msg(e, chk):
+                                ok = False
+                                break
             else:
                 try:
                     res = fn(*args, **kwargs)
                     if kind == "eq":
-                        ok = deep_eq(res, t["expected"])
+                        ok = deep_eq(res, t["expected"], cmp)
                     elif kind == "ne":
-                        ok = not deep_eq(res, t["expected"])
+                        ok = not deep_eq(res, t["expected"], cmp)
                     elif kind == "truthy":
                         ok = bool(res)
                     elif kind == "falsy":
@@ -444,6 +1170,9 @@ def main(argv):
     start = 0
     if "--start" in argv:
         start = int(argv[argv.index("--start") + 1])
+    global TOL
+    if "--tol" in argv:
+        TOL = float(argv[argv.index("--tol") + 1])
     try:
         sys.setrecursionlimit(max(sys.getrecursionlimit(), 10000))
     except Exception:
@@ -498,13 +1227,20 @@ const MARKER = __MARKER__;
 const ENTRYPOINT = __ENTRYPOINT__;
 const CLASS_HINT = __CLASS_HINT__;
 const IS_TS = __IS_TS__;
+function PySet(items) { this.items = items; }
+function PyDec(s) { this.s = s; this.n = Number(s); }
+function PyDict(entries, counter) { this.entries = entries; this.counter = !!counter; }
 const TESTS = JSON.parse(__TESTS__, function (k, v) {
-  if (v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 1 &&
-      typeof v["$bcg_float"] === "string") {
-    return v["$bcg_float"] === "nan" ? NaN : (v["$bcg_float"] === "inf" ? Infinity : -Infinity);
+  if (v && typeof v === "object" && !Array.isArray(v) && typeof v["$bcg"] === "string") {
+    const tag = v["$bcg"];
+    if (tag === "float") return v.v === "nan" ? NaN : (v.v === "inf" ? Infinity : -Infinity);
+    if (tag === "dec") return new PyDec(v.v);
+    if (tag === "set") return new PySet(v.v);
+    if (tag === "dict") return new PyDict(v.v, v.c);
   }
   return v;
 });
+let TOL = __DEFAULT_TOL__;
 
 function emit(obj) {
   fs.writeSync(1, MARKER + JSON.stringify(obj) + "\n");
@@ -536,36 +1272,134 @@ process.stderr.write = makeWriter("err");
 function isPlainObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
-function pyEqual(a, b) {
+function isRecord(v) {
+  return isPlainObject(v) && !(v instanceof Map) && !(v instanceof Set) &&
+    !ArrayBuffer.isView(v) && !(v instanceof PySet) && !(v instanceof PyDict) && !(v instanceof PyDec);
+}
+function isSeq(v) {
+  return Array.isArray(v) || (ArrayBuffer.isView(v) && !(v instanceof DataView));
+}
+function asNumber(a) {
+  if (typeof a === "number") return a;
+  if (typeof a === "boolean") return a ? 1 : 0;
+  if (typeof a === "bigint") return Number(a);
+  if (a instanceof PyDec) return a.n;
+  if (a instanceof Number) return a.valueOf();
+  if (a !== null && typeof a === "object" && typeof a.toNumber === "function") {
+    try { const n = a.toNumber(); if (typeof n === "number") return n; } catch (e) {}
+  }
+  return undefined;
+}
+function numEq(a, b, cmp) {
+  if (typeof a === "bigint" && typeof b === "number" && Number.isSafeInteger(b)) {
+    if (a === BigInt(b)) return true;
+  }
+  const na = asNumber(a), nb = asNumber(b);
+  if (na === undefined || nb === undefined) return false;
+  if (na === nb) return true;
+  if (Number.isNaN(na) || Number.isNaN(nb)) return false;
+  if (!Number.isFinite(na) || !Number.isFinite(nb)) return false;
+  const mode = cmp ? cmp.mode : "default";
+  if (mode === "default" && Number.isInteger(na) && Number.isInteger(nb) &&
+      !(Number.isSafeInteger(na) === false || Number.isSafeInteger(nb) === false)) return false;
+  const diff = Math.abs(na - nb);
+  if (mode === "default") return diff <= TOL;
+  if (mode === "isclose") return diff <= Math.max(cmp.rel * Math.max(Math.abs(na), Math.abs(nb)), cmp.abs);
+  if (mode === "abs_lt") return diff < cmp.tol;
+  if (mode === "abs_le") return diff <= cmp.tol;
+  return false;
+}
+function keyStr(k) {
+  if (typeof k === "string") return k;
+  if (k === null || k === undefined) return "null";
+  if (Array.isArray(k)) return k.map(keyStr).join(",");
+  if (k instanceof PyDec) return String(k.n);
+  return String(k);
+}
+function isZero(v) {
+  const n = asNumber(v);
+  return n === 0;
+}
+function mapEntries(a) {
+  if (a instanceof Map) return Array.from(a.entries());
+  if (isRecord(a)) return Object.keys(a).map(function (k) { return [k, a[k]]; });
+  return null;
+}
+function dictEqual(a, b, cmp) {
+  let exp = b.entries;
+  if (b.counter) exp = exp.filter(function (e) { return !isZero(e[1]); });
+  let act = mapEntries(a);
+  if (act === null) return false;
+  if (b.counter) act = act.filter(function (e) { return !isZero(e[1]); });
+  if (act.length !== exp.length) return false;
+  const used = new Array(act.length).fill(false);
+  const isMap = a instanceof Map;
+  for (const [k, v] of exp) {
+    let found = -1;
+    if (isMap) {
+      for (let i = 0; i < act.length; i++) {
+        if (!used[i] && pyEqual(act[i][0], k, null)) { found = i; break; }
+      }
+      if (found < 0) {
+        const ks = keyStr(k);
+        for (let i = 0; i < act.length; i++) {
+          if (!used[i] && typeof act[i][0] === "string" && act[i][0] === ks) { found = i; break; }
+        }
+      }
+    } else {
+      const ks = keyStr(k);
+      for (let i = 0; i < act.length; i++) {
+        if (!used[i] && act[i][0] === ks) { found = i; break; }
+      }
+    }
+    if (found < 0) return false;
+    used[found] = true;
+    if (!pyEqual(act[found][1], v, cmp)) return false;
+  }
+  return true;
+}
+function setEqual(a, b, cmp) {
+  let act;
+  if (a instanceof Set) act = Array.from(a);
+  else if (a instanceof PySet) act = a.items.slice();
+  else return false;
+  if (act.length !== b.items.length) return false;
+  const used = new Array(act.length).fill(false);
+  for (const x of b.items) {
+    let found = -1;
+    for (let i = 0; i < act.length; i++) {
+      if (!used[i] && pyEqual(act[i], x, null)) { found = i; break; }
+    }
+    if (found < 0 && cmp !== undefined) {
+      for (let i = 0; i < act.length; i++) {
+        if (!used[i] && pyEqual(act[i], x, cmp)) { found = i; break; }
+      }
+    }
+    if (found < 0) return false;
+    used[found] = true;
+  }
+  return true;
+}
+function pyEqual(a, b, cmp) {
   if (b === null || b === undefined) return a === null || a === undefined;
-  if (typeof b === "number" || typeof b === "boolean") {
-    if (typeof a === "number" || typeof a === "boolean") return Number(a) === Number(b);
-    if (typeof a === "bigint") return Number.isInteger(Number(b)) && a === BigInt(Number(b));
-    return false;
+  if (typeof b === "boolean") {
+    const na = asNumber(a);
+    if (na === undefined || a instanceof PyDec) return false;
+    return na === (b ? 1 : 0);
   }
-  if (typeof b === "string") return a === b;
+  if (typeof b === "number" || b instanceof PyDec) {
+    if (typeof a === "string" || a === null || a === undefined) return false;
+    return numEq(a, b, cmp);
+  }
+  if (typeof b === "string") return a === b || (a instanceof String && a.valueOf() === b);
   if (Array.isArray(b)) {
-    if (!Array.isArray(a) && !(ArrayBuffer.isView(a) && !(a instanceof DataView))) return false;
+    if (!isSeq(a)) return false;
     if (a.length !== b.length) return false;
-    for (let i = 0; i < b.length; i++) if (!pyEqual(a[i], b[i])) return false;
+    for (let i = 0; i < b.length; i++) if (!pyEqual(a[i], b[i], cmp)) return false;
     return true;
   }
-  if (isPlainObject(b)) {
-    if (a instanceof Map) {
-      const bk = Object.keys(b);
-      if (a.size !== bk.length) return false;
-      for (const k of bk) { if (!a.has(k) || !pyEqual(a.get(k), b[k])) return false; }
-      return true;
-    }
-    if (!isPlainObject(a) || a instanceof Set) return false;
-    const ak = Object.keys(a), bk = Object.keys(b);
-    if (ak.length !== bk.length) return false;
-    for (const k of bk) {
-      if (!Object.prototype.hasOwnProperty.call(a, k)) return false;
-      if (!pyEqual(a[k], b[k])) return false;
-    }
-    return true;
-  }
+  if (b instanceof PySet) return setEqual(a, b, cmp);
+  if (b instanceof PyDict) return dictEqual(a, b, cmp);
   return false;
 }
 function pyTruthy(v) {
@@ -580,14 +1414,95 @@ function pyTruthy(v) {
     return Object.keys(v).length > 0;
   return true;
 }
-function deepCopy(v) {
-  if (Array.isArray(v)) return v.map(deepCopy);
-  if (isPlainObject(v)) {
-    const o = {};
-    for (const k of Object.keys(v)) Object.defineProperty(o, k, { value: deepCopy(v[k]), enumerable: true, writable: true, configurable: true });
-    return o;
+// Convert an encoded test value into a fresh native JS value.
+function toJS(v) {
+  if (Array.isArray(v)) return v.map(toJS);
+  if (v instanceof PyDec) return v.n;
+  if (v instanceof PySet) return new Set(v.items.map(toJS));
+  if (v instanceof PyDict) {
+    if (v.entries.every(function (e) { return typeof e[0] === "string"; })) {
+      const o = {};
+      for (const [k, x] of v.entries) Object.defineProperty(o, k, { value: toJS(x), enumerable: true, writable: true, configurable: true });
+      return o;
+    }
+    return new Map(v.entries.map(function (e) { return [toJS(e[0]), toJS(e[1])]; }));
   }
   return v;
+}
+
+// ---------- exceptions ----------
+const PY_EXC_PARENT = {
+  BaseException: null, Exception: "BaseException", SystemExit: "BaseException",
+  KeyboardInterrupt: "BaseException", GeneratorExit: "BaseException",
+  ArithmeticError: "Exception", ZeroDivisionError: "ArithmeticError",
+  OverflowError: "ArithmeticError", FloatingPointError: "ArithmeticError",
+  AssertionError: "Exception", AttributeError: "Exception", BufferError: "Exception",
+  EOFError: "Exception", ImportError: "Exception", ModuleNotFoundError: "ImportError",
+  LookupError: "Exception", IndexError: "LookupError", KeyError: "LookupError",
+  MemoryError: "Exception", NameError: "Exception", UnboundLocalError: "NameError",
+  OSError: "Exception", FileNotFoundError: "OSError", FileExistsError: "OSError",
+  PermissionError: "OSError", TimeoutError: "OSError", IsADirectoryError: "OSError",
+  NotADirectoryError: "OSError", ConnectionError: "OSError",
+  RuntimeError: "Exception", NotImplementedError: "RuntimeError", RecursionError: "RuntimeError",
+  StopIteration: "Exception", StopAsyncIteration: "Exception",
+  SyntaxError: "Exception", SystemError: "Exception", TypeError: "Exception",
+  ValueError: "Exception", UnicodeError: "ValueError", UnicodeDecodeError: "UnicodeError",
+  UnicodeEncodeError: "UnicodeError", Warning: "Exception"
+};
+const JS_BUILTIN_ERRORS = new Set(["Error", "RangeError", "TypeError", "SyntaxError",
+  "ReferenceError", "EvalError", "URIError", "AggregateError", "Object", ""]);
+function errorNames(e) {
+  const names = [];
+  if (e !== null && (typeof e === "object" || typeof e === "function")) {
+    try { if (typeof e.name === "string") names.push(e.name); } catch (x) {}
+    let p = null;
+    try { p = Object.getPrototypeOf(e); } catch (x) {}
+    let guard = 0;
+    while (p && guard++ < 50) {
+      try {
+        if (p.constructor && typeof p.constructor.name === "string") names.push(p.constructor.name);
+      } catch (x) {}
+      try { p = Object.getPrototypeOf(p); } catch (x) { p = null; }
+    }
+  }
+  return names;
+}
+function excMatches(e, wanted) {
+  if (wanted === null || wanted === undefined) return true;
+  const names = errorNames(e);
+  for (const n of names) {
+    if (wanted.indexOf(n) >= 0) return true;
+    let p = Object.prototype.hasOwnProperty.call(PY_EXC_PARENT, n) ? PY_EXC_PARENT[n] : undefined;
+    while (p) {
+      if (wanted.indexOf(p) >= 0) return true;
+      p = PY_EXC_PARENT[p];
+    }
+  }
+  // the error names a (different) Python exception: mismatch
+  for (const n of names) {
+    if (!JS_BUILTIN_ERRORS.has(n) && Object.prototype.hasOwnProperty.call(PY_EXC_PARENT, n)) return false;
+  }
+  // generic JS errors / custom classes carry no Python type: accept
+  return true;
+}
+function errorMessage(e) {
+  if (e !== null && typeof e === "object" && typeof e.message === "string") return e.message;
+  try { return String(e); } catch (x) { return ""; }
+}
+function checkMsg(e, chk) {
+  const s = errorMessage(e);
+  let r = false;
+  try {
+    if (chk.op === "in") r = s.indexOf(chk.v) >= 0;
+    else if (chk.op === "eq") r = s === chk.v;
+    else if (chk.op === "startswith") r = s.startsWith(chk.v);
+    else if (chk.op === "endswith") r = s.endsWith(chk.v);
+    else if (chk.op === "search") r = new RegExp(chk.js, chk.jsflags).test(s);
+    else if (chk.op === "match") r = new RegExp(chk.js, chk.jsflags + "y").test(s);
+    else if (chk.op === "fullmatch") r = new RegExp("(?:" + chk.js + ")(?![\\s\\S])", chk.jsflags + "y").test(s);
+    else return false;
+  } catch (x) { return false; }
+  return chk.neg ? !r : r;
 }
 
 // ---------- solution loading ----------
@@ -708,7 +1623,8 @@ function resolve(loaded, name) {
 
 // ---------- running ----------
 async function runTest(factory, t) {
-  const args = deepCopy(t.args).concat(t.kwargs.map(function (kv) { return deepCopy(kv[1]); }));
+  const args = toJS(t.args).concat(t.kwargs.map(function (kv) { return toJS(kv[1]); }));
+  const cmp = t.cmp || null;
   let ok = false;
   capOut = ""; capErr = "";
   try {
@@ -720,13 +1636,16 @@ async function runTest(factory, t) {
           let r = fn.apply(null, args);
           if (r && typeof r.then === "function") r = await r;
           ok = false;
-        } catch (e) { ok = true; }
+        } catch (e) {
+          ok = excMatches(e, t.exc);
+          if (ok) for (const chk of (t.checks || [])) { if (!checkMsg(e, chk)) { ok = false; break; } }
+        }
       } else {
         try {
           let res = fn.apply(null, args);
           if (res && typeof res.then === "function") res = await res;
-          if (t.kind === "eq") ok = pyEqual(res, t.expected);
-          else if (t.kind === "ne") ok = !pyEqual(res, t.expected);
+          if (t.kind === "eq") ok = pyEqual(res, t.expected, cmp);
+          else if (t.kind === "ne") ok = !pyEqual(res, t.expected, cmp);
           else if (t.kind === "truthy") ok = pyTruthy(res);
           else if (t.kind === "falsy") ok = !pyTruthy(res);
         } catch (e) { ok = false; }
@@ -749,6 +1668,8 @@ async function main() {
   let start = 0;
   const si = argv.indexOf("--start");
   if (si >= 0) start = parseInt(argv[si + 1], 10) || 0;
+  const ti = argv.indexOf("--tol");
+  if (ti >= 0) { const v = parseFloat(argv[ti + 1]); if (!Number.isNaN(v)) TOL = v; }
   const passed = [], failed = [];
   let factory = null;
   capOut = ""; capErr = "";
@@ -794,6 +1715,7 @@ def render_tester(lang: str, tests, entrypoint: str) -> str:
         records.append({
             "id": t["id"], "kind": t["kind"], "args": t["args"],
             "kwargs": t["kwargs"], "expected": t.get("expected"),
+            "cmp": t.get("cmp"), "exc": t.get("exc"), "checks": t.get("checks"),
             "stdout": t.get("stdout"), "stderr": t.get("stderr"),
         })
     if lang == "python":
@@ -803,9 +1725,10 @@ def render_tester(lang: str, tests, entrypoint: str) -> str:
         out = out.replace("__MARKER__", repr(MARKER))
         out = out.replace("__ENTRYPOINT__", repr(name))
         out = out.replace("__CLASS_HINT__", repr(class_hint))
+        out = out.replace("__DEFAULT_TOL__", repr(DEFAULT_TOL))
         out = out.replace("__TESTS__", body)
         return out
-    data = json.dumps(json_safe(records), allow_nan=False)
+    data = json.dumps([json_safe_record(r) for r in records], allow_nan=False)
     out = JS_TEMPLATE
     out = out.replace("__HEADER__", "// @ts-nocheck" if lang == "typescript" else "")
     out = out.replace("__META__", meta)
@@ -815,6 +1738,7 @@ def render_tester(lang: str, tests, entrypoint: str) -> str:
     out = out.replace("__ENTRYPOINT__", json.dumps(name))
     out = out.replace("__CLASS_HINT__", json.dumps(class_hint))
     out = out.replace("__IS_TS__", "true" if lang == "typescript" else "false")
+    out = out.replace("__DEFAULT_TOL__", repr(DEFAULT_TOL))
     out = out.replace("__TESTS__", json.dumps(data))
     return out
 
@@ -901,12 +1825,12 @@ def _node_cmd(lang):
     return cmd
 
 
-def _run_tester(base_cmd, tester, solution, n_tests, timeout):
+def _run_tester(base_cmd, tester, solution, n_tests, timeout, extra=()):
     """Run tester, restarting after crashes/timeouts. Returns dict id->bool."""
     results = {}
     start = 0
     while start < n_tests:
-        cmd = base_cmd + [tester, solution, "--start", str(start)]
+        cmd = base_cmd + [tester, solution, "--start", str(start)] + list(extra)
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, start_new_session=True)
@@ -993,6 +1917,9 @@ def emit_result(status, passed, failed) -> int:
 def cmd_test(args) -> int:
     tests_dir = args.tests_dir
     lang = args.lang
+    tol = args.tol
+    if tol is None or not math.isfinite(tol) or tol < 0:
+        return emit_result("error", [], [])
     meta = None
     tester = None
     if lang in LANG_EXT:
@@ -1028,7 +1955,8 @@ def cmd_test(args) -> int:
     if not ids:
         return emit_result("pass", [], [])
     timeout = args.timeout if args.timeout and args.timeout > 0 else DEFAULT_TIMEOUT
-    results = _run_tester(base, os.path.abspath(tester), solution, len(ids), timeout)
+    extra = ["--tol", repr(float(tol))]
+    results = _run_tester(base, os.path.abspath(tester), solution, len(ids), timeout, extra)
     passed = [i for i in ids if results.get(i) is True]
     failed = [i for i in ids if results.get(i) is not True]
     return emit_result("pass" if not failed else "fail", passed, failed)
@@ -1056,6 +1984,7 @@ def main(argv=None) -> int:
     t.add_argument("tests_dir")
     t.add_argument("--lang")
     t.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    t.add_argument("--tol", type=float, default=DEFAULT_TOL)
     is_test = bool(argv) and argv[0] == "test"
     try:
         args, _unknown = parser.parse_known_args(argv)
