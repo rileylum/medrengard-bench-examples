@@ -27,13 +27,25 @@ def load_state():
         with open(state_path(), "r", encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict):
+            vaults = data.pop(VAULT_KEY, None)
+            VAULTS.clear()
+            if isinstance(vaults, dict):
+                VAULTS.update(vaults)
             return data
     except Exception:
         pass
     return {}
 
 
+VAULT_KEY = "__vaults__"
+VAULTS = {}
+
+
 def save_state(state):
+    state = dict(state)
+    state.pop(VAULT_KEY, None)
+    if VAULTS:
+        state[VAULT_KEY] = VAULTS
     path = state_path()
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -530,16 +542,190 @@ def cmd_delete(args):
     state = load_state()
     if name not in state:
         fail([err("metadata.name", "mesh %r not found" % name, "not_found")])
+    deps = sorted(vn for vn, v in VAULTS.items() if (v.get("spec") or {}).get("meshRef") == name)
+    if deps:
+        fail([err("metadata.name", "mesh %r cannot be deleted: referenced by vaults: %s"
+                  % (name, ", ".join(deps)), "conflict")])
     del state[name]
     save_state(state)
     out({"message": "mesh %s deleted" % name, "metadata": {"name": name}})
 
 
+VAULT_POLICIES = ("retain", "recreate")
+VAULT_STR_FIELDS = ("meshRef", "vaultName", "updatePolicy", "template", "templateRef")
+
+
+def vault_status(vault, meshes):
+    parent = meshes.get((vault.get("spec") or {}).get("meshRef"))
+    stable = isinstance(parent, dict) and (parent.get("status") or {}).get("stable") is True
+    ready = "True" if stable else "False"
+    return {"conditions": [cond("Ready", ready, "")], "state": "Ready" if stable else "Pending"}
+
+
+def vault_render(vault, meshes):
+    r = {"metadata": copy.deepcopy(vault.get("metadata") or {}),
+         "spec": copy.deepcopy(vault.get("spec") or {})}
+    r["status"] = vault_status(vault, meshes)
+    return r
+
+
+def vault_validate(doc, meshes, mode, stored=None):
+    errors = []
+    if not isinstance(doc, dict):
+        fail([err("", "document must be a YAML mapping", "parse")])
+    md_in = doc.get("metadata")
+    if md_in is None:
+        md_in = {}
+    if not isinstance(md_in, dict):
+        errors.append(err("metadata", "metadata must be an object", "invalid"))
+        md_in = {}
+    name = md_in.get("name")
+    name_ok = False
+    if name is None or name == "":
+        errors.append(err("metadata.name", "metadata.name is required", "required"))
+    elif not isinstance(name, str) or not NAME_RE.match(name):
+        errors.append(err("metadata.name",
+                          "metadata.name must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$", "invalid"))
+    else:
+        name_ok = True
+    if mode == "update" and name_ok and name not in VAULTS:
+        fail([err("metadata.name", "vault %r not found" % name, "not_found")])
+
+    spec_in = doc.get("spec")
+    if spec_in is None:
+        spec_in = {}
+    if not isinstance(spec_in, dict):
+        errors.append(err("spec", "spec must be an object", "invalid"))
+        spec_in = {}
+    if stored is not None:
+        old_spec = stored.get("spec") or {}
+        for f in ("meshRef", "vaultName"):
+            v = spec_in.get(f)
+            if v is not None and v != old_spec.get(f):
+                errors.append(err("spec.%s" % f, "field 'spec.%s' is immutable after creation" % f,
+                                  "immutable"))
+        spec = deep_merge(old_spec, spec_in)
+        for k, v in spec_in.items():
+            if v is None and k not in ("meshRef", "vaultName"):
+                spec.pop(k, None)
+        for f in ("meshRef", "vaultName"):
+            if f in old_spec:
+                spec[f] = old_spec[f]
+    else:
+        spec = {k: copy.deepcopy(v) for k, v in spec_in.items() if v is not None}
+
+    bad = set()
+    for f in VAULT_STR_FIELDS:
+        v = spec.get(f)
+        if v is not None and not isinstance(v, str):
+            errors.append(err("spec.%s" % f, "spec.%s must be a string" % f, "invalid"))
+            bad.add(f)
+
+    mesh_ref = spec.get("meshRef")
+    if mesh_ref is None or mesh_ref == "":
+        errors.append(err("spec.meshRef", "spec.meshRef is required", "required"))
+        mesh_ref = None
+    elif "meshRef" not in bad and mesh_ref not in meshes:
+        errors.append(err("spec.meshRef", "referenced mesh %r does not exist" % mesh_ref, "invalid"))
+
+    if spec.get("vaultName") is None or spec.get("vaultName") == "":
+        if name_ok:
+            spec["vaultName"] = name
+        elif "vaultName" in spec:
+            del spec["vaultName"]
+    if spec.get("updatePolicy") is None:
+        spec["updatePolicy"] = "retain"
+    elif "updatePolicy" not in bad and spec["updatePolicy"] not in VAULT_POLICIES:
+        errors.append(err("spec.updatePolicy",
+                          "spec.updatePolicy must be one of \"retain\", \"recreate\", got %r"
+                          % (spec["updatePolicy"],), "invalid"))
+    if spec.get("template") is not None and spec.get("templateRef") is not None:
+        errors.append(err("spec.template",
+                          "spec.template and spec.templateRef are mutually exclusive", "invalid"))
+
+    if mode == "create":
+        if name_ok and name in VAULTS:
+            errors.append(err("metadata.name", "vault %r already exists" % name, "duplicate"))
+        vn = spec.get("vaultName")
+        if mesh_ref is not None and isinstance(vn, str):
+            for other_name, other in VAULTS.items():
+                os_ = other.get("spec") or {}
+                if os_.get("meshRef") == mesh_ref and os_.get("vaultName") == vn:
+                    errors.append(err("spec.vaultName",
+                                      "vault %r already exists in mesh %r (vault %s)"
+                                      % (vn, mesh_ref, other_name), "duplicate"))
+                    break
+    if errors:
+        fail(errors)
+    md = deep_merge((stored or {}).get("metadata") or {}, md_in)
+    md["name"] = name
+    return {"metadata": md, "spec": spec}
+
+
+def vault_create(args):
+    doc = read_doc(args)
+    meshes = load_state()
+    vault = vault_validate(doc, meshes, "create")
+    VAULTS[vault["metadata"]["name"]] = vault
+    save_state(meshes)
+    out(vault_render(vault, meshes))
+
+
+def vault_update(args):
+    doc = read_doc(args)
+    meshes = load_state()
+    md = doc.get("metadata") if isinstance(doc, dict) else None
+    name = md.get("name") if isinstance(md, dict) else None
+    stored = VAULTS.get(name) if isinstance(name, str) else None
+    if stored is None and isinstance(name, str) and name != "":
+        fail([err("metadata.name", "vault %r not found" % name, "not_found")])
+    vault = vault_validate(doc, meshes, "update", stored)
+    VAULTS[name] = vault
+    save_state(meshes)
+    out(vault_render(vault, meshes))
+
+
+def vault_list(args):
+    meshes = load_state()
+    items = [{"name": n, "status": {"state": vault_status(v, meshes)["state"]}}
+             for n, v in VAULTS.items()]
+    items.sort(key=lambda x: x["name"])
+    out(items)
+
+
+def vault_need(args):
+    names = [a for a in args if not a.startswith("-")]
+    if not names:
+        fail([err("metadata.name", "vault name is required", "required")])
+    meshes = load_state()
+    if names[0] not in VAULTS:
+        fail([err("metadata.name", "vault %r not found" % names[0], "not_found")])
+    return names[0], meshes
+
+
+def vault_describe(args):
+    name, meshes = vault_need(args)
+    out(vault_render(VAULTS[name], meshes))
+
+
+def vault_delete(args):
+    name, meshes = vault_need(args)
+    del VAULTS[name]
+    save_state(meshes)
+    out({"message": "vault %s deleted" % name, "metadata": {"name": name}})
+
+
 def main(argv):
-    if len(argv) < 2 or argv[0] != "mesh":
-        fail([err("", "usage: meshctl.py mesh <create|update|list|describe|delete> [arguments]", "invalid")])
+    if len(argv) < 2 or argv[0] not in ("mesh", "vault"):
+        fail([err("", "usage: meshctl.py <mesh|vault> <create|update|list|describe|delete> [arguments]",
+                  "invalid")])
     op, rest = argv[1], argv[2:]
-    handlers = {"create": cmd_create, "update": cmd_update, "list": cmd_list, "describe": cmd_describe, "delete": cmd_delete}
+    if argv[0] == "vault":
+        handlers = {"create": vault_create, "update": vault_update, "list": vault_list,
+                    "describe": vault_describe, "delete": vault_delete}
+    else:
+        handlers = {"create": cmd_create, "update": cmd_update, "list": cmd_list,
+                    "describe": cmd_describe, "delete": cmd_delete}
     if op not in handlers:
         fail([err("", "unknown operation %r" % op, "invalid")])
     handlers[op](rest)
