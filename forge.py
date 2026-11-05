@@ -365,9 +365,119 @@ def cmd_alloc_get(data_dir, args):
     raise ForgeError("not_found", "allocation '%s' not found" % ident)
 
 
+def _parse_flags(args, flags):
+    vals = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        for f in flags:
+            if a == f or a.startswith(f + "="):
+                if f in vals:
+                    raise ForgeError("validation_error", "%s given more than once" % f)
+                vals[f], i = _take_opt(args, i, f)
+                break
+        else:
+            raise ForgeError("validation_error", "unexpected argument '%s'" % a)
+    return vals
+
+
+def cmd_alloc_bind(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "allocation bind takes no arguments")
+    raw = sys.stdin.read()
+    try:
+        doc = json.loads(raw, parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as e:
+        raise ForgeError("validation_error", "invalid JSON input: %s" % e)
+    if not isinstance(doc, dict):
+        raise ForgeError("validation_error",
+                         "input must be a JSON object, got %s" % type_name(doc))
+    errors = []
+    if "assignment_id" not in doc or doc["assignment_id"] is None:
+        errors.append("assignment_id: is required")
+    elif not isinstance(doc["assignment_id"], str):
+        errors.append("assignment_id: must be a string, got %s"
+                      % type_name(doc["assignment_id"]))
+    elif doc["assignment_id"] == "":
+        errors.append("assignment_id: must be a non-empty string")
+    if "allocations" not in doc or doc["allocations"] is None:
+        errors.append("allocations: is required")
+    elif not isinstance(doc["allocations"], dict):
+        errors.append("allocations: must be an object, got %s"
+                      % type_name(doc["allocations"]))
+    elif len(doc["allocations"]) == 0:
+        errors.append("allocations: must contain at least one entry")
+    if errors:
+        raise ForgeError("validation_error", "; ".join(errors))
+
+    assignment = doc["assignment_id"]
+    ops = doc["allocations"]
+    bad = [k for k, v in ops.items() if v not in ("add", "remove") or not isinstance(v, str)]
+    if bad:
+        raise ForgeError("invalid_operation",
+                         "invalid operation for allocations: %s (must be \"add\" or \"remove\")"
+                         % ", ".join(json.dumps(k) for k in bad))
+
+    allocs = load_allocs(data_dir)
+    by_id = {a.get("uuid"): a for a in allocs}
+    missing = [k for k in ops if k not in by_id]
+    if missing:
+        raise ForgeError("not_found", "allocations not found: %s"
+                         % ", ".join(json.dumps(k) for k in missing))
+
+    has_add = any(v == "add" for v in ops.values())
+    if has_add and any(a.get("assignment_id") == assignment
+                       and a.get("binding_status") == "bound" for a in allocs):
+        raise ForgeError("duplicate_assignment",
+                         "assignment '%s' already has bound allocations" % assignment)
+
+    changed = False
+    for k, v in ops.items():
+        al = by_id[k]
+        if v == "add":
+            al["binding_status"] = "bound"
+            al["assignment_id"] = assignment
+            changed = True
+        elif al.get("binding_status") != "unbound" or al.get("assignment_id") is not None:
+            al["binding_status"] = "unbound"
+            al["assignment_id"] = None
+            changed = True
+    if changed:
+        save_allocs(data_dir, allocs)
+    return {"status": "accepted"}
+
+
+def cmd_alloc_delete(data_dir, args):
+    vals = _parse_flags(args, ("--assignment", "--ids"))
+    if len(vals) != 1:
+        raise ForgeError("validation_error",
+                         "exactly one of --assignment or --ids must be provided")
+    allocs = load_allocs(data_dir)
+    if "--assignment" in vals:
+        target = vals["--assignment"]
+        remaining = [a for a in allocs if a.get("assignment_id") != target]
+    else:
+        requested = vals["--ids"].split(",")
+        existing = {a.get("uuid") for a in allocs}
+        unresolved = []
+        for r in requested:
+            if r not in existing and r not in unresolved:
+                unresolved.append(r)
+        if unresolved:
+            raise ForgeError("not_found", "allocations not found: %s"
+                             % ", ".join(json.dumps(r) for r in unresolved))
+        target = set(requested)
+        remaining = [a for a in allocs if a.get("uuid") not in target]
+    count = len(allocs) - len(remaining)
+    if count:
+        save_allocs(data_dir, remaining)
+    return {"deleted": count}
+
+
 GROUPS = {
     "blueprint": COMMANDS,
-    "allocation": {"create": cmd_alloc_create, "list": cmd_alloc_list, "get": cmd_alloc_get},
+    "allocation": {"create": cmd_alloc_create, "list": cmd_alloc_list, "get": cmd_alloc_get,
+                   "bind": cmd_alloc_bind, "delete": cmd_alloc_delete},
 }
 
 
