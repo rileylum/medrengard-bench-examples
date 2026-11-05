@@ -11,6 +11,11 @@ The call may be wrapped in primitive operations (arithmetic, comparisons, indexi
 slicing, len/sorted/sum/min/max/..., str/list/dict/set methods, comprehensions) and
 tolerance helpers (abs(...) < tol, math.isclose, pytest.approx). Tests that call the
 entrypoint more than once, or depend on any other function call, are rejected.
+
+Parameterization loops (for / while, nested, enumerate, range, break/continue) are
+unrolled at discovery time. The loop statement is itself a test (``tests.py:<line>``)
+that passes iff it iterates at least once (on every execution); assertions in the body
+get ids ``tests.py:<line>:<k>`` where k counts executions of that assertion.
 """
 
 from __future__ import annotations
@@ -662,6 +667,17 @@ def py_regex_to_js(pattern, flags):
     return pattern, jsflags
 
 
+MAX_LOOP_ITERATIONS = 100_000
+
+
+class _LoopBreak(Exception):
+    pass
+
+
+class _LoopContinue(Exception):
+    pass
+
+
 class Discoverer:
     def __init__(self, source, entrypoint):
         self.source = source
@@ -671,6 +687,9 @@ class Discoverer:
         self.local_funcs = set()
         self.ctx = Context()
         self._calls = []
+        self._loop_depth = 0
+        self._exec_counts = {}   # (line, col) -> executions of a test statement inside loops
+        self._loops = {}         # (line, col) -> loop-as-test record
 
     # -- helpers
     def lit(self, node):
@@ -694,6 +713,35 @@ class Discoverer:
         if ir[0] == "lit":
             return ir[1]
         raise first
+
+    def value(self, node):
+        """Discovery-time value of an expression that must not involve the entrypoint.
+        Unlike ``lit`` the result may be any Python value (e.g. a ``range``)."""
+        try:
+            return literal_value(node, self.ctx)
+        except DiscoveryError as err:
+            first = err
+        lineno = getattr(node, "lineno", "?")
+        if self._mentions(node, frozenset()):
+            raise DiscoveryError(f"line {lineno}: expression depends on the entrypoint")
+        saved, self._calls = self._calls, []
+        try:
+            ir = self.cx(node, frozenset())
+            calls = self._calls
+        except DiscoveryError:
+            raise first
+        finally:
+            self._calls = saved
+        if calls:
+            raise DiscoveryError(f"line {lineno}: expression depends on the entrypoint")
+        if ir[0] == "lit":
+            return ir[1]
+        if not _ir_closed(ir) or not _fold_safe(ir):
+            raise first
+        try:
+            return _EVNS["_ev"](ir, None)
+        except Exception as e:
+            raise DiscoveryError(f"line {lineno}: cannot evaluate expression: {e}")
 
     def is_entry_call(self, node):
         if not isinstance(node, ast.Call):
@@ -732,12 +780,32 @@ class Discoverer:
         args = []
         for a in node.args:
             if isinstance(a, ast.Starred):
-                raise DiscoveryError(f"line {node.lineno}: starred arguments not allowed")
+                v = self.value(a.value)
+                try:
+                    vals = list(v)
+                except TypeError:
+                    raise DiscoveryError(f"line {node.lineno}: starred argument is not iterable")
+                for x in vals:
+                    if not _lit_ok(x):
+                        raise DiscoveryError(f"line {node.lineno}: unsupported starred argument")
+                args.extend(vals)
+                continue
             args.append(self.lit(a))
         kwargs = {}
         for kw in node.keywords:
             if kw.arg is None:
-                raise DiscoveryError(f"line {node.lineno}: ** arguments not allowed")
+                v = self.value(kw.value)
+                if not isinstance(v, dict) or not all(isinstance(k, str) for k in v):
+                    raise DiscoveryError(f"line {node.lineno}: ** argument must be a dict with str keys")
+                for k, x in v.items():
+                    if not _lit_ok(x):
+                        raise DiscoveryError(f"line {node.lineno}: unsupported ** argument")
+                    if k in kwargs:
+                        raise DiscoveryError(f"line {node.lineno}: duplicate keyword argument {k!r}")
+                    kwargs[k] = x
+                continue
+            if kw.arg in kwargs:
+                raise DiscoveryError(f"line {node.lineno}: duplicate keyword argument {kw.arg!r}")
             kwargs[kw.arg] = self.lit(kw.value)
         self.callees.append(name)
         return {"name": name, "args": args, "kwargs": kwargs, "line": node.lineno}
@@ -979,8 +1047,14 @@ class Discoverer:
 
     # -- statements
     def add_test(self, node, kind, info, expected=_MISSING, extra=None, xf=None):
+        it = None
+        if self._loop_depth:
+            key = (node.lineno, node.col_offset)
+            it = self._exec_counts.get(key, 0)
+            self._exec_counts[key] = it + 1
         t = {"line": node.lineno, "col": node.col_offset, "kind": kind, "args": info["args"],
-             "kwargs": info["kwargs"], "extra": extra or {}, "xf": None if xf == ["r"] else xf}
+             "kwargs": info["kwargs"], "extra": extra or {}, "xf": None if xf == ["r"] else xf,
+             "iter": it}
         if expected is not _MISSING:
             t["expected"] = expected
         self.tests.append(t)
@@ -1424,6 +1498,107 @@ class Discoverer:
         for e, x in zip(t.elts, vals):
             self._bind_const(e, x, lineno)
 
+    # -- loops (parameterization) -----------------------------------------
+    def _loop_record(self, node):
+        key = (node.lineno, node.col_offset)
+        rec = self._loops.get(key)
+        if rec is None:
+            rec = {"line": node.lineno, "col": node.col_offset, "kind": "loop", "ok": True,
+                   "iter": None, "args": [], "kwargs": {}, "extra": {}, "xf": None}
+            self._loops[key] = rec
+            self.tests.append(rec)
+        return rec
+
+    def _run_iteration(self, body):
+        """Process one iteration of a loop body; return False if the loop was broken."""
+        self._loop_depth += 1
+        try:
+            self.handle_body(body, True)
+        except _LoopContinue:
+            pass
+        except _LoopBreak:
+            return False
+        finally:
+            self._loop_depth -= 1
+            self._pending_raises = None
+        return True
+
+    def handle_for(self, node):
+        rec = self._loop_record(node)
+        if getattr(node, "type_comment", None) is not None:
+            pass
+        self._check_target(node.target, node.lineno)
+        try:
+            items = list(self.value(node.iter))
+        except (DiscoveryError, TypeError):
+            rec["ok"] = False  # cannot be evaluated
+            return
+        if len(items) > MAX_LOOP_ITERATIONS:
+            raise DiscoveryError(f"line {node.lineno}: too many loop iterations")
+        if not items:
+            rec["ok"] = False
+        broke = False
+        for v in items:
+            try:
+                self._bind_const(node.target, v, node.lineno)
+            except DiscoveryError:
+                rec["ok"] = False
+                return
+            if not self._run_iteration(node.body):
+                broke = True
+                break
+        if not broke and node.orelse:
+            self.handle_body(node.orelse, True)
+
+    def _truth(self, node):
+        v = self.value(node)
+        try:
+            return bool(v)
+        except Exception as e:
+            raise DiscoveryError(f"line {getattr(node, 'lineno', '?')}: bad condition: {e}")
+
+    def handle_while(self, node):
+        rec = self._loop_record(node)
+        n = 0
+        broke = False
+        while True:
+            try:
+                cond = self._truth(node.test)
+            except DiscoveryError:
+                if n == 0:
+                    rec["ok"] = False
+                    return
+                raise
+            if not cond:
+                break
+            n += 1
+            if n > MAX_LOOP_ITERATIONS:
+                raise DiscoveryError(f"line {node.lineno}: while loop does not terminate")
+            if not self._run_iteration(node.body):
+                broke = True
+                break
+        if n == 0:
+            rec["ok"] = False
+        if not broke and node.orelse:
+            self.handle_body(node.orelse, True)
+
+    def handle_if(self, node):
+        branch = node.body if self._truth(node.test) else node.orelse
+        if branch:
+            self.handle_body(branch, True)
+
+    def handle_augassign(self, stmt):
+        t = stmt.target
+        if not isinstance(t, ast.Name) or t.id not in self.ctx.consts:
+            raise DiscoveryError(f"line {stmt.lineno}: unsupported augmented assignment")
+        expr = ast.BinOp(left=ast.Name(id=t.id, ctx=ast.Load()), op=stmt.op, right=stmt.value)
+        ast.copy_location(expr, stmt)
+        ast.fix_missing_locations(expr)
+        v = self.value(expr)
+        if not _lit_ok(v):
+            raise DiscoveryError(f"line {stmt.lineno}: unsupported augmented assignment")
+        self.ctx.consts[t.id] = _check_size(v)
+
     def handle_body(self, body, in_func):
         self._pending_raises = None
         for stmt in body:
@@ -1453,6 +1628,24 @@ class Discoverer:
                 self.handle_import(stmt)
             elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
                 self.handle_assign(stmt)
+            elif isinstance(stmt, ast.AugAssign):
+                self.handle_augassign(stmt)
+            elif isinstance(stmt, ast.For):
+                self.handle_for(stmt)
+                self._pending_raises = None
+            elif isinstance(stmt, ast.While):
+                self.handle_while(stmt)
+                self._pending_raises = None
+            elif isinstance(stmt, (ast.Break, ast.Continue)):
+                if not self._loop_depth:
+                    raise DiscoveryError(f"line {stmt.lineno}: {type(stmt).__name__.lower()} outside loop")
+                raise _LoopBreak() if isinstance(stmt, ast.Break) else _LoopContinue()
+            elif isinstance(stmt, ast.If) and not (
+                isinstance(stmt.test, ast.Compare)
+                and isinstance(stmt.test.left, ast.Name)
+                and stmt.test.left.id == "__name__"
+            ):
+                self.handle_if(stmt)
             elif isinstance(stmt, ast.Pass):
                 pass
             elif (
@@ -1548,16 +1741,22 @@ def discover(tests_dir, entrypoint=None):
     expects, comment_lines = read_expect_comments(source)
     lines = source.splitlines()
 
-    tests = sorted(d.tests, key=lambda t: (t["line"], t["col"]))
+    def _ik(t):
+        return -1 if t.get("iter") is None else t["iter"]
+
+    tests = sorted(d.tests, key=lambda t: (t["line"], _ik(t), t["col"]))
     counts = {}
     for t in tests:
-        counts[t["line"]] = counts.get(t["line"], 0) + 1
+        k = (t["line"], t.get("iter"))
+        counts[k] = counts.get(k, 0) + 1
     seen = {}
     for t in tests:
         line = t["line"]
-        idx = seen.get(line, 0)
-        seen[line] = idx + 1
-        t["id"] = f"tests.py:{line}" if counts[line] == 1 else f"tests.py:{line}#{idx}"
+        k = (line, t.get("iter"))
+        idx = seen.get(k, 0)
+        seen[k] = idx + 1
+        base = f"tests.py:{line}" if t.get("iter") is None else f"tests.py:{line}:{t['iter']}"
+        t["id"] = base if counts[k] == 1 else f"{base}#{idx}"
         t["stdout"] = None
         t["stderr"] = None
         if idx == 0:
@@ -3679,6 +3878,8 @@ def render_python(tests, entrypoint):
         "TESTS = [",
     ]
     for t in tests:
+        if t["kind"] == "loop":
+            continue
         kw = "{" + ", ".join(f"{k!r}: {py_lit(v)}" for k, v in t["kwargs"].items()) + "}"
         exp = py_lit(t["expected"]) if "expected" in t else "None"
         lines.append(
@@ -3710,6 +3911,8 @@ def render_js(tests, entrypoint, lang):
         header.append(f"const ENTRYPOINT = {js_str(entrypoint)};")
         header.append("const TESTS = [")
     for t in tests:
+        if t["kind"] == "loop":
+            continue
         if t["kwargs"]:
             raise GenerateError(f"{t['id']}: keyword arguments cannot be translated to {lang}")
         exp = js_lit(t["expected"], "exp") if "expected" in t else "null"
@@ -3982,8 +4185,11 @@ def cmd_test(opts):
         prefix = build_command(lang, os.path.abspath(tester_path), workdir)
         if prefix is None:
             return emit_result("error", [], ids)
-        results, error = run_tester(prefix, os.path.abspath(solution), ids, timeout, workdir, lang,
-                                    opts.get("tol"))
+        static = {t["id"]: bool(t["ok"]) for t in tests if t["kind"] == "loop"}
+        run_ids = [i for i in ids if i not in static]
+        results, error = run_tester(prefix, os.path.abspath(solution), run_ids, timeout, workdir,
+                                    lang, opts.get("tol"))
+        results.update(static)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     passed = [i for i in ids if results.get(i) is True]
