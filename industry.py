@@ -7,6 +7,7 @@ import io
 import math
 import os
 import sys
+from fractions import Fraction
 from decimal import Decimal, InvalidOperation
 
 csv.field_size_limit(sys.maxsize)
@@ -275,12 +276,37 @@ def invention(args, name, sde, types, by_name, product_bps, bp_products,
     return 0
 
 
+def _ranged_int(lo, hi, even=False):
+    def conv(v):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(f"invalid integer: {v!r}")
+        if n < lo or n > hi:
+            raise argparse.ArgumentTypeError(
+                f"must be in range [{lo},{hi}], got {n}")
+        if even and n % 2:
+            raise argparse.ArgumentTypeError(f"must be an even integer, got {n}")
+        return n
+    return conv
+
+
+def mat_amount(q, me, runs=1):
+    return math.ceil(max(1, Fraction(q) * (1 - Fraction(me, 100)) * runs))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="EVE industry recipe planner")
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("recipe")
     r.add_argument("name", nargs="+")
     r.add_argument("--sde", required=True)
+    r.add_argument("--material-efficiency", "-me", dest="me",
+                   type=_ranged_int(0, 10), default=0)
+    r.add_argument("--time-efficiency", "-te", dest="te",
+                   type=_ranged_int(0, 20, even=True), default=0)
+    r.add_argument("--display-waste", "-waste", dest="waste",
+                   action="store_true")
     inv = sub.add_parser("invention")
     inv.add_argument("name", nargs="+")
     inv.add_argument("--sde", required=True)
@@ -443,12 +469,17 @@ def main(argv=None):
         volume = fmt_plain(v)
 
     secs = times.get((bp, act), 0)
+    secs = Fraction(secs) * (1 - Fraction(args.te, 100))
     minutes = math.ceil(secs / 60) if secs else 0
 
+    me = args.me if act == MANUFACTURING else 0
     rows = []
     for mid, mq in mats.get((bp, act), []):
         mname = types[mid]["name"] if mid in types else str(mid)
-        rows.append((mname, mq, "Yes" if buildable(mid) else "No"))
+        need = mat_amount(mq, me)
+        best = mat_amount(mq, 10) if act == MANUFACTURING else need
+        rows.append((mname, need, need - best,
+                     "Yes" if buildable(mid) else "No"))
     rows.sort(key=lambda x: (x[0].lower(), x[0]))
 
     out = [
@@ -462,11 +493,18 @@ def main(argv=None):
         f"Activity: {ACTIVITY_NAMES[act]}",
         f"Output Quantity: {qty}",
         f"Run Time: {minutes}",
-        "| Item | Quantity | Buildable |",
-        "|:-:|:---:|---:|",
     ]
-    for mname, mq, b in rows:
-        out.append(f"| {mname} | {mq} | {b} |")
+    if args.waste:
+        out += ["| Item | Quantity | Waste | Buildable |",
+                "|:-:|:---:|:---:|---:|"]
+    else:
+        out += ["| Item | Quantity | Buildable |",
+                "|:-:|:---:|---:|"]
+    for mname, mq, w, b in rows:
+        if args.waste:
+            out.append(f"| {mname} | {mq} | {w} | {b} |")
+        else:
+            out.append(f"| {mname} | {mq} | {b} |")
     print("\n".join(out))
     return 0
 
