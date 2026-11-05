@@ -298,7 +298,7 @@ def nice_coef(v, check):
     return v
 
 
-def infer_linear(xs, ys, fmt, out_is_str):
+def infer_linear(xs, ys, fmt, out_is_str, allow_identity=False):
     pts = []
     raws = []
     for x, y in zip(xs, ys):
@@ -356,7 +356,7 @@ def infer_linear(xs, ys, fmt, out_is_str):
         return None
     a = float(a)
     b = float(b)
-    if a == 1.0 and b == 0.0 and all(same(x, y) for x, y in zip(xs, ys)):
+    if not allow_identity and a == 1.0 and b == 0.0 and all(same(x, y) for x, y in zip(xs, ys)):
         return None  # plain copy, handled elsewhere
 
     fn = rt()["format_num"]
@@ -645,7 +645,8 @@ def refine_thresholds(exprs, kind, in_rows, kept_set, fmt):
     return out
 
 
-def infer_filter(in_rows, kept_idx, in_cols, fmt):
+def infer_filter(in_rows, kept_idx, in_cols, fmt, penalty=None):
+    penalty = penalty or {}
     n = len(in_rows)
     full = (1 << n) - 1
     K = 0
@@ -701,7 +702,7 @@ def infer_filter(in_rows, kept_idx, in_cols, fmt):
             intonly = all(float(x).is_integer() for x in nums if x is not None)
             nn = [x for x in nums if x is not None]
             id_like = len(set(nn)) == len(nn) == n and all(nn[i] < nn[i + 1] for i in range(len(nn) - 1))
-            tcost = 3 if id_like else 1
+            tcost = (3 if id_like else 1) + penalty.get(col, 0)
             uniq = sorted(set(nn))
             kn = [nums[i] for i in kept]
             dn = [nums[i] for i in dropped]
@@ -731,7 +732,7 @@ def infer_filter(in_rows, kept_idx, in_cols, fmt):
             for a_, b_ in gaps:
                 generic.append((threshold_atom(col, a_, b_, "ge", intonly), tcost + 1, col))
                 generic.append((threshold_atom(col, a_, b_, "lt", intonly), tcost + 1, col))
-        ecost = 3 if high_card else (2 if numeric else 1)
+        ecost = (3 if high_card else (2 if numeric else 1)) + penalty.get(col, 0)
 
         def eq_expr(v, op):
             if numeric and not is_null(v, fmt):
@@ -857,7 +858,672 @@ def infer_filter(in_rows, kept_idx, in_cols, fmt):
     return {"op": "or", "args": terms}
 
 
+# ---------------------------------------------------------------- neighbour-aware filters
+VPEN = {"prev": 4, "next": 4, "sameprev": 3, "samenext": 3, "eq": 3}
+
+
+def virtual_defs(in_cols):
+    defs = []
+    for c in in_cols:
+        for k in ("sameprev", "samenext", "prev", "next"):
+            defs.append({"kind": k, "col": c, "name": "<%s>%s" % (k, c)})
+    if len(in_cols) <= 24:
+        for a, b in itertools.combinations(in_cols, 2):
+            defs.append({"kind": "eq", "a": a, "b": b, "name": "<eq>%s<&>%s" % (a, b)})
+    return defs
+
+
+def filter_cols(f, acc):
+    if not isinstance(f, dict):
+        return acc
+    if f.get("op") == "cmp":
+        acc.add(f["col"])
+    for a in f.get("args") or []:
+        filter_cols(a, acc)
+    return acc
+
+
+def infer_filter_ext(in_rows, kept_idx, in_cols, fmt):
+    """Per-row filter, falling back to neighbour / cross-column predicates."""
+    defs = virtual_defs(in_cols)
+    names = set(c for c in in_cols)
+    defs = [d for d in defs if d["name"] not in names]
+    aug_fn = rt()["augment"]
+    n = len(in_rows)
+    aug = [aug_fn(in_rows[i], in_rows[i - 1] if i > 0 else None, in_rows[i + 1] if i + 1 < n else None, defs)
+           for i in range(n)]
+    penalty = dict((d["name"], VPEN[d["kind"]]) for d in defs)
+    cols = list(in_cols) + [d["name"] for d in defs]
+    flt = infer_filter(aug, kept_idx, cols, fmt, penalty)
+    used = filter_cols(flt, set())
+    vdefs = [d for d in defs if d["name"] in used]
+    return flt, vdefs
+
+
+# ---------------------------------------------------------------- stateful columns
+def numeric_col(seq, col, fmt):
+    vals = [r.get(col) for r in seq]
+    nonnull = [v for v in vals if not is_null(v, fmt)]
+    return bool(nonnull) and all(is_numeric_value(v, fmt) for v in nonnull)
+
+
+def nice_threshold(col, lo, hi, direction, intonly):
+    """Threshold for a gap (lo, hi): fewest significant digits, preferring the
+    boundary sample value `hi` (x >= hi / x < hi), then a round number inside
+    the gap, then the low side (x > lo / x <= lo)."""
+    op_hi, op_lo = (">=", ">") if direction == "ge" else ("<", "<=")
+    cands = [(hi, op_hi)]
+    nb = nice_between(lo, hi, intonly)
+    if nb is not None:
+        cands.append((nb, op_hi))
+    cands.append((lo, op_lo))
+    best = None
+    for idx, (c, op) in enumerate(cands):
+        key = (sig_digits(c), idx)
+        if best is None or key < best[0]:
+            best = (key, c, op)
+    return {"op": "cmp", "col": col, "cmp": best[2], "value": clean_num(best[1]), "numeric": True}
+
+
+def row_atoms(seq, in_cols, fmt, with_neq=False):
+    """Simple single-column predicates over the rows of `seq`."""
+    atoms = []
+    for col in in_cols:
+        vals = [r.get(col) for r in seq]
+        numeric = numeric_col(seq, col, fmt)
+        distinct, seen = [], set()
+        for v in vals:
+            if numeric and not is_null(v, fmt):
+                k = ("n", to_num(v))
+            else:
+                k = ("r", vkey(v)) if not isinstance(v, (dict, list)) else ("j", json.dumps(v, sort_keys=True))
+            if k not in seen:
+                seen.add(k)
+                distinct.append(v)
+        if numeric:
+            nums = sorted(set(to_num(v) for v in vals if not is_null(v, fmt)))
+            intonly = all(float(x).is_integer() for x in nums)
+            if len(distinct) <= 12:
+                for v in distinct:
+                    if is_null(v, fmt):
+                        continue
+                    atoms.append({"op": "cmp", "col": col, "cmp": "==", "value": clean_num(to_num(v)), "numeric": True})
+                    if with_neq:
+                        atoms.append({"op": "cmp", "col": col, "cmp": "!=", "value": clean_num(to_num(v)),
+                                      "numeric": True})
+            gaps = list(zip(nums, nums[1:]))
+            if len(gaps) > 40:
+                gaps = [gaps[(k * (len(gaps) - 1)) // 39] for k in range(40)]
+            for a_, b_ in gaps:
+                atoms.append(nice_threshold(col, a_, b_, "ge", intonly))
+                atoms.append(nice_threshold(col, a_, b_, "lt", intonly))
+        else:
+            if len(distinct) > 16:
+                continue
+            for v in distinct:
+                if isinstance(v, (dict, list)):
+                    continue
+                atoms.append({"op": "cmp", "col": col, "cmp": "==", "value": v, "numeric": False})
+                if with_neq:
+                    atoms.append({"op": "cmp", "col": col, "cmp": "!=", "value": v, "numeric": False})
+    return atoms
+
+
+def trigger_cands(seq, in_cols, fmt, atoms):
+    cands = []
+    for col in in_cols:
+        cands.append({"kind": "change", "col": col})
+    for a in atoms:
+        for k in ("rise", "flip", "pred", "rise0"):
+            cands.append({"kind": k, "pred": a})
+    for col in in_cols:
+        vals = [r.get(col) for r in seq]
+        if any(isinstance(v, (dict, list)) for v in vals):
+            continue
+        distinct, seen = [], set()
+        for v in vals:
+            k = vkey(v)
+            if k not in seen:
+                seen.add(k)
+                distinct.append(v)
+        if 2 <= len(distinct) <= 8:
+            for a in distinct:
+                for b in distinct:
+                    if vkey(a) != vkey(b):
+                        cands.append({"kind": "trans", "col": col, "from": a, "to": b})
+        if numeric_col(seq, col, fmt):
+            nums = [to_num(v) for v in vals]
+            diffs = sorted(set(nums[i] - nums[i - 1] for i in range(1, len(nums))
+                               if nums[i] is not None and nums[i - 1] is not None))
+            gaps = list(zip(diffs, diffs[1:]))
+            if len(gaps) > 30:
+                gaps = [gaps[(k * (len(gaps) - 1)) // 29] for k in range(30)]
+            intonly = all(float(x).is_integer() for x in diffs)
+            for a_, b_ in gaps:
+                for d in ("ge", "lt"):
+                    t = nice_threshold(col, a_, b_, d, intonly)
+                    cands.append({"kind": "gap", "col": col, "cmp": t["cmp"], "value": t["value"]})
+    return cands
+
+
+def y_info(ys):
+    out = []
+    for y in ys:
+        if isinstance(y, bool):
+            out.append(None)
+            continue
+        yn = to_num(y)
+        if yn is None:
+            out.append(None)
+            continue
+        out.append((yn, max(1e-9 * max(1.0, abs(yn)), 10 ** (-decimals_of(y)) * 0.5 + 1e-9)))
+    return out
+
+
+class NumCheck:
+    """Progressive check that ys ~ a * F + b (loose: a prefilter only)."""
+
+    def __init__(self, strict_null, ys, yi):
+        self.strict_null = strict_null
+        self.ys = ys
+        self.yi = yi
+        self.null_set = False
+        self.null = None
+        self.p1 = None
+        self.ab = None
+
+    def add(self, f, j):
+        y = self.ys[j]
+        if f is None:
+            if self.null_set:
+                return same(y, self.null)
+            if not (y is None or (isinstance(y, str) and y.strip() == "")):
+                return False
+            self.null_set, self.null = True, y
+            return True
+        info = self.yi[j]
+        if info is None:
+            return False
+        yn, tol = info
+        fn = float(f)
+        if self.p1 is None:
+            self.p1 = (fn, yn, tol)
+            return True
+        f1, y1, t1 = self.p1
+        if self.ab is None:
+            if fn == f1:
+                return abs(yn - y1) <= t1 + tol
+            a = (yn - y1) / (fn - f1)
+            if a == 0:
+                return False
+            self.ab = (a, y1 - a * f1, fn - f1, t1 + tol)
+            return True
+        a, b, span, t0 = self.ab
+        d = fn - f1
+        r = d / span
+        if r < 0:
+            r = -r
+        if r < 1.0:
+            r = 1.0
+        return abs(a * fn + b - yn) <= tol + t0 * r + 1e-9 * (abs(yn) if abs(yn) > 1 else 1.0)
+
+
+class LabelCheck:
+    def __init__(self, ys):
+        self.ys = ys
+        self.fy = {}
+        self.yf = {}
+
+    def add(self, f, j):
+        y = self.ys[j]
+        if f is None or isinstance(y, (dict, list)):
+            return False
+        kf, ky = vkey(f), vkey(y)
+        if self.fy.setdefault(kf, ky) != ky:
+            return False
+        if self.yf.setdefault(ky, kf) != kf:
+            return False
+        return True
+
+
+def run_feature(f, seq, pos, ys=None, check=None):
+    """Feature values at `pos`; None if `check` rejects them early."""
+    R = rt()
+    step = R["feat_step"]
+    st = R["feat_init"](f)
+    out = []
+    j = 0
+    last = pos[-1]
+    for i, row in enumerate(seq):
+        if i > last:
+            break
+        v = step(f, st, row)
+        if i == pos[j]:
+            if check is not None and not check.add(v, j):
+                return None
+            out.append(v)
+            j += 1
+    return out
+
+
+def quick_line(pairs, name):
+    """False when the numeric outputs clearly are not a * feature + b."""
+    pts = []
+    for i_, o_ in pairs:
+        y = o_.get(name)
+        if isinstance(y, bool):
+            return True
+        yn = to_num(y)
+        if yn is None:
+            return True  # non-numeric output: let the general search decide
+        pts.append((float(i_["__f"]), yn, max(1e-9 * max(1.0, abs(yn)), 10 ** (-decimals_of(y)) * 0.75 + 1e-9)))
+    if len(pts) < 2:
+        return True
+    mx = sum(p[0] for p in pts) / len(pts)
+    my = sum(p[1] for p in pts) / len(pts)
+    sxx = sum((p[0] - mx) ** 2 for p in pts)
+    if sxx == 0:
+        return all(abs(p[1] - pts[0][1]) <= p[2] + pts[0][2] for p in pts)
+    a = sum((p[0] - mx) * (p[1] - my) for p in pts) / sxx
+    b = my - a * mx
+    return all(abs(a * p[0] + b - p[1]) <= 2 * p[2] for p in pts)
+
+
+def finish_column(name, f, scope, seq, pos, ys, fmt, labels=False):
+    """Fit the mapping feature-value -> output and verify it exactly."""
+    R = rt()
+    fv = run_feature(f, seq, pos)
+    if fv is None or len(fv) != len(ys):
+        return None
+    col = {"name": name, "kind": "stateful", "scope": scope, "feature": f, "inner": None}
+    nulls = [y for v, y in zip(fv, ys) if v is None]
+    if nulls:
+        col["null"] = nulls[0]
+    if not labels:
+        pairs = [({"__f": v}, {name: y}) for v, y in zip(fv, ys) if v is not None]
+        if not pairs:
+            return None
+        numeric_f = all(isinstance(p[0]["__f"], (int, float)) and not isinstance(p[0]["__f"], bool) for p in pairs)
+        if numeric_f and not quick_line(pairs, name):
+            return None
+        if numeric_f or not all(same(R["map_feat"](col, v), y) for v, y in zip(fv, ys)):
+            inner = None
+            xs = [p[0]["__f"] for p in pairs]
+            if all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in xs):
+                out_is_str = all(isinstance(p[1][name], str) or p[1][name] is None for p in pairs)
+                lin = infer_linear(xs, [p[1][name] for p in pairs], fmt, out_is_str, True)
+                if lin is not None:
+                    lin = dict({"kind": "linear", "src": "__f"}, **{k: v for k, v in lin.items() if k != "kind"})
+                    col["inner"] = lin
+                    if all(same(R["map_feat"](col, v), y) for v, y in zip(fv, ys)):
+                        inner = lin
+            if inner is None:
+                col["inner"] = None
+                if all(same(R["map_feat"](col, v), y) for v, y in zip(fv, ys)):
+                    inner = {"kind": "copy", "src": "__f"}
+            if inner is None:
+                if numeric_f and all(to_num(p[1][name]) is not None and not isinstance(p[1][name], bool)
+                                     for p in pairs):
+                    return None
+                inner = infer_column(name, pairs, ["__f"], [name], fmt)
+            inner.pop("name", None)
+            if inner.get("kind") == "const":
+                return None
+            col["inner"] = inner
+    for v, y in zip(fv, ys):
+        if not same(R["map_feat"](col, v), y):
+            return None
+    return col
+
+
+def infer_mode(name, seq, pos, ys, scope, atoms, fmt, num_cols):
+    ev = rt()["eval_filter"]
+    keys = [vkey(y) for y in ys]
+    labels = []
+    for y in ys:
+        if vkey(y) not in [vkey(l) for l in labels]:
+            labels.append(y)
+    if not (2 <= len(labels) <= 16):
+        return None
+    truth = [[bool(ev(a, r)) for r in seq] for a in atoms]
+    rules = []
+    for L in labels:
+        kl = vkey(L)
+        req = [pos[j] for j in range(1, len(ys)) if keys[j] == kl and keys[j - 1] != kl]
+        if not req:
+            continue
+        forb = [pos[j] for j in range(len(ys)) if keys[j] != kl]
+        found = None
+        for ai, a in enumerate(atoms):
+            if a.get("numeric") and a.get("cmp") not in ("==", "!="):
+                continue
+            t = truth[ai]
+            if all(t[p] for p in req) and not any(t[p] for p in forb):
+                found = a
+                break
+        if found is None:
+            # widest numeric threshold separating the trigger rows from rows with other labels
+            for col in num_cols:
+                rv = [to_num(seq[p].get(col)) for p in req]
+                fv = [to_num(seq[p].get(col)) for p in forb]
+                if any(v is None for v in rv):
+                    continue
+                fv = [v for v in fv if v is not None]
+                vals = sorted(set(v for v in (to_num(r.get(col)) for r in seq) if v is not None))
+                intonly = all(float(v).is_integer() for v in vals)
+                lo, hi = max(rv), min(rv)
+                if all(v > lo for v in fv):
+                    up = min(fv) if fv else None
+                    if up is None:
+                        above = [v for v in vals if v > lo]
+                        up = above[0] if above else None
+                    if up is not None:
+                        found = nice_threshold(col, lo, up, "lt", intonly)
+                        break
+                if all(v < hi for v in fv):
+                    dn = max(fv) if fv else None
+                    if dn is None:
+                        below = [v for v in vals if v < hi]
+                        dn = below[-1] if below else None
+                    if dn is not None:
+                        found = nice_threshold(col, dn, hi, "ge", intonly)
+                        break
+        if found is None:
+            return None
+        rules.append([found, L])
+    f = {"type": "mode", "rules": rules, "init": ys[0]}
+    return finish_column(name, f, scope, seq, pos, ys, fmt, labels=True)
+
+
+def counter_values(trig, seq, last, truth_of):
+    """Fast trigger-count sequence (verified later with the runtime)."""
+    kind = trig["kind"]
+    ks = []
+    k = 0
+    if kind in ("pred", "rise", "rise0", "flip"):
+        t = truth_of(trig["pred"])
+        for i in range(last + 1):
+            b = t[i]
+            if kind == "pred":
+                fire = b
+            elif kind == "rise":
+                fire = i > 0 and b and not t[i - 1]
+            elif kind == "rise0":
+                fire = b and not (i > 0 and t[i - 1])
+            else:
+                fire = i > 0 and b != t[i - 1]
+            if fire:
+                k += 1
+            ks.append(k)
+        return ks
+    R = rt()
+    st = R["feat_init"]({"type": "counter"})
+    fire_fn = R["trig_fire"]
+    for i in range(last + 1):
+        if fire_fn(trig, st, seq[i]):
+            k += 1
+        ks.append(k)
+    return ks
+
+
+def infer_stateful(name, in_rows, align, in_cols, fmt, ys, has_filter):
+    if not ys or not align:
+        return None
+    scopes = [("all", in_rows, list(align))]
+    if has_filter:
+        scopes.append(("kept", [in_rows[i] for i in align], list(range(len(align)))))
+    ys_numeric = all((not isinstance(y, bool)) and (to_num(y) is not None or y is None
+                                                   or (isinstance(y, str) and y.strip() == "")) for y in ys) \
+        and any(to_num(y) is not None and not isinstance(y, bool) for y in ys)
+    ys_hashable = all(not isinstance(y, (dict, list)) for y in ys)
+    yi = y_info(ys)
+    ctx = {}
+
+    def info(scope, seq):
+        if scope not in ctx:
+            numc = [c for c in in_cols if numeric_col(seq, c, fmt)]
+            atoms = row_atoms(seq, in_cols, fmt)
+            ev = rt()["eval_filter"]
+            tcache = {}
+
+            def truth_of(a):
+                k = json.dumps(a, sort_keys=True)
+                if k not in tcache:
+                    tcache[k] = [bool(ev(a, r)) for r in seq]
+                return tcache[k]
+            ctx[scope] = {"num": numc, "atoms": atoms, "truth": truth_of, "trig": None, "ks": {}}
+        return ctx[scope]
+
+    def try_num(f, scope, seq, pos, strict=False):
+        if run_feature(f, seq, pos, ys, NumCheck(strict, ys, yi)) is None:
+            return None
+        return finish_column(name, f, scope, seq, pos, ys, fmt)
+
+    def best_of(cands, scope, seq, pos, strict=False):
+        first = None
+        for f in cands:
+            r = try_num(f, scope, seq, pos, strict)
+            if r:
+                if simple_map(r):
+                    return r
+                if first is None:
+                    first = r
+        return first
+
+    # 1. prefix aggregates
+    if ys_numeric:
+        for scope, seq, pos in scopes:
+            I = info(scope, seq)
+            cands = [{"type": "prefix", "agg": agg, "src": c} for c in I["num"] for agg in ("sum", "mean")]
+            cands.append({"type": "prefix", "agg": "count"})
+            r = best_of(cands, scope, seq, pos)
+            if r:
+                return r
+            cands = [{"type": "prefix", "agg": agg, "src": c} for c in I["num"] for agg in ("max", "min")]
+            r = best_of(cands, scope, seq, pos)
+            if r:
+                return r
+
+    # 2. counters (segment ids / session ids)
+    if ys_hashable:
+        for scope, seq, pos in scopes:
+            I = info(scope, seq)
+            if I["trig"] is None:
+                I["trig"] = trigger_cands(seq, in_cols, fmt, I["atoms"])
+            for trig in I["trig"]:
+                key = json.dumps(trig, sort_keys=True)
+                ks = counter_values(trig, seq, pos[-1], I["truth"])
+                I["ks"][key] = ks
+                chk = LabelCheck(ys)
+                if not all(chk.add(ks[p], j) for j, p in enumerate(pos)):
+                    continue
+                if len(set(ks[p] for p in pos)) < 2:
+                    continue
+                for base in (0, 1):
+                    f = {"type": "counter", "trigger": trig}
+                    if base:
+                        f["base"] = base
+                    r = finish_column(name, f, scope, seq, pos, ys, fmt)
+                    if r:
+                        return r
+
+    # 3. sliding windows
+    if ys_numeric:
+        for strict in (False, True):
+            for scope, seq, pos in scopes:
+                I = info(scope, seq)
+                wmax = min(64, pos[-1] + (1 if strict else 0))
+                for w in range(2, wmax + 1):
+                    cands = []
+                    for c in I["num"]:
+                        cands += [{"type": "window", "w": w, "agg": "sum", "src": c},
+                                  {"type": "window", "w": w, "agg": "mean", "src": c}]
+                    cands.append({"type": "window", "w": w, "agg": "count"})
+                    for c in I["num"]:
+                        cands += [{"type": "window", "w": w, "agg": "max", "src": c},
+                                  {"type": "window", "w": w, "agg": "min", "src": c}]
+                    for f in cands:
+                        if strict:
+                            f["strict"] = True
+                    r = best_of(cands, scope, seq, pos, strict)
+                    if r:
+                        return r
+
+    # 4. predicate counts (prefix, then windows)
+    if ys_numeric:
+        for scope, seq, pos in scopes:
+            I = info(scope, seq)
+            patoms = row_atoms(seq, in_cols, fmt, with_neq=True)
+            for a in patoms:
+                r = try_num({"type": "prefix", "agg": "countp", "pred": a}, scope, seq, pos)
+                if r:
+                    return r
+            pref = {}
+            for a in patoms:
+                t = I["truth"](a)
+                acc = [0]
+                for b_ in t:
+                    acc.append(acc[-1] + (1 if b_ else 0))
+                pref[id(a)] = acc
+            for w in range(2, min(64, pos[-1]) + 1):
+                for a in patoms:
+                    acc = pref[id(a)]
+                    # quick window-count check before running the runtime
+                    chk = NumCheck(False, ys, yi)
+                    ok = True
+                    for j, p in enumerate(pos):
+                        if not chk.add(acc[p + 1] - acc[max(0, p - w + 1)], j):
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    r = finish_column(name, {"type": "window", "w": w, "agg": "countp", "pred": a},
+                                      scope, seq, pos, ys, fmt)
+                    if r:
+                        return r
+
+    # 5. mode state machine, then 6. cyclic labels toggled by a trigger
+    if ys_hashable:
+        nlab = len(set(vkey(y) for y in ys))
+        if 2 <= nlab <= 16:
+            for scope, seq, pos in scopes:
+                I = info(scope, seq)
+                r = infer_mode(name, seq, pos, ys, scope, I["atoms"], fmt, I["num"])
+                if r:
+                    return r
+            for scope, seq, pos in scopes:
+                I = info(scope, seq)
+                if I["trig"] is None:
+                    I["trig"] = trigger_cands(seq, in_cols, fmt, I["atoms"])
+                order = ([t for t in I["trig"] if t["kind"] == "trans"] +
+                         [t for t in I["trig"] if t["kind"] == "change"] +
+                         [t for t in I["trig"] if t["kind"] not in ("trans", "change")])
+                for trig in order:
+                    key = json.dumps(trig, sort_keys=True)
+                    ks = I["ks"].get(key) or counter_values(trig, seq, pos[-1], I["truth"])
+                    I["ks"][key] = ks
+                    for L in range(2, nlab + 1):
+                        lab = {}
+                        ok = True
+                        for p, y in zip(pos, ys):
+                            r_ = ks[p] % L
+                            if r_ in lab:
+                                if not same(lab[r_], y) or vkey(lab[r_]) != vkey(y):
+                                    ok = False
+                                    break
+                            else:
+                                lab[r_] = y
+                        if not ok or len(lab) != L or len(set(ks[p] for p in pos)) <= L:
+                            continue
+                        f = {"type": "cycle", "trigger": trig, "labels": [lab[i] for i in range(L)]}
+                        r = finish_column(name, f, scope, seq, pos, ys, fmt, labels=True)
+                        if r:
+                            return r
+    return None
+
+
+def simple_map(col):
+    inner = col.get("inner")
+    if inner is None:
+        return True
+    k = inner.get("kind")
+    if k == "linear":
+        return inner.get("a") == 1.0 and inner.get("b") == 0.0
+    if k == "str":
+        return not inner.get("steps") and not inner.get("prefix") and not inner.get("suffix")
+    return k == "copy"
+
+
+def column_exact(col, pairs):
+    ac = rt()["apply_col"]
+    return all(same(ac(col, ir), orow.get(col["name"])) for ir, orow in pairs)
+
+
+def add_stateful(cols, in_rows, out_rows, align, in_cols, fmt, has_filter):
+    pairs = [(in_rows[i], out_rows[j]) for j, i in enumerate(align)]
+    res = []
+    for col in cols:
+        if pairs and not column_exact(col, pairs):
+            ys = [o.get(col["name"]) for _, o in pairs]
+            st = infer_stateful(col["name"], in_rows, align, in_cols, fmt, ys, has_filter)
+            if st is not None:
+                col = st
+        res.append(col)
+    return res
+
+
 # ---------------------------------------------------------------- driver
+def transformed_anchors(in_rows, out_rows, in_cols, out_cols, n, m, limit=6):
+    """Monotone alignments where one output column equals a simple transform
+    (affix, offset, ratio) of one input column, found by greedy matching."""
+    res = []
+    if m == 0 or n * len(in_cols) * len(out_cols) * min(n, 20) > 3000000:
+        return res
+    for oc in out_cols:
+        ys = [r.get(oc) for r in out_rows]
+        yn = [norm(y) for y in ys]
+        ynum = [to_num(y) if not isinstance(y, bool) else None for y in ys]
+        if len(set(v for v in yn if v)) < max(2, m // 2):
+            continue
+        for ic in in_cols:
+            xs = [r.get(ic) for r in in_rows]
+            xn = [norm(x) for x in xs]
+            xnum = [to_num(x) if not isinstance(x, bool) else None for x in xs]
+            tried = set()
+            for i in range(min(n - m + 1, 20)):
+                ts = []
+                if xnum[i] is not None and ynum[0] is not None:
+                    ts.append(("add", ynum[0] - xnum[i]))
+                    if xnum[i] != 0 and ynum[0] != 0:
+                        ts.append(("mul", ynum[0] / xnum[i]))
+                if xn[i] and yn[0] and xn[i] in yn[0] and xn[i] != yn[0]:
+                    k = yn[0].find(xn[i])
+                    ts.append(("aff", (yn[0][:k], yn[0][k + len(xn[i]):])))
+                for t in ts:
+                    if t in tried or t == ("add", 0.0) or t == ("mul", 1.0):
+                        continue
+                    tried.add(t)
+
+                    def ok(a, j, t=t):
+                        if t[0] == "aff":
+                            return xn[a] is not None and yn[j] == t[1][0] + xn[a] + t[1][1]
+                        if xnum[a] is None or ynum[j] is None:
+                            return False
+                        v = xnum[a] + t[1] if t[0] == "add" else xnum[a] * t[1]
+                        return abs(v - ynum[j]) <= 1e-9 * max(1.0, abs(ynum[j]))
+                    al = []
+                    j = 0
+                    for a in range(n):
+                        if j < m and ok(a, j):
+                            al.append(a)
+                            j += 1
+                    if j == m and al not in res:
+                        res.append(al)
+                        if len(res) >= limit:
+                            return res
+    return res
+
+
 def infer(sample_dir):
     fmt, ip, op = find_sample(sample_dir)
     if fmt not in FORMATS:
@@ -871,7 +1537,8 @@ def infer(sample_dir):
         out_rows_used = out_rows[:len(align)]
         pairs = [(in_rows[i], out_rows_used[j]) for j, i in enumerate(align)]
         cols = infer_columns(pairs, in_cols, out_cols, fmt)
-        return {"format": fmt, "input_columns": in_cols, "filter": None, "columns": cols}
+        cols = add_stateful(cols, in_rows, out_rows_used, align, in_cols, fmt, False)
+        return {"format": fmt, "input_columns": in_cols, "filter": None, "columns": cols, "virtual": []}
 
     sims = {}
     in_profs = [in_profile(r) for r in in_rows]
@@ -941,6 +1608,9 @@ def infer(sample_dir):
         if all(inn[i] == on[j] for j, i in enumerate(al)):
             if al not in candidates:
                 candidates.append(al)
+    for al in transformed_anchors(in_rows, out_rows, in_cols, out_cols, n, m):
+        if al not in candidates:
+            candidates.append(al)
     a0 = dp_align(n, m, s1)
     if a0 not in candidates:
         candidates.append(a0)
@@ -956,8 +1626,9 @@ def infer(sample_dir):
         if q == m * len(out_cols):
             break
     _, align, cols = best
-    flt = infer_filter(in_rows, align, in_cols, fmt)
-    return {"format": fmt, "input_columns": in_cols, "filter": flt, "columns": cols}
+    flt, vdefs = infer_filter_ext(in_rows, align, in_cols, fmt)
+    cols = add_stateful(cols, in_rows, out_rows, align, in_cols, fmt, flt is not None)
+    return {"format": fmt, "input_columns": in_cols, "filter": flt, "columns": cols, "virtual": vdefs}
 
 
 def spec_json(spec):
@@ -1240,6 +1911,264 @@ def transform(row):
     return out
 
 
+# ---------------------------------------------------------------- stateful transforms
+_INT_RE = re.compile(r"^\s*[-+]?\d+\s*$")
+_COLS = SPEC.get("columns") or []
+_VIRT = SPEC.get("virtual") or []
+_LOOKAHEAD = any(v.get("kind") in ("next", "samenext") for v in _VIRT)
+_ALL = [(str(i), c) for i, c in enumerate(_COLS) if c.get("kind") == "stateful" and c.get("scope") != "kept"]
+_KEPT = [(str(i), c) for i, c in enumerate(_COLS) if c.get("kind") == "stateful" and c.get("scope") == "kept"]
+
+
+def num_of(v):
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, str):
+        if _INT_RE.match(v):
+            return int(v)
+        return to_num(v)
+    return None
+
+
+def _cmp(x, op, val):
+    if op == ">=":
+        return x >= val
+    if op == ">":
+        return x > val
+    if op == "<":
+        return x < val
+    if op == "<=":
+        return x <= val
+    if op == "==":
+        return x == val
+    if op == "!=":
+        return x != val
+    return False
+
+
+def augment(row, prev, nxt, defs):
+    """Row extended with virtual neighbour / cross-column columns."""
+    if not defs:
+        return row
+    r = dict(row)
+    for d in defs:
+        k = d["kind"]
+        if k == "prev":
+            r[d["name"]] = None if prev is None else prev.get(d["col"])
+        elif k == "next":
+            r[d["name"]] = None if nxt is None else nxt.get(d["col"])
+        elif k == "sameprev":
+            r[d["name"]] = prev is not None and same(row.get(d["col"]), prev.get(d["col"]))
+        elif k == "samenext":
+            r[d["name"]] = nxt is not None and same(row.get(d["col"]), nxt.get(d["col"]))
+        elif k == "eq":
+            r[d["name"]] = same(row.get(d["a"]), row.get(d["b"]))
+    return r
+
+
+def trig_fire(tr, st, row):
+    kind = tr["kind"]
+    has = st["h"]
+    pv = st["p"]
+    if kind in ("pred", "rise", "rise0", "flip"):
+        b = bool(eval_filter(tr["pred"], row))
+        if kind == "pred":
+            fire = b
+        elif kind == "rise":
+            fire = has and b and not pv
+        elif kind == "rise0":
+            fire = b and not (has and pv)
+        else:
+            fire = has and b != pv
+        st["p"] = b
+    else:
+        v = row.get(tr["col"])
+        if kind == "change":
+            fire = has and not same(v, pv)
+        elif kind == "trans":
+            fire = has and same(pv, tr["from"]) and same(v, tr["to"])
+        elif kind == "gap":
+            x, px = to_num(v), to_num(pv)
+            fire = has and x is not None and px is not None and _cmp(x - px, tr["cmp"], tr["value"])
+        else:
+            fire = False
+        st["p"] = v
+    st["h"] = True
+    return bool(fire)
+
+
+def feat_init(f):
+    t = f["type"]
+    if t == "prefix":
+        return {"s": 0, "c": 0, "m": None}
+    if t == "window":
+        return {"b": []}
+    if t == "mode":
+        return {"l": f.get("init")}
+    return {"k": f.get("base", 0), "h": False, "p": None}
+
+
+def _contrib(f, row):
+    agg = f["agg"]
+    if agg == "countp":
+        return 1 if eval_filter(f["pred"], row) else 0
+    if agg == "count":
+        return 1
+    return num_of(row.get(f["src"]))
+
+
+def _window_agg(agg, b):
+    if agg in ("count", "countp"):
+        s = 0
+        for x in b:
+            s = s + x
+        return s
+    s = 0
+    c = 0
+    m = None
+    for x in b:
+        if x is None:
+            continue
+        c += 1
+        if agg == "min":
+            if m is None or x < m:
+                m = x
+        elif agg == "max":
+            if m is None or x > m:
+                m = x
+        else:
+            s = s + x
+    if c == 0:
+        return None
+    if agg == "sum":
+        return s
+    if agg == "mean":
+        return s / c
+    return m
+
+
+def feat_step(f, st, row):
+    """Advance the state `st` of feature `f` by one row and return its value."""
+    t = f["type"]
+    if t == "prefix":
+        agg = f["agg"]
+        x = _contrib(f, row)
+        if agg in ("count", "countp"):
+            st["s"] = st["s"] + x
+            return st["s"]
+        if x is not None:
+            st["c"] += 1
+            if agg == "min":
+                if st["m"] is None or x < st["m"]:
+                    st["m"] = x
+            elif agg == "max":
+                if st["m"] is None or x > st["m"]:
+                    st["m"] = x
+            else:
+                st["s"] = st["s"] + x
+        if st["c"] == 0:
+            return None
+        if agg == "sum":
+            return st["s"]
+        if agg == "mean":
+            return st["s"] / st["c"]
+        return st["m"]
+    if t == "window":
+        b = st["b"]
+        b.append(_contrib(f, row))
+        while len(b) > f["w"]:
+            b.pop(0)
+        if f.get("strict") and len(b) < f["w"]:
+            return None
+        return _window_agg(f["agg"], b)
+    if t == "counter":
+        if trig_fire(f["trigger"], st, row):
+            st["k"] += 1
+        return st["k"]
+    if t == "cycle":
+        if trig_fire(f["trigger"], st, row):
+            st["k"] += 1
+        labels = f["labels"]
+        return labels[st["k"] % len(labels)]
+    if t == "mode":
+        for atom, label in f["rules"]:
+            if eval_filter(atom, row):
+                st["l"] = label
+                break
+        return st["l"]
+    return None
+
+
+def map_feat(c, v):
+    if v is None:
+        return c.get("null")
+    inner = c.get("inner")
+    if inner is None:
+        return v
+    return apply_col(inner, {"__f": v})
+
+
+class _Machine:
+    """Streaming state machine: per-row features, one-row lookahead and
+    neighbour-aware filtering.  All state lives in the JSON-able dict `s`."""
+
+    def __init__(self, snap=None):
+        if snap is None:
+            snap = {"prev": None, "pend": None, "pprev": None, "pvals": None,
+                    "fa": dict((k, feat_init(c["feature"])) for k, c in _ALL),
+                    "fk": dict((k, feat_init(c["feature"])) for k, c in _KEPT)}
+        self.s = snap
+
+    def _decide(self, row, prev, nxt, vals):
+        r = augment(row, prev, nxt, _VIRT)
+        if not eval_filter(SPEC.get("filter"), r):
+            return None
+        kv = {}
+        for k, c in _KEPT:
+            kv[k] = feat_step(c["feature"], self.s["fk"][k], row)
+        out = {}
+        for i, c in enumerate(_COLS):
+            if c.get("kind") == "stateful":
+                k = str(i)
+                out[c["name"]] = map_feat(c, kv[k] if c.get("scope") == "kept" else vals[k])
+            else:
+                out[c["name"]] = apply_col(c, row)
+        return out
+
+    def push(self, row):
+        s = self.s
+        vals = {}
+        for k, c in _ALL:
+            vals[k] = feat_step(c["feature"], s["fa"][k], row)
+        out = []
+        if _LOOKAHEAD:
+            if s["pend"] is not None:
+                t = self._decide(s["pend"], s["pprev"], row, s["pvals"])
+                if t is not None:
+                    out.append(t)
+            s["pend"], s["pprev"], s["pvals"] = row, s["prev"], vals
+        else:
+            t = self._decide(row, s["prev"], None, vals)
+            if t is not None:
+                out.append(t)
+        s["prev"] = row
+        return out
+
+    def finish(self):
+        s = self.s
+        out = []
+        if s["pend"] is not None:
+            t = self._decide(s["pend"], s["pprev"], None, s["pvals"])
+            if t is not None:
+                out.append(t)
+            s["pend"], s["pprev"], s["pvals"] = None, None, None
+        return out
+
+
 # ---------------------------------------------------------------- readers
 def _strip_eol(b):
     if b.endswith(b"\n"):
@@ -1395,26 +2324,31 @@ class DynamicPreprocessor:
 
     process = __call__
 
-    # rows as (out_row, input_end_offset), in batches of at most `buffer`
-    def _stream_with_offsets(self, path, start):
+    # Events: (out_row, None) for each output row and (None, offset) after each
+    # input row has been fully processed.  Input is read in batches of at most
+    # `buffer` rows; history lives in the machine state, not in the batch.
+    def _events(self, path, start, mach):
         it = read_rows(path, SPEC["format"], start)
         batch = []
         for row, off in it:
             batch.append((row, off))
             if len(batch) >= self.buffer:
                 for r, o in batch:
-                    t = transform(r)
-                    if t is not None:
-                        yield t, o
+                    for t in mach.push(r):
+                        yield t, None
+                    yield None, o
                 batch = []
         for r, o in batch:
-            t = transform(r)
-            if t is not None:
-                yield t, o
+            for t in mach.push(r):
+                yield t, None
+            yield None, o
+        for t in mach.finish():
+            yield t, None
 
     def _stream(self, path, start):
-        for t, _ in self._stream_with_offsets(path, start):
-            yield t
+        for t, _ in self._events(path, start, _Machine()):
+            if t is not None:
+                yield t
 
     def _cache_paths(self, path):
         ap = os.path.abspath(path)
@@ -1468,25 +2402,29 @@ class DynamicPreprocessor:
                 fh.truncate(good)
         m = int(state.get("out") or 0)
         offset = state.get("offset")
-        if m > n:
-            m, offset = 0, None
+        snap = state.get("snap")
+        if m > n or (offset is not None and not isinstance(snap, dict)):
+            m, offset, snap = 0, None, None
+        mach = _Machine(snap if offset is not None else None)
         counter = m
         out = open(rows_path, "ab")
         try:
-            since = 0
-            for t, off in self._stream_with_offsets(path, offset):
+            steps = 0
+            for t, off in self._events(path, offset, mach):
+                if t is None:
+                    steps += 1
+                    if steps >= self.buffer:
+                        steps = 0
+                        state = dict(state, out=counter, offset=off, snap=mach.s)
+                        _write_json_atomic(state_path, state)
+                    continue
                 counter += 1
                 if counter <= n:
                     continue
                 out.write((_dump(t) + "\n").encode("utf-8"))
                 out.flush()
-                since += 1
-                if since >= self.buffer:
-                    since = 0
-                    state = dict(state, out=counter, offset=off)
-                    _write_json_atomic(state_path, state)
                 yield t
-            state = dict(state, out=counter, offset=None, complete=True)
+            state = dict(state, out=counter, offset=None, snap=None, complete=True)
             _write_json_atomic(state_path, state)
         finally:
             out.close()
@@ -1741,6 +2679,210 @@ function transform(row) {
   return out;
 }
 
+// ---------------------------------------------------------------- stateful transforms
+const INT_RE = /^\s*[-+]?\d+\s*$/;
+const COLS = SPEC.columns || [];
+const VIRT = SPEC.virtual || [];
+const LOOKAHEAD = VIRT.some((v) => v.kind === "next" || v.kind === "samenext");
+const ALL = [], KEPT = [];
+COLS.forEach((c, i) => {
+  if (c.kind === "stateful") (c.scope === "kept" ? KEPT : ALL).push([String(i), c]);
+});
+
+function numOf(v) {
+  if (typeof v === "string" && INT_RE.test(v)) return Number(v.trim());
+  return toNum(v);
+}
+
+function cmpOp(x, op, val) {
+  switch (op) {
+    case ">=": return x >= val;
+    case ">": return x > val;
+    case "<": return x < val;
+    case "<=": return x <= val;
+    case "==": return x === val;
+    case "!=": return x !== val;
+    default: return false;
+  }
+}
+
+function augment(row, prev, nxt, defs) {
+  if (!defs || !defs.length) return row;
+  const r = Object.assign({}, row);
+  for (const d of defs) {
+    const k = d.kind;
+    if (k === "prev") r[d.name] = prev === null ? null : get(prev, d.col);
+    else if (k === "next") r[d.name] = nxt === null ? null : get(nxt, d.col);
+    else if (k === "sameprev") r[d.name] = prev !== null && same(get(row, d.col), get(prev, d.col));
+    else if (k === "samenext") r[d.name] = nxt !== null && same(get(row, d.col), get(nxt, d.col));
+    else if (k === "eq") r[d.name] = same(get(row, d.a), get(row, d.b));
+  }
+  return r;
+}
+
+function trigFire(tr, st, row) {
+  const kind = tr.kind;
+  const has = st.h, pv = st.p;
+  let fire = false;
+  if (kind === "pred" || kind === "rise" || kind === "rise0" || kind === "flip") {
+    const b = !!evalFilter(tr.pred, row);
+    if (kind === "pred") fire = b;
+    else if (kind === "rise") fire = has && b && !pv;
+    else if (kind === "rise0") fire = b && !(has && pv);
+    else fire = has && b !== pv;
+    st.p = b;
+  } else {
+    const v = get(row, tr.col);
+    if (kind === "change") fire = has && !same(v, pv);
+    else if (kind === "trans") fire = has && same(pv, tr.from) && same(v, tr.to);
+    else if (kind === "gap") {
+      const x = toNum(v), px = toNum(pv);
+      fire = has && x !== null && px !== null && cmpOp(x - px, tr.cmp, tr.value);
+    }
+    st.p = v === undefined ? null : v;
+  }
+  st.h = true;
+  return !!fire;
+}
+
+function featInit(f) {
+  const t = f.type;
+  if (t === "prefix") return { s: 0, c: 0, m: null };
+  if (t === "window") return { b: [] };
+  if (t === "mode") return { l: f.init === undefined ? null : f.init };
+  return { k: f.base === undefined ? 0 : f.base, h: false, p: null };
+}
+
+function contrib(f, row) {
+  if (f.agg === "countp") return evalFilter(f.pred, row) ? 1 : 0;
+  if (f.agg === "count") return 1;
+  return numOf(get(row, f.src));
+}
+
+function windowAgg(agg, b) {
+  if (agg === "count" || agg === "countp") {
+    let s = 0;
+    for (const x of b) s = s + x;
+    return s;
+  }
+  let s = 0, c = 0, m = null;
+  for (const x of b) {
+    if (x === null) continue;
+    c++;
+    if (agg === "min") { if (m === null || x < m) m = x; }
+    else if (agg === "max") { if (m === null || x > m) m = x; }
+    else s = s + x;
+  }
+  if (c === 0) return null;
+  if (agg === "sum") return s;
+  if (agg === "mean") return s / c;
+  return m;
+}
+
+function featStep(f, st, row) {
+  const t = f.type;
+  if (t === "prefix") {
+    const agg = f.agg;
+    const x = contrib(f, row);
+    if (agg === "count" || agg === "countp") { st.s = st.s + x; return st.s; }
+    if (x !== null) {
+      st.c++;
+      if (agg === "min") { if (st.m === null || x < st.m) st.m = x; }
+      else if (agg === "max") { if (st.m === null || x > st.m) st.m = x; }
+      else st.s = st.s + x;
+    }
+    if (st.c === 0) return null;
+    if (agg === "sum") return st.s;
+    if (agg === "mean") return st.s / st.c;
+    return st.m;
+  }
+  if (t === "window") {
+    const b = st.b;
+    b.push(contrib(f, row));
+    while (b.length > f.w) b.shift();
+    if (f.strict && b.length < f.w) return null;
+    return windowAgg(f.agg, b);
+  }
+  if (t === "counter") {
+    if (trigFire(f.trigger, st, row)) st.k++;
+    return st.k;
+  }
+  if (t === "cycle") {
+    if (trigFire(f.trigger, st, row)) st.k++;
+    return f.labels[st.k % f.labels.length];
+  }
+  if (t === "mode") {
+    for (const [atom, label] of f.rules) {
+      if (evalFilter(atom, row)) { st.l = label; break; }
+    }
+    return st.l;
+  }
+  return null;
+}
+
+function mapFeat(c, v) {
+  if (v === null || v === undefined) return c.null === undefined ? null : c.null;
+  if (c.inner === null || c.inner === undefined) return v;
+  return applyCol(c.inner, { __f: v });
+}
+
+class Machine {
+  constructor(snap) {
+    if (!snap) {
+      const fa = {}, fk = {};
+      for (const [k, c] of ALL) fa[k] = featInit(c.feature);
+      for (const [k, c] of KEPT) fk[k] = featInit(c.feature);
+      snap = { prev: null, pend: null, pprev: null, pvals: null, fa, fk };
+    }
+    this.s = snap;
+  }
+
+  decide(row, prev, nxt, vals) {
+    const r = augment(row, prev, nxt, VIRT);
+    if (!evalFilter(SPEC.filter, r)) return null;
+    const kv = {};
+    for (const [k, c] of KEPT) kv[k] = featStep(c.feature, this.s.fk[k], row);
+    const out = {};
+    COLS.forEach((c, i) => {
+      if (c.kind === "stateful") {
+        const k = String(i);
+        out[c.name] = mapFeat(c, c.scope === "kept" ? kv[k] : vals[k]);
+      } else out[c.name] = applyCol(c, row);
+    });
+    return out;
+  }
+
+  push(row) {
+    const s = this.s;
+    const vals = {};
+    for (const [k, c] of ALL) vals[k] = featStep(c.feature, s.fa[k], row);
+    const out = [];
+    if (LOOKAHEAD) {
+      if (s.pend !== null) {
+        const t = this.decide(s.pend, s.pprev, row, s.pvals);
+        if (t !== null) out.push(t);
+      }
+      s.pend = row; s.pprev = s.prev; s.pvals = vals;
+    } else {
+      const t = this.decide(row, s.prev, null, vals);
+      if (t !== null) out.push(t);
+    }
+    s.prev = row;
+    return out;
+  }
+
+  finish() {
+    const s = this.s;
+    const out = [];
+    if (s.pend !== null) {
+      const t = this.decide(s.pend, s.pprev, null, s.pvals);
+      if (t !== null) out.push(t);
+      s.pend = null; s.pprev = null; s.pvals = null;
+    }
+    return out;
+  }
+}
+
 // ---------------------------------------------------------------- readers
 const CHUNK = 65536;
 
@@ -1911,27 +3053,29 @@ function writeJsonAtomic(p, obj) {
   fs.renameSync(tmp, p);
 }
 
-function* streamWithOffsets(path, start, bufferSize) {
+// Events: [row, null] per output row, [null, offset] after each input row.
+function* events(path, start, bufferSize, mach) {
   let batch = [];
   for (const item of readRows(path, SPEC.format, start)) {
     batch.push(item);
     if (batch.length >= bufferSize) {
-      const b = batch;
+      const bt = batch;
       batch = [];
-      for (const [r, o] of b) {
-        const t = transform(r);
-        if (t !== null) yield [t, o];
+      for (const [r, o] of bt) {
+        for (const t of mach.push(r)) yield [t, null];
+        yield [null, o];
       }
     }
   }
   for (const [r, o] of batch) {
-    const t = transform(r);
-    if (t !== null) yield [t, o];
+    for (const t of mach.push(r)) yield [t, null];
+    yield [null, o];
   }
+  for (const t of mach.finish()) yield [t, null];
 }
 
 function* plainStream(path, bufferSize) {
-  for (const [t] of streamWithOffsets(path, null, bufferSize)) yield t;
+  for (const [t] of events(path, null, bufferSize, new Machine(null))) if (t !== null) yield t;
 }
 
 function* replay(rowsPath) {
@@ -1965,24 +3109,29 @@ function* resume(path, rowsPath, statePath, state, bufferSize) {
   const n = countComplete(rowsPath);
   let m = Number(state.out || 0);
   let offset = state.offset === undefined ? null : state.offset;
-  if (m > n) { m = 0; offset = null; }
+  let snap = state.snap && typeof state.snap === "object" ? state.snap : null;
+  if (m > n || (offset !== null && snap === null)) { m = 0; offset = null; snap = null; }
+  const mach = new Machine(offset !== null ? snap : null);
   let counter = m;
   const fd = fs.openSync(rowsPath, "a");
   try {
-    let since = 0;
-    for (const [t, off] of streamWithOffsets(path, offset, bufferSize)) {
+    let steps = 0;
+    for (const [t, off] of events(path, offset, bufferSize, mach)) {
+      if (t === null) {
+        steps++;
+        if (steps >= bufferSize) {
+          steps = 0;
+          state = Object.assign({}, state, { out: counter, offset: off, snap: mach.s });
+          writeJsonAtomic(statePath, state);
+        }
+        continue;
+      }
       counter++;
       if (counter <= n) continue;
       fs.writeSync(fd, JSON.stringify(t) + "\n");
-      since++;
-      if (since >= bufferSize) {
-        since = 0;
-        state = Object.assign({}, state, { out: counter, offset: off });
-        writeJsonAtomic(statePath, state);
-      }
       yield t;
     }
-    state = Object.assign({}, state, { out: counter, offset: null, complete: true });
+    state = Object.assign({}, state, { out: counter, offset: null, snap: null, complete: true });
     writeJsonAtomic(statePath, state);
   } finally {
     fs.closeSync(fd);
