@@ -942,6 +942,1143 @@ def s_dict(*args):
     return d
 
 
+# ---------------------------------------------------------------------------
+# Rich helpers: XPath over JSON/XML, gjson-style paths, misc
+# ---------------------------------------------------------------------------
+
+import hashlib
+import hmac as _hmac
+import json as _json
+import math
+import xml.parsers.expat
+
+
+class XNode:
+    __slots__ = ("type", "name", "prefix", "local", "data", "children", "attrs",
+                 "parent", "order")
+
+    def __init__(self, type_, name="", data="", parent=None):
+        self.type = type_          # "doc", "elem", "text", "attr", "comment", "pi"
+        self.name = name
+        if ":" in name:
+            self.prefix, self.local = name.split(":", 1)
+        else:
+            self.prefix, self.local = "", name
+        self.data = data
+        self.children = []
+        self.attrs = []
+        self.parent = parent
+        self.order = 0
+
+    def inner_text(self):
+        if self.type in ("text", "attr", "comment", "pi"):
+            return self.data
+        out = []
+        stack = [self]
+        while stack:
+            n = stack.pop()
+            if n.type == "text":
+                out.append(n.data)
+            elif n.type in ("doc", "elem"):
+                stack.extend(reversed(n.children))
+        return "".join(out)
+
+
+def _number_order(root):
+    i = 0
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        n.order = i
+        i += 1
+        for a in n.attrs:
+            a.order = i
+            i += 1
+        stack.extend(reversed(n.children))
+
+
+def _go_format_float(f):
+    """strconv.FormatFloat(f, 'f', -1, 64)."""
+    if f != f:
+        return "NaN"
+    if f in (float("inf"), float("-inf")):
+        return "+Inf" if f > 0 else "-Inf"
+    if f == int(f) and abs(f) < 1e21:
+        s = "%d" % int(f)
+        if f == 0 and math.copysign(1.0, f) < 0:
+            s = "-0"
+        return s
+    s = format(decimal.Decimal(repr(f)), "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+def _json_to_xtree(text):
+    try:
+        val = _json.loads(text, parse_int=float, parse_constant=_bad_const)
+    except ValueError as e:
+        raise TemplateError("invalid json: %s" % e)
+    doc = XNode("doc")
+
+    def add(v, parent):
+        if isinstance(v, list):
+            for vv in v:
+                n = XNode("elem", "", parent=parent)
+                parent.children.append(n)
+                add(vv, n)
+        elif isinstance(v, dict):
+            for k in sorted(v.keys()):
+                n = XNode("elem", k, parent=parent)
+                parent.children.append(n)
+                add(v[k], n)
+        elif isinstance(v, str):
+            parent.children.append(XNode("text", data=v, parent=parent))
+        elif isinstance(v, bool):
+            parent.children.append(XNode("text", data="true" if v else "false", parent=parent))
+        elif isinstance(v, float):
+            parent.children.append(XNode("text", data=_go_format_float(v), parent=parent))
+
+    add(val, doc)
+    _number_order(doc)
+    return doc
+
+
+def _bad_const(c):
+    raise ValueError("invalid character in JSON: %s" % c)
+
+
+def _xml_to_xtree(text):
+    doc = XNode("doc")
+    stack = [doc]
+    p = xml.parsers.expat.ParserCreate()
+    p.buffer_text = True
+    p.ordered_attributes = True
+
+    def start(name, attrs):
+        parent = stack[-1]
+        n = XNode("elem", name, parent=parent)
+        for i in range(0, len(attrs), 2):
+            n.attrs.append(XNode("attr", attrs[i], attrs[i + 1], parent=n))
+        parent.children.append(n)
+        stack.append(n)
+
+    def end(name):
+        stack.pop()
+
+    def chars(data):
+        parent = stack[-1]
+        if parent.children and parent.children[-1].type == "text":
+            parent.children[-1].data += data
+        else:
+            parent.children.append(XNode("text", data=data, parent=parent))
+
+    def comment(data):
+        stack[-1].children.append(XNode("comment", data=data, parent=stack[-1]))
+
+    def pi(target, data):
+        stack[-1].children.append(XNode("pi", target, data, parent=stack[-1]))
+
+    p.StartElementHandler = start
+    p.EndElementHandler = end
+    p.CharacterDataHandler = chars
+    p.CommentHandler = comment
+    p.ProcessingInstructionHandler = pi
+    try:
+        p.Parse(text.encode("utf-8", "surrogateescape"), True)
+    except xml.parsers.expat.ExpatError as e:
+        raise TemplateError("invalid xml: %s" % e)
+    _number_order(doc)
+    return doc
+
+
+# --- XPath 1.0 (subset) ------------------------------------------------------
+
+_XP_TOKEN = re.compile(r"""
+    (?P<ws>\s+)
+  | (?P<num>\d+(?:\.\d*)?|\.\d+)
+  | (?P<str>"[^"]*"|'[^']*')
+  | (?P<op>//|::|\.\.|!=|<=|>=|[/()\[\]@,|.=<>+\-*$])
+  | (?P<name>(?:[A-Za-z_À-￿][\w.\-·À-￿]*)
+              (?::(?:[A-Za-z_À-￿][\w.\-·À-￿]*|\*))?)
+""", re.X)
+
+_AXES = {
+    "ancestor", "ancestor-or-self", "attribute", "child", "descendant",
+    "descendant-or-self", "following", "following-sibling", "namespace",
+    "parent", "preceding", "preceding-sibling", "self",
+}
+_NODE_TYPES = {"node", "text", "comment", "processing-instruction"}
+
+
+_XP_NON_OPERAND = {"@", "::", "(", "[", ",", "/", "//", "|", "=", "!=", "<", "<=",
+                   ">", ">=", "+", "-", "$"}
+
+
+def _xp_lex(expr):
+    toks = []
+    pos = 0
+    n = len(expr)
+    while pos < n:
+        m = _XP_TOKEN.match(expr, pos)
+        if not m:
+            raise TemplateError("invalid xpath expression: %s" % expr)
+        pos = m.end()
+        kind = m.lastgroup
+        if kind == "ws":
+            continue
+        val = m.group(kind)
+        toks.append((kind, val))
+    # disambiguate operator names / multiply per XPath 1.0 rules
+    out = []
+    for i, (k, v) in enumerate(toks):
+        prev = out[-1] if out else None
+        prev_is_operand = prev is not None and not (
+            prev[0] in ("opname", "mul")
+            or (prev[0] == "op" and prev[1] in _XP_NON_OPERAND))
+        if k == "op" and v == "*" and prev_is_operand:
+            out.append(("mul", "*"))
+        elif k == "name" and v in ("and", "or", "div", "mod") and prev_is_operand:
+            out.append(("opname", v))
+        else:
+            out.append((k, v))
+    return out
+
+
+class _XPParser:
+    def __init__(self, expr):
+        self.expr = expr
+        self.toks = _xp_lex(expr)
+        self.i = 0
+
+    def peek(self, off=0):
+        j = self.i + off
+        return self.toks[j] if j < len(self.toks) else (None, None)
+
+    def take(self):
+        t = self.peek()
+        self.i += 1
+        return t
+
+    def expect(self, v):
+        t = self.take()
+        if t[1] != v:
+            raise TemplateError("invalid xpath expression: %s" % self.expr)
+        return t
+
+    def parse(self):
+        if not self.toks:
+            raise TemplateError("invalid xpath expression: empty")
+        e = self.or_expr()
+        if self.i != len(self.toks):
+            raise TemplateError("invalid xpath expression: %s" % self.expr)
+        return e
+
+    def _binary(self, sub, ops, kinds=("op", "opname", "mul")):
+        left = sub()
+        while True:
+            k, v = self.peek()
+            if k in kinds and v in ops:
+                self.take()
+                left = ("bin", v, left, sub())
+            else:
+                return left
+
+    def or_expr(self):
+        return self._binary(self.and_expr, ("or",))
+
+    def and_expr(self):
+        return self._binary(self.eq_expr, ("and",))
+
+    def eq_expr(self):
+        return self._binary(self.rel_expr, ("=", "!="))
+
+    def rel_expr(self):
+        return self._binary(self.add_expr, ("<", "<=", ">", ">="))
+
+    def add_expr(self):
+        return self._binary(self.mul_expr, ("+", "-"))
+
+    def mul_expr(self):
+        return self._binary(self.unary_expr, ("*", "div", "mod"), kinds=("mul", "opname"))
+
+    def unary_expr(self):
+        if self.peek() == ("op", "-"):
+            self.take()
+            return ("neg", self.unary_expr())
+        return self.union_expr()
+
+    def union_expr(self):
+        left = self.path_expr()
+        while self.peek() == ("op", "|"):
+            self.take()
+            left = ("union", left, self.path_expr())
+        return left
+
+    def path_expr(self):
+        k, v = self.peek()
+        is_filter = False
+        if k in ("num", "str") or (k == "op" and v in ("(", "$")):
+            is_filter = True
+        elif k == "name" and self.peek(1) == ("op", "(") and v not in _NODE_TYPES:
+            is_filter = True
+        if not is_filter:
+            return self.location_path()
+        prim = self.primary()
+        preds = []
+        while self.peek() == ("op", "["):
+            preds.append(self.predicate())
+        node = ("filter", prim, preds) if preds else prim
+        k, v = self.peek()
+        if k == "op" and v in ("/", "//"):
+            self.take()
+            steps = []
+            if v == "//":
+                steps.append(("descendant-or-self", ("type", "node"), []))
+            steps.extend(self.relative_steps())
+            node = ("pathfrom", node, steps)
+        return node
+
+    def primary(self):
+        k, v = self.take()
+        if k == "num":
+            return ("const", float(v))
+        if k == "str":
+            return ("const", v[1:-1])
+        if v == "(":
+            e = self.or_expr()
+            self.expect(")")
+            return e
+        if v == "$":
+            name = self.take()
+            raise TemplateError("xpath variables not supported: $%s" % name[1])
+        if k == "name":
+            self.expect("(")
+            args = []
+            if self.peek() != ("op", ")"):
+                args.append(self.or_expr())
+                while self.peek() == ("op", ","):
+                    self.take()
+                    args.append(self.or_expr())
+            self.expect(")")
+            return ("call", v, args)
+        raise TemplateError("invalid xpath expression: %s" % self.expr)
+
+    def predicate(self):
+        self.expect("[")
+        e = self.or_expr()
+        self.expect("]")
+        return e
+
+    def location_path(self):
+        k, v = self.peek()
+        if k == "op" and v == "/":
+            self.take()
+            nk, nv = self.peek()
+            if nk == "name" or (nk == "op" and nv in ("*", "@", ".", "..")):
+                return ("path", True, self.relative_steps())
+            return ("path", True, [])
+        if k == "op" and v == "//":
+            self.take()
+            steps = [("descendant-or-self", ("type", "node"), [])]
+            steps.extend(self.relative_steps())
+            return ("path", True, steps)
+        return ("path", False, self.relative_steps())
+
+    def relative_steps(self):
+        steps = [self.step()]
+        while True:
+            k, v = self.peek()
+            if k == "op" and v == "/":
+                self.take()
+                steps.append(self.step())
+            elif k == "op" and v == "//":
+                self.take()
+                steps.append(("descendant-or-self", ("type", "node"), []))
+                steps.append(self.step())
+            else:
+                return steps
+
+    def step(self):
+        k, v = self.peek()
+        if k == "op" and v == ".":
+            self.take()
+            return ("self", ("type", "node"), [])
+        if k == "op" and v == "..":
+            self.take()
+            return ("parent", ("type", "node"), [])
+        axis = "child"
+        if k == "op" and v == "@":
+            self.take()
+            axis = "attribute"
+        elif k == "name" and self.peek(1) == ("op", "::"):
+            if v not in _AXES:
+                raise TemplateError("invalid xpath axis: %s" % v)
+            axis = v
+            self.take()
+            self.take()
+        k, v = self.take()
+        if k == "op" and v == "*":
+            test = ("name", "*", "*")
+        elif k == "name":
+            if v in _NODE_TYPES and self.peek() == ("op", "("):
+                self.take()
+                if self.peek()[0] == "str":
+                    self.take()
+                self.expect(")")
+                test = ("type", v)
+            else:
+                if ":" in v:
+                    pfx, loc = v.split(":", 1)
+                else:
+                    pfx, loc = "", v
+                test = ("name", pfx, loc)
+        else:
+            raise TemplateError("invalid xpath expression: %s" % self.expr)
+        preds = []
+        while self.peek() == ("op", "["):
+            preds.append(self.predicate())
+        return (axis, test, preds)
+
+
+def _axis_nodes(node, axis):
+    if axis == "child":
+        return list(node.children)
+    if axis == "attribute":
+        return list(node.attrs)
+    if axis == "self":
+        return [node]
+    if axis == "parent":
+        return [node.parent] if node.parent is not None else []
+    if axis in ("descendant", "descendant-or-self"):
+        out = [node] if axis == "descendant-or-self" else []
+        stack = list(reversed(node.children))
+        while stack:
+            n = stack.pop()
+            out.append(n)
+            stack.extend(reversed(n.children))
+        return out
+    if axis in ("ancestor", "ancestor-or-self"):
+        out = [node] if axis == "ancestor-or-self" else []
+        p = node.parent
+        while p is not None:
+            out.append(p)
+            p = p.parent
+        return out
+    if axis in ("following-sibling", "preceding-sibling"):
+        if node.parent is None or node.type == "attr":
+            return []
+        sibs = node.parent.children
+        idx = next(i for i, s in enumerate(sibs) if s is node)
+        if axis == "following-sibling":
+            return sibs[idx + 1:]
+        return list(reversed(sibs[:idx]))
+    if axis in ("following", "preceding"):
+        root = node
+        while root.parent is not None:
+            root = root.parent
+        alln = _axis_nodes(root, "descendant-or-self")
+        if axis == "following":
+            last = node
+            while last.children:
+                last = last.children[-1]
+            return [n for n in alln if n.order > last.order]
+        anc = set(id(a) for a in _axis_nodes(node, "ancestor"))
+        return list(reversed([n for n in alln if n.order < node.order and id(n) not in anc]))
+    return []
+
+
+_REVERSE_AXES = {"ancestor", "ancestor-or-self", "preceding", "preceding-sibling"}
+
+
+def _node_test(n, test, axis):
+    if test[0] == "type":
+        t = test[1]
+        if t == "node":
+            return True
+        if t == "text":
+            return n.type == "text"
+        if t == "comment":
+            return n.type == "comment"
+        return n.type == "pi"
+    principal = "attr" if axis == "attribute" else "elem"
+    if n.type != principal:
+        return False
+    _, pfx, loc = test
+    if pfx == "*" and loc == "*":
+        return True
+    if loc == "*":
+        return n.prefix == pfx
+    return n.local == loc and n.prefix == pfx
+
+
+def _xp_string(v):
+    if isinstance(v, list):
+        return v[0].inner_text() if v else ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        if v != v:
+            return "NaN"
+        if v in (float("inf"), float("-inf")):
+            return "Infinity" if v > 0 else "-Infinity"
+        return _go_format_float(v)
+    return v
+
+
+def _xp_number(v):
+    if isinstance(v, list):
+        v = _xp_string(v)
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    if isinstance(v, float):
+        return v
+    try:
+        s = v.strip()
+        if not re.match(r"^-?(\d+(\.\d*)?|\.\d+)$", s):
+            return float("nan")
+        return float(s)
+    except ValueError:
+        return float("nan")
+
+
+def _xp_bool(v):
+    if isinstance(v, list):
+        return len(v) > 0
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, float):
+        return v != 0 and v == v
+    return len(v) > 0
+
+
+def _xp_compare(op, a, b):
+    def cmp(x, y):
+        if op in ("=", "!="):
+            if isinstance(x, bool) or isinstance(y, bool):
+                r = _xp_bool(x) == _xp_bool(y)
+            elif isinstance(x, float) or isinstance(y, float):
+                r = _xp_number(x) == _xp_number(y)
+            else:
+                r = _xp_string(x) == _xp_string(y)
+            return r if op == "=" else not r
+        x, y = _xp_number(x), _xp_number(y)
+        return {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
+
+    al = a if isinstance(a, list) else None
+    bl = b if isinstance(b, list) else None
+    if al is not None and bl is not None:
+        return any(cmp(x.inner_text(), y.inner_text()) for x in al for y in bl)
+    if al is not None:
+        if isinstance(b, bool):
+            return cmp(_xp_bool(a), b)
+        return any(cmp(x.inner_text(), b) for x in al)
+    if bl is not None:
+        if isinstance(a, bool):
+            return cmp(a, _xp_bool(b))
+        return any(cmp(a, y.inner_text()) for y in bl)
+    return cmp(a, b)
+
+
+def _xp_round(x):
+    if x != x or x in (float("inf"), float("-inf")):
+        return x
+    return float(math.floor(x + 0.5))
+
+
+class _XPEval:
+    def __init__(self, root):
+        self.root = root
+
+    def ev(self, e, node, pos, size):
+        k = e[0]
+        if k == "const":
+            return e[1]
+        if k == "path":
+            start = [self.root] if e[1] else [node]
+            return self.steps(start, e[2])
+        if k == "pathfrom":
+            base = self.ev(e[1], node, pos, size)
+            if not isinstance(base, list):
+                raise TemplateError("xpath: expression must evaluate to a node-set")
+            return self.steps(base, e[2])
+        if k == "filter":
+            base = self.ev(e[1], node, pos, size)
+            if not isinstance(base, list):
+                raise TemplateError("xpath: expression must evaluate to a node-set")
+            for p in e[2]:
+                base = self.apply_pred(base, p)
+            return base
+        if k == "union":
+            a = self.ev(e[1], node, pos, size)
+            b = self.ev(e[2], node, pos, size)
+            if not isinstance(a, list) or not isinstance(b, list):
+                raise TemplateError("xpath: union operands must be node-sets")
+            seen = {}
+            for n in a + b:
+                seen[id(n)] = n
+            return sorted(seen.values(), key=lambda n: n.order)
+        if k == "neg":
+            return -_xp_number(self.ev(e[1], node, pos, size))
+        if k == "bin":
+            op = e[1]
+            if op == "or":
+                return _xp_bool(self.ev(e[2], node, pos, size)) or _xp_bool(self.ev(e[3], node, pos, size))
+            if op == "and":
+                return _xp_bool(self.ev(e[2], node, pos, size)) and _xp_bool(self.ev(e[3], node, pos, size))
+            a = self.ev(e[2], node, pos, size)
+            b = self.ev(e[3], node, pos, size)
+            if op in ("=", "!=", "<", "<=", ">", ">="):
+                return _xp_compare(op, a, b)
+            x, y = _xp_number(a), _xp_number(b)
+            if op == "+":
+                return x + y
+            if op == "-":
+                return x - y
+            if op == "*":
+                return x * y
+            if op == "div":
+                if y == 0:
+                    if x == 0 or x != x:
+                        return float("nan")
+                    return math.copysign(float("inf"), x) * math.copysign(1.0, y)
+                return x / y
+            if op == "mod":
+                if y == 0:
+                    return float("nan")
+                return math.fmod(x, y)
+        if k == "call":
+            return self.call(e[1], e[2], node, pos, size)
+        raise TemplateError("xpath: unsupported expression")
+
+    def steps(self, nodes, steps):
+        for axis, test, preds in steps:
+            seen = {}
+            for n in nodes:
+                cand = [c for c in _axis_nodes(n, axis) if _node_test(c, test, axis)]
+                for p in preds:
+                    cand = self.apply_pred(cand, p)
+                for c in cand:
+                    seen[id(c)] = c
+            nodes = sorted(seen.values(), key=lambda n: n.order)
+        return nodes
+
+    def apply_pred(self, nodes, pred):
+        out = []
+        size = len(nodes)
+        for i, n in enumerate(nodes):
+            v = self.ev(pred, n, i + 1, size)
+            if isinstance(v, float) and not isinstance(v, bool):
+                if v == i + 1:
+                    out.append(n)
+            elif _xp_bool(v):
+                out.append(n)
+        return out
+
+    def call(self, name, args, node, pos, size):
+        def a(i):
+            return self.ev(args[i], node, pos, size)
+
+        def s(i):
+            return _xp_string(a(i)) if i < len(args) else node.inner_text()
+
+        n = len(args)
+        if name == "last":
+            return float(size)
+        if name == "position":
+            return float(pos)
+        if name == "count":
+            v = a(0)
+            if not isinstance(v, list):
+                raise TemplateError("xpath: count() requires a node-set")
+            return float(len(v))
+        if name in ("name", "local-name", "namespace-uri"):
+            if n:
+                v = a(0)
+                if not isinstance(v, list):
+                    raise TemplateError("xpath: %s() requires a node-set" % name)
+                tgt = v[0] if v else None
+            else:
+                tgt = node
+            if tgt is None or tgt.type not in ("elem", "attr", "pi"):
+                return ""
+            if name == "name":
+                return tgt.name
+            if name == "local-name":
+                return tgt.local
+            return ""
+        if name == "string":
+            return s(0)
+        if name == "concat":
+            return "".join(_xp_string(a(i)) for i in range(n))
+        if name == "contains":
+            return s(1) in s(0)
+        if name == "starts-with":
+            return s(0).startswith(s(1))
+        if name == "ends-with":
+            return s(0).endswith(s(1))
+        if name == "substring-before":
+            x, y = s(0), s(1)
+            i = x.find(y)
+            return x[:i] if i >= 0 else ""
+        if name == "substring-after":
+            x, y = s(0), s(1)
+            i = x.find(y)
+            return x[i + len(y):] if i >= 0 else ""
+        if name == "substring":
+            x = s(0)
+            st = _xp_round(_xp_number(a(1)))
+            if n > 2:
+                ln = _xp_round(_xp_number(a(2)))
+                end = st + ln
+            else:
+                end = float("inf")
+            out = []
+            for i, ch in enumerate(x):
+                p = i + 1
+                if p >= st and p < end:
+                    out.append(ch)
+            return "".join(out)
+        if name == "string-length":
+            return float(len(s(0)))
+        if name == "normalize-space":
+            return " ".join(s(0).split())
+        if name == "translate":
+            x, f, t = s(0), s(1), s(2)
+            m = {}
+            for i, ch in enumerate(f):
+                if ch not in m:
+                    m[ch] = t[i] if i < len(t) else None
+            return "".join(m.get(ch, ch) or "" for ch in x if m.get(ch, ch) is not None)
+        if name in ("lower-case", "upper-case"):
+            return s(0).lower() if name == "lower-case" else s(0).upper()
+        if name == "not":
+            return not _xp_bool(a(0))
+        if name == "true":
+            return True
+        if name == "false":
+            return False
+        if name == "boolean":
+            return _xp_bool(a(0))
+        if name == "number":
+            return _xp_number(a(0)) if n else _xp_number(node.inner_text())
+        if name == "sum":
+            v = a(0)
+            if not isinstance(v, list):
+                raise TemplateError("xpath: sum() requires a node-set")
+            return float(sum(_xp_number(x.inner_text()) for x in v))
+        if name == "floor":
+            x = _xp_number(a(0))
+            return float(math.floor(x)) if math.isfinite(x) else x
+        if name == "ceiling":
+            x = _xp_number(a(0))
+            return float(math.ceil(x)) if math.isfinite(x) else x
+        if name == "round":
+            return _xp_round(_xp_number(a(0)))
+        raise TemplateError("xpath: unsupported function %s()" % name)
+
+
+_XP_CACHE = {}
+
+
+def xpath_find_one(root, expr):
+    ast = _XP_CACHE.get(expr)
+    if ast is None:
+        ast = _XPParser(expr).parse()
+        if len(_XP_CACHE) > 1024:
+            _XP_CACHE.clear()
+        _XP_CACHE[expr] = ast
+    res = _XPEval(root).ev(ast, root, 1, 1)
+    if isinstance(res, list):
+        return res[0] if res else None
+    return None
+
+
+def h_json_path(expr, data):
+    _need_str(expr), _need_str(data)
+    if data == "":
+        return ""
+    root = _json_to_xtree(data)
+    n = xpath_find_one(root, expr)
+    return n.inner_text() if n is not None else ""
+
+
+def h_xml_path(expr, data):
+    _need_str(expr), _need_str(data)
+    if data == "":
+        return ""
+    root = _xml_to_xtree(data)
+    n = xpath_find_one(root, expr)
+    return n.inner_text() if n is not None else ""
+
+
+# --- gjson-style dot paths ---------------------------------------------------
+
+class GJ:
+    """A parsed JSON value retaining its raw source text."""
+    __slots__ = ("kind", "value", "raw")
+
+    def __init__(self, kind, value, raw):
+        self.kind = kind     # "obj", "arr", "str", "num", "true", "false", "null"
+        self.value = value   # obj: list of (key, GJ); arr: list of GJ; str: str; num: float
+        self.raw = raw
+
+
+_GJ_WS = " \t\r\n"
+_GJ_NUM = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+_GJ_STR = re.compile(r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"')
+
+
+def gj_parse(text):
+    n = len(text)
+
+    def ws(i):
+        while i < n and text[i] in _GJ_WS:
+            i += 1
+        return i
+
+    def val(i, depth):
+        if depth > 1000:
+            raise ValueError("too deep")
+        i = ws(i)
+        if i >= n:
+            raise ValueError("unexpected end")
+        ch = text[i]
+        if ch == "{":
+            start = i
+            items = []
+            i = ws(i + 1)
+            if i < n and text[i] == "}":
+                return GJ("obj", items, text[start:i + 1]), i + 1
+            while True:
+                i = ws(i)
+                m = _GJ_STR.match(text, i)
+                if not m:
+                    raise ValueError("bad key")
+                key = _json.loads(m.group(0))
+                i = ws(m.end())
+                if i >= n or text[i] != ":":
+                    raise ValueError("expected colon")
+                v, i = val(i + 1, depth + 1)
+                items.append((key, v))
+                i = ws(i)
+                if i < n and text[i] == ",":
+                    i += 1
+                    continue
+                if i < n and text[i] == "}":
+                    return GJ("obj", items, text[start:i + 1]), i + 1
+                raise ValueError("bad object")
+        if ch == "[":
+            start = i
+            items = []
+            i = ws(i + 1)
+            if i < n and text[i] == "]":
+                return GJ("arr", items, text[start:i + 1]), i + 1
+            while True:
+                v, i = val(i, depth + 1)
+                items.append(v)
+                i = ws(i)
+                if i < n and text[i] == ",":
+                    i += 1
+                    continue
+                if i < n and text[i] == "]":
+                    return GJ("arr", items, text[start:i + 1]), i + 1
+                raise ValueError("bad array")
+        if ch == '"':
+            m = _GJ_STR.match(text, i)
+            if not m:
+                raise ValueError("bad string")
+            return GJ("str", _json.loads(m.group(0)), m.group(0)), m.end()
+        for lit in ("true", "false", "null"):
+            if text.startswith(lit, i):
+                return GJ(lit, None, lit), i + len(lit)
+        m = _GJ_NUM.match(text, i)
+        if m and m.end() > i:
+            return GJ("num", float(m.group(0)), m.group(0)), m.end()
+        raise ValueError("invalid character")
+
+    v, i = val(0, 0)
+    if ws(i) != n:
+        raise ValueError("trailing data")
+    return v
+
+
+def _gj_split(path):
+    """Split a gjson path into components, honouring escapes and #(...) queries."""
+    parts = []
+    cur = []
+    i = 0
+    n = len(path)
+    while i < n:
+        ch = path[i]
+        if ch == "\\" and i + 1 < n:
+            cur.append(("esc", path[i + 1]))
+            i += 2
+            continue
+        if ch == "#" and not cur and i + 1 < n and path[i + 1] == "(":
+            depth = 0
+            j = i + 1
+            quote = False
+            while j < n:
+                c = path[j]
+                if quote:
+                    if c == "\\":
+                        j += 1
+                    elif c == '"':
+                        quote = False
+                elif c == '"':
+                    quote = True
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            q = path[i + 2:j]
+            j += 1
+            multi = False
+            if j < n and path[j] == "#":
+                multi = True
+                j += 1
+            parts.append(("query", q, multi))
+            if j < n and path[j] in ".|":
+                j += 1
+            i = j
+            continue
+        if ch in ".|":
+            parts.append(("key", cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(("ch", ch))
+        i += 1
+    if cur or (path and path[-1] in ".|"):
+        parts.append(("key", cur))
+    out = []
+    for p in parts:
+        if p[0] == "key":
+            raw = "".join(c for _, c in p[1])
+            wild = any(t == "ch" and c in "*?" for t, c in p[1])
+            out.append(("key", raw, wild, p[1]))
+        else:
+            out.append(p)
+    return out
+
+
+def _gj_wild_match(chars, s):
+    pat = []
+    for t, c in chars:
+        if t == "ch" and c == "*":
+            pat.append(".*")
+        elif t == "ch" and c == "?":
+            pat.append(".")
+        else:
+            pat.append(re.escape(c))
+    return re.fullmatch("".join(pat), s, re.S) is not None
+
+
+def _gj_query_match(elem, q):
+    m = re.match(r"^\s*(.*?)\s*(==|!=|<=|>=|<|>|%|!%|=)\s*(.*?)\s*$", q, re.S)
+    if m:
+        lhs_path, op, rhs = m.group(1), m.group(2), m.group(3)
+    else:
+        lhs_path, op, rhs = q.strip(), None, None
+    if lhs_path in ("", "@this"):
+        lhs = elem
+    else:
+        lhs = _gj_get(elem, _gj_split(lhs_path))
+    if lhs is None:
+        return False
+    if op is None:
+        return True
+    if op == "=":
+        op = "=="
+    if rhs.startswith('"') and rhs.endswith('"') and len(rhs) >= 2:
+        try:
+            rv = _json.loads(rhs)
+        except ValueError:
+            rv = rhs[1:-1]
+        rk = "str"
+    elif rhs in ("true", "false"):
+        rk, rv = "bool", rhs == "true"
+    elif rhs == "null":
+        rk, rv = "null", None
+    else:
+        try:
+            rv = float(rhs)
+            rk = "num"
+        except ValueError:
+            rk, rv = "str", rhs
+    if rk == "str":
+        if lhs.kind != "str":
+            return False
+        lv = lhs.value
+        if op in ("%", "!%"):
+            r = _gj_wild_match([("ch", c) for c in rv], lv)
+            return r if op == "%" else not r
+    elif rk == "num":
+        if lhs.kind != "num":
+            return False
+        lv = lhs.value
+    elif rk == "bool":
+        if lhs.kind not in ("true", "false"):
+            return False
+        lv = lhs.kind == "true"
+        if op not in ("==", "!="):
+            return False
+    else:
+        r = lhs.kind == "null"
+        return r if op == "==" else (not r if op == "!=" else False)
+    return {"==": lv == rv, "!=": lv != rv, "<": lv < rv, "<=": lv <= rv,
+            ">": lv > rv, ">=": lv >= rv}.get(op, False)
+
+
+def _gj_arr(results):
+    raw = "[" + ",".join(r.raw for r in results) + "]"
+    return GJ("arr", results, raw)
+
+
+def _gj_get(v, parts):
+    if v is None:
+        return None
+    if not parts:
+        return v
+    p = parts[0]
+    rest = parts[1:]
+    if p[0] == "query":
+        if v.kind != "arr":
+            return None
+        _, q, multi = p
+        if multi:
+            res = []
+            for e in v.value:
+                if _gj_query_match(e, q):
+                    r = _gj_get(e, rest)
+                    if r is not None:
+                        res.append(r)
+            return _gj_arr(res)
+        for e in v.value:
+            if _gj_query_match(e, q):
+                return _gj_get(e, rest)
+        return None
+    _, key, wild, chars = p
+    if v.kind == "arr":
+        if key == "#" and not wild and not any(t == "esc" for t, _ in chars):
+            if not rest:
+                return GJ("num", float(len(v.value)), str(len(v.value)))
+            res = []
+            for e in v.value:
+                r = _gj_get(e, rest)
+                if r is not None:
+                    res.append(r)
+            return _gj_arr(res)
+        if re.fullmatch(r"\d+", key):
+            idx = int(key)
+            if idx < len(v.value):
+                return _gj_get(v.value[idx], rest)
+        return None
+    if v.kind == "obj":
+        for k, child in v.value:
+            if (wild and _gj_wild_match(chars, k)) or (not wild and k == key):
+                return _gj_get(child, rest)
+        return None
+    return None
+
+
+def _gj_string(r):
+    if r is None or r.kind == "null":
+        return ""
+    if r.kind == "str":
+        return r.value
+    if r.kind in ("true", "false"):
+        return r.kind
+    if r.kind == "num":
+        raw = r.raw
+        if re.fullmatch(r"-?\d+", raw):
+            return raw
+        return _go_format_float(r.value)
+    return r.raw
+
+
+def h_gjson_path(expr, data):
+    _need_str(expr), _need_str(data)
+    if data == "":
+        return ""
+    try:
+        doc = gj_parse(data)
+    except (ValueError, RecursionError):
+        raise TemplateError("invalid json")
+    if expr == "":
+        return ""
+    return _gj_string(_gj_get(doc, _gj_split(expr)))
+
+
+# --- misc --------------------------------------------------------------------
+
+def h_uuidv5(data):
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, _need_str(data)))
+
+
+_RE_CACHE = {}
+
+
+def _go_regex(pattern):
+    r = _RE_CACHE.get(pattern)
+    if r is not None:
+        return r
+    p = pattern.replace("(?<", "(?P<").replace("(?P<=", "(?<=").replace("(?P<!", "(?<!")
+    p = re.sub(r"(?<!\\)((?:\\\\)*)\\z", r"\1\\Z", p)
+    try:
+        r = re.compile(p)
+    except re.error as e:
+        raise TemplateError("regexp: Compile(%s): %s" % (go_quote(pattern), e))
+    if len(_RE_CACHE) > 512:
+        _RE_CACHE.clear()
+    _RE_CACHE[pattern] = r
+    return r
+
+
+def h_regex_find_all_submatch(pattern, s):
+    _need_str(pattern), _need_str(s)
+    m = _go_regex(pattern).search(s)
+    if not m:
+        return []
+    return [m.group(0)] + [g if g is not None else "" for g in m.groups()]
+
+
+def h_regex_find_first_submatch(pattern, s):
+    _need_str(pattern), _need_str(s)
+    r = _go_regex(pattern)
+    m = r.search(s)
+    if not m or r.groups < 1:
+        return ""
+    return m.group(1) or ""
+
+
+def h_hmac_sha256(secret, data):
+    _need_str(secret), _need_str(data)
+    return _hmac.new(secret.encode("utf-8", "surrogateescape"),
+                     data.encode("utf-8", "surrogateescape"), hashlib.sha256).hexdigest()
+
+
+def h_is_last_index(index, array):
+    _need_int(index)
+    if array is None:
+        raise TemplateError("reflect: call of reflect.Value.Len on zero Value")
+    if isinstance(array, str):
+        n = len(array.encode("utf-8", "surrogateescape"))
+    elif isinstance(array, (list, tuple, dict, bytes)):
+        n = len(array)
+    else:
+        raise TemplateError("reflect: call of reflect.Value.Len on %s Value" % gotype(array))
+    return index == n - 1
+
+
+def h_html_escape_string(s):
+    return f_html(_need_str(s))
+
+
 FUNCS = {
     # Go builtins
     "and": None,
@@ -1001,6 +2138,16 @@ FUNCS = {
     "max": m_max,
     "min": m_min,
     "uuidv4": s_uuidv4,
+    # hmock helpers
+    "jsonPath": h_json_path,
+    "gJsonPath": h_gjson_path,
+    "xmlPath": h_xml_path,
+    "uuidv5": h_uuidv5,
+    "regexFindAllSubmatch": h_regex_find_all_submatch,
+    "regexFindFirstSubmatch": h_regex_find_first_submatch,
+    "hmacSHA256": h_hmac_sha256,
+    "isLastIndex": h_is_last_index,
+    "htmlEscapeString": h_html_escape_string,
 }
 
 
@@ -1909,8 +3056,14 @@ def _to_text(v):
     return str(v)
 
 
+def _resolve_template_file(templates_dir, rel):
+    # like Go's filepath.Join: the file is always resolved inside templates_dir
+    rel = rel.replace("\\", "/").lstrip("/")
+    return os.path.normpath(os.path.join(templates_dir or ".", rel))
+
+
 class ReplyHTTP:
-    def __init__(self, spec):
+    def __init__(self, spec, templates_dir=None):
         if not isinstance(spec, dict):
             raise ValidationError("reply_http must be a mapping")
         if "status_code" not in spec or spec["status_code"] is None:
@@ -1930,6 +3083,18 @@ class ReplyHTTP:
             raise ValidationError("reply_http.headers must be a mapping")
         self.headers = [(str(k), _to_text(v)) for k, v in headers.items()]
         self.body = _to_text(spec.get("body"))
+        bff = spec.get("body_from_file")
+        self.body_from_file = "" if bff is None else _to_text(bff)
+        if self.body == "" and self.body_from_file != "":
+            path = _resolve_template_file(templates_dir, self.body_from_file)
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError as e:
+                raise ValidationError("reply_http.body_from_file: cannot read %s: %s"
+                                      % (self.body_from_file, e.strerror or e))
+            # snapshot of the file contents for this loaded configuration
+            self.body = _dec(data)
 
 
 class Sleep:
@@ -1979,7 +3144,7 @@ def _compile_path(path):
 
 
 class Behavior:
-    def __init__(self, raw, source):
+    def __init__(self, raw, source, templates_dir=None):
         if not isinstance(raw, dict):
             raise ValidationError("mock must be a mapping")
         self.source = source
@@ -2024,7 +3189,7 @@ class Behavior:
                     replies += 1
                     if replies > 1:
                         raise ValidationError("more than one reply_http action")
-                    self.actions.append(("reply_http", ReplyHTTP(spec)))
+                    self.actions.append(("reply_http", ReplyHTTP(spec, templates_dir)))
                 elif name == "sleep":
                     self.actions.append(("sleep", Sleep(spec)))
                 elif name == "order":
@@ -2088,7 +3253,7 @@ def load_mocks(templates_dir):
     behaviors = []
     for item, path in raw:
         try:
-            b = Behavior(item, path)
+            b = Behavior(item, path, templates_dir)
         except ValidationError as e:
             key = item.get("key") if isinstance(item, dict) else None
             LOG.error("invalid mock rejected", file=path, key=_to_text(key), err=str(e))
