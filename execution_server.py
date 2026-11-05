@@ -39,30 +39,51 @@ class ApiError(Exception):
         self.message = message
 
 
+def _summary(d):
+    if not d:
+        return {"average": None, "median": None, "max": None, "min": None, "stddev": None}
+    return {
+        "average": round(sum(d) / len(d), 3),
+        "median": round(statistics.median(d), 3),
+        "max": round(max(d), 3),
+        "min": round(min(d), 3),
+        "stddev": round(statistics.pstdev(d), 3),
+    }
+
+
 class Stats:
     def __init__(self):
         self._lock = threading.Lock()
         self._durations = []
+        self._cmd_durations = []
+        self._cmd_total = 0
 
-    def record(self, duration):
+    def record(self, duration, cmd_durations=None, cmd_total=None):
         with self._lock:
             self._durations.append(duration)
+            if cmd_durations is None:
+                cmd_durations = [duration]
+            if cmd_total is None:
+                cmd_total = len(cmd_durations)
+            self._cmd_durations.extend(cmd_durations)
+            self._cmd_total += cmd_total
 
     def snapshot(self):
         with self._lock:
             d = list(self._durations)
-        if not d:
-            return {"ran": 0, "duration": {"average": None, "median": None,
-                                           "max": None, "min": None, "stddev": None}}
+            cd = list(self._cmd_durations)
+            total = self._cmd_total
+        n = len(d)
         return {
-            "ran": len(d),
-            "duration": {
-                "average": round(sum(d) / len(d), 3),
-                "median": round(statistics.median(d), 3),
-                "max": round(max(d), 3),
-                "min": round(min(d), 3),
-                "stddev": round(statistics.pstdev(d), 3),
+            "ran": n,
+            "commands": {
+                "total": total,
+                "ran": len(cd),
+                "average": round(total / n, 3) if n else None,
+                "average_ran": round(len(cd) / n, 3) if n else None,
+                "duration": _summary(cd),
             },
+            "duration": _summary(d),
         }
 
 
@@ -76,10 +97,15 @@ def validate(body):
     if "command" not in body:
         raise ApiError(400, "MISSING_FIELD", "'command' is required")
     command = body["command"]
-    if not isinstance(command, str):
-        raise ApiError(400, "INVALID_FIELD", "'command' must be a string")
-    if not command.strip():
-        raise ApiError(400, "INVALID_FIELD", "'command' must be a non-empty string")
+    if isinstance(command, str):
+        if not command.strip():
+            raise ApiError(400, "INVALID_FIELD", "'command' must be a non-empty string")
+    elif isinstance(command, list):
+        if not command:
+            raise ApiError(400, "INVALID_FIELD", "'command' array must not be empty")
+    else:
+        raise ApiError(400, "INVALID_FIELD",
+                       "'command' must be a string or an array of command objects")
 
     env = body.get("env", {})
     if env is None:
@@ -123,6 +149,39 @@ def validate(body):
     if not math.isfinite(timeout) or timeout <= 0:
         raise ApiError(400, "INVALID_FIELD", "'timeout' must be a positive number")
 
+    continue_on_error = body.get("continue_on_error", False)
+    if continue_on_error is None:
+        continue_on_error = False
+    if not isinstance(continue_on_error, bool):
+        raise ApiError(400, "INVALID_FIELD", "'continue_on_error' must be a boolean")
+
+    if isinstance(command, list):
+        steps = []
+        for i, item in enumerate(command):
+            if not isinstance(item, dict):
+                raise ApiError(400, "INVALID_FIELD", f"command[{i}] must be an object")
+            if "cmd" not in item:
+                raise ApiError(400, "MISSING_FIELD", f"command[{i}].cmd is required")
+            cmd = item["cmd"]
+            if not isinstance(cmd, str) or not cmd.strip():
+                raise ApiError(400, "INVALID_FIELD",
+                               f"command[{i}].cmd must be a non-empty string")
+            t = item.get("timeout")
+            if t is None:
+                t = timeout
+            if isinstance(t, bool) or not isinstance(t, (int, float)):
+                raise ApiError(400, "INVALID_FIELD", f"command[{i}].timeout must be a number")
+            if not math.isfinite(t) or t <= 0:
+                raise ApiError(400, "INVALID_FIELD",
+                               f"command[{i}].timeout must be a positive number")
+            req = item.get("required", False)
+            if req is None:
+                req = False
+            if not isinstance(req, bool):
+                raise ApiError(400, "INVALID_FIELD", f"command[{i}].required must be a boolean")
+            steps.append({"cmd": cmd, "timeout": float(t), "required": req})
+        command = steps
+
     track = body.get("track")
     if track is not None:
         if not isinstance(track, list):
@@ -136,7 +195,7 @@ def validate(body):
         if not track:
             track = None
 
-    return command, env, files, stdin, float(timeout), track
+    return command, env, files, stdin, float(timeout), track, continue_on_error
 
 
 def _split_exts(path):
@@ -281,7 +340,54 @@ def kill_group(proc):
             pass
 
 
-def execute(command, env, files, stdin, timeout, track=None):
+def run_one(command, workdir, run_env, stdin, timeout):
+    start = time.monotonic()
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", command],
+        cwd=workdir,
+        env=run_env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        out, err = proc.communicate(stdin.encode("utf-8"), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_group(proc)
+        try:
+            out, err = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            # grandchildren may hold pipes open; give up on further output
+            for f in (proc.stdout, proc.stderr):
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            proc.wait()
+            out, err = b"", b""
+    duration = time.monotonic() - start
+    # make sure no stragglers remain in the group
+    kill_group(proc)
+
+    exit_code = -1 if timed_out else proc.returncode
+    result = {
+        "stdout": (out or b"").decode("utf-8", errors="replace"),
+        "stderr": (err or b"").decode("utf-8", errors="replace"),
+        "exit_code": exit_code,
+        "duration": round(duration, 3),
+        "timed_out": timed_out,
+    }
+    return result, duration
+
+
+def execute(command, env, files, stdin, timeout, track=None, continue_on_error=False):
+    """Run a command (string) or chain (list of steps).
+
+    Returns (response, total_duration, per_command_durations, total_commands).
+    """
     workdir = tempfile.mkdtemp(prefix="exec-")
     try:
         real_root = os.path.realpath(workdir)
@@ -300,49 +406,43 @@ def execute(command, env, files, stdin, timeout, track=None):
         run_env = dict(os.environ)
         run_env.update(env)
 
-        start = time.monotonic()
-        proc = subprocess.Popen(
-            ["/bin/sh", "-c", command],
-            cwd=workdir,
-            env=run_env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        timed_out = False
-        try:
-            out, err = proc.communicate(stdin.encode("utf-8"), timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            kill_group(proc)
-            try:
-                out, err = proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                # grandchildren may hold pipes open; give up on further output
-                for f in (proc.stdout, proc.stderr):
-                    try:
-                        f.close()
-                    except Exception:
-                        pass
-                proc.wait()
-                out, err = b"", b""
-        duration = time.monotonic() - start
-        # make sure no stragglers remain in the group
-        kill_group(proc)
+        if isinstance(command, str):
+            res, duration = run_one(command, workdir, run_env, stdin, timeout)
+            result = {"id": str(uuid.uuid4())}
+            result.update(res)
+            result["files"] = collect_tracked(workdir, track) if track else {}
+            return result, duration, [duration], 1
 
-        exit_code = -1 if timed_out else proc.returncode
+        results = []
+        durations = []
+        failed = False
+        first_stdin = True
+        for step in command:
+            if failed and not continue_on_error and not step["required"]:
+                continue
+            res, duration = run_one(step["cmd"], workdir, run_env,
+                                    stdin if first_stdin else "", step["timeout"])
+            first_stdin = False
+            entry = {"cmd": step["cmd"]}
+            entry.update(res)
+            if step["required"]:
+                entry["required"] = True
+            results.append(entry)
+            durations.append(duration)
+            if res["exit_code"] != 0 or res["timed_out"]:
+                failed = True
+
+        overall_exit = next((r["exit_code"] for r in results if r["exit_code"] != 0), 0)
+        total = sum(durations)
         result = {
             "id": str(uuid.uuid4()),
-            "stdout": (out or b"").decode("utf-8", errors="replace"),
-            "stderr": (err or b"").decode("utf-8", errors="replace"),
-            "exit_code": exit_code,
-            "duration": round(duration, 3),
-            "timed_out": timed_out,
+            "commands": results,
+            "exit_code": overall_exit,
+            "duration": round(total, 3),
+            "timed_out": any(r["timed_out"] for r in results),
+            "files": collect_tracked(workdir, track) if track else {},
         }
-        if track:
-            result["files"] = collect_tracked(workdir, track)
-        return result, duration
+        return result, total, durations, len(command)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -416,8 +516,8 @@ class Handler(BaseHTTPRequestHandler):
             except (UnicodeDecodeError, ValueError):
                 raise ApiError(400, "INVALID_JSON", "request body is not valid JSON")
             args = validate(body)
-            result, duration = execute(*args)
-            STATS.record(round(duration, 3))
+            result, duration, cmd_durations, cmd_total = execute(*args)
+            STATS.record(round(duration, 3), [round(x, 3) for x in cmd_durations], cmd_total)
             self._send(201, result)
         except ApiError as e:
             self._error(e.status, e.code, e.message)
