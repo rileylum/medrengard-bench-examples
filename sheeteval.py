@@ -1588,6 +1588,80 @@ def check_depends(rule, sheet, where, outcomes, checklist_cells, rep):
     return None
 
 
+def _esc(text):
+    import html as _html
+    return _html.escape("" if text is None else str(text), quote=True)
+
+
+class HtmlReport(object):
+    """Collects structured grading results and renders a standalone HTML5 report."""
+
+    def __init__(self, check_mode=False):
+        self.check_mode = check_mode
+        self.sheets = []
+        self.total = None
+
+    def start_sheet(self, name):
+        sec = {"name": name, "rows": [], "threshold": None, "subtotal": ""}
+        self.sheets.append(sec)
+        return sec
+
+    @staticmethod
+    def _cell_html(coord, concealed):
+        if concealed:
+            return ('[concealed]<span class="hint" style="display:none">%s</span>'
+                    % _esc(coord))
+        return _esc(coord)
+
+    def render(self):
+        if self.check_mode:
+            headers = ("Rule ID", "Cell", "Check Name", "Result", "Fail Message")
+        else:
+            headers = ("Rule ID", "Cell", "Outcome", "Earned", "Possible")
+        out = []
+        out.append("<!DOCTYPE html>")
+        out.append('<html lang="en">')
+        out.append("<head>")
+        out.append('<meta charset="utf-8">')
+        out.append("<title>sheeteval report</title>")
+        out.append("</head>")
+        out.append("<body>")
+        out.append("<h1>sheeteval report</h1>")
+        for sec in self.sheets:
+            out.append('<section class="sheet">')
+            out.append("<h2>%s</h2>" % _esc(sec["name"]))
+            if sec["threshold"] is not None:
+                out.append('<p class="threshold">%s</p>' % _esc(sec["threshold"]))
+            else:
+                out.append("<table>")
+                out.append("<tr>%s</tr>" % "".join("<th>%s</th>" % h for h in headers))
+                for row in sec["rows"]:
+                    if row[0] == "feedback":
+                        out.append('<tr class="feedback"><td colspan="5">%s</td></tr>'
+                                   % _esc(row[1]))
+                    elif row[0] == "rule":
+                        _, rid, coord, concealed, outcome, earned, possible = row
+                        out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+                                   "<td>%s</td></tr>"
+                                   % (_esc(rid), self._cell_html(coord, concealed),
+                                      _esc(outcome), _esc(fmt_num(earned)),
+                                      _esc(fmt_num(possible))))
+                    else:
+                        _, rid, coord, concealed, name, passed, msg = row
+                        out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+                                   "<td>%s</td></tr>"
+                                   % (_esc(rid), self._cell_html(coord, concealed),
+                                      _esc(name), "PASS" if passed else "FAIL",
+                                      _esc(msg) if (not passed and msg is not None) else ""))
+                out.append("</table>")
+            out.append('<p class="subtotal">%s</p>' % _esc(sec["subtotal"]))
+            out.append("</section>")
+        out.append('<p class="total">%s</p>' % _esc(self.total or ""))
+        out.append("</body>")
+        out.append("</html>")
+        return "\n".join(out) + "\n"
+
+
 class SheetBuffer(object):
     """Collects a sheet's per-rule report lines, optionally deferring them."""
 
@@ -1614,7 +1688,7 @@ class SheetBuffer(object):
         self.pending = []
 
 
-def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
+def grade(key_path, sub_path, rep, out, check_mode=False, cout=None, html=None):
     import openpyxl
 
     for p in (key_path, sub_path):
@@ -1689,6 +1763,8 @@ def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
         # Per-rule lines are deferred when a threshold is configured.
         sheet_out = SheetBuffer(out, defer=min_score is not None)
         sheet_out.header("Sheet '%s':" % sheet)
+        hsec = html.start_sheet(sheet) if html is not None else None
+        nsec = hsec if not check_mode else None  # normal-mode HTML rows
         sheet_earned = 0
         sheet_max = 0
         check_lines = []
@@ -1758,6 +1834,8 @@ def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
                 earned = 0
                 outcomes[key] = outcome
                 sheet_out.line("  [SKIPPED] %s %s: 0 / %s" % (coord, label, fmt_num(possible)))
+                if nsec is not None:
+                    nsec["rows"].append(("rule", coord, coord, concealed, outcome, 0, possible))
                 rep.log("%s.%s: %s SKIPPED" % (sheet, coord, kind))
             else:
                 unmet = check_depends(rule, sheet, where, outcomes, checklist_cells, rep)
@@ -1769,6 +1847,9 @@ def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
                     outcomes[key] = outcome
                     sheet_out.line("  [PREREQ] %s %s: 0 / %s (requires %s)"
                                    % (coord, label, fmt_num(possible), unmet))
+                    if nsec is not None:
+                        nsec["rows"].append(("rule", coord, coord, concealed, outcome, 0,
+                                             possible))
                     rep.log("%s.%s: %s PREREQ (requires %s)" % (sheet, coord, kind, unmet))
                 else:
                     tol = get_tolerance(rule, where, rep)
@@ -1824,9 +1905,15 @@ def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
                     outcomes[key] = outcome
                     sheet_out.line("  [%s] %s %s: %s / %s" % (outcome, coord, label,
                                                              fmt_num(earned), fmt_num(possible)))
+                    if nsec is not None:
+                        nsec["rows"].append(("rule", coord, coord, concealed, outcome, earned,
+                                             possible))
                     if outcome == "INCORRECT" and fail_template is not None:
-                        sheet_out.line("    Feedback: %s" % render_template(
-                            fail_template, ctx.expected, ctx.actual, ctx, rep))
+                        fb_text = render_template(
+                            fail_template, ctx.expected, ctx.actual, ctx, rep)
+                        sheet_out.line("    Feedback: %s" % fb_text)
+                        if nsec is not None:
+                            nsec["rows"].append(("feedback", fb_text))
                     if fatal and outcome != "CORRECT":
                         halted = True
 
@@ -1860,6 +1947,7 @@ def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
                 if exp_points is not None and float(cearned) != exp_points:
                     passed = False
                 sheet_checks += 1
+                msg = None
                 if passed:
                     sheet_passed += 1
                     check_lines.append("PASS: %s" % name)
@@ -1867,13 +1955,17 @@ def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
                     check_lines.append("FAIL: %s" % name)
                     tmpl = ft or meta["fail-message"] or fail_template
                     if tmpl is not None:
-                        check_lines.append("    Feedback: %s" % render_template(
-                            tmpl, exp_v, act_v, ctx, rep))
+                        msg = render_template(tmpl, exp_v, act_v, ctx, rep)
+                        check_lines.append("    Feedback: %s" % msg)
+                if hsec is not None:
+                    hsec["rows"].append(("check", coord, coord, concealed, name, passed, msg))
 
         threshold_hit = min_score is not None and sheet_earned < min_score
         if threshold_hit:
             sheet_earned = 0
             sheet_out.replace_rules("  %s" % threshold_message)
+            if hsec is not None:
+                hsec["threshold"] = threshold_message
         if check_mode:
             for ln in check_lines:
                 cout.line(ln)
@@ -1881,18 +1973,38 @@ def grade(key_path, sub_path, rep, out, check_mode=False, cout=None):
                 sheet_passed = 0
                 cout.line(threshold_message)
             cout.line("%s: %d / %d passed" % (sheet, sheet_passed, sheet_checks))
+            if hsec is not None:
+                hsec["subtotal"] = "%s: %d / %d passed" % (sheet, sheet_passed, sheet_checks)
             total_passed += sheet_passed
             total_checks += sheet_checks
+        elif hsec is not None:
+            hsec["subtotal"] = "%s: %s / %s" % (sheet, fmt_num(sheet_earned),
+                                                fmt_num(sheet_max))
         sheet_out.flush()
         out.line("Sheet '%s': %s / %s" % (sheet, fmt_num(sheet_earned), fmt_num(sheet_max)))
         out.line("")
         total_earned += sheet_earned
         total_max += sheet_max
     out.line("Total: %s / %s" % (fmt_num(total_earned), fmt_num(total_max)))
+    if html is not None:
+        if check_mode:
+            html.total = "Total: %d / %d passed" % (total_passed, total_checks)
+        else:
+            html.total = "Total: %s / %s" % (fmt_num(total_earned), fmt_num(total_max))
     if check_mode:
         cout.lines.append("Total: %d / %d passed" % (total_passed, total_checks))
         return total_passed, total_checks
     return total_earned, total_max
+
+
+def write_html(path, html):
+    if not path or html is None:
+        return
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(html.render())
+    except OSError as e:
+        raise FatalError("cannot write HTML file '%s': %s" % (path, e.strerror or e))
 
 
 def main(argv=None):
@@ -1906,6 +2018,7 @@ def main(argv=None):
     parser.add_argument("--log", "-l", action="store_true")
     parser.add_argument("--quiet-warnings", action="store_true")
     parser.add_argument("--check-mode", "-C", action="store_true")
+    parser.add_argument("--html-file")
     args = parser.parse_args(argv)
     rep = Reporter(args.quiet_warnings, args.log)
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
@@ -1913,8 +2026,9 @@ def main(argv=None):
         if args.check_mode:
             out = Output(False)
             cout = Output(args.detailed)
+            html = HtmlReport(check_mode=True) if args.html_file else None
             passed, total = grade(args.answer_key, args.submission, rep, out,
-                                  check_mode=True, cout=cout)
+                                  check_mode=True, cout=cout, html=html)
             if args.report_file:
                 try:
                     with open(args.report_file, "w", encoding="utf-8", newline="\n") as f:
@@ -1926,11 +2040,13 @@ def main(argv=None):
             if args.score_file:
                 with open(args.score_file, "w", encoding="utf-8") as f:
                     f.write("%d\n" % passed)
+            write_html(args.html_file, html)
             sys.stdout.write("Total: %d / %d passed\n" % (passed, total))
             sys.stdout.flush()
             return 0
         out = Output(args.detailed)
-        earned, maximum = grade(args.answer_key, args.submission, rep, out)
+        html = HtmlReport() if args.html_file else None
+        earned, maximum = grade(args.answer_key, args.submission, rep, out, html=html)
         if args.report_file:
             try:
                 with open(args.report_file, "w", encoding="utf-8", newline="\n") as f:
@@ -1942,6 +2058,7 @@ def main(argv=None):
         if args.score_file:
             with open(args.score_file, "w", encoding="utf-8") as f:
                 f.write(fmt_num(earned) + "\n")
+        write_html(args.html_file, html)
         sys.stdout.write("Assignment Score: %s / %s\n" % (fmt_num(earned), fmt_num(maximum)))
         sys.stdout.flush()
         return 0
