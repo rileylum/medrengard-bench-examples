@@ -14,6 +14,15 @@ Usage:
     python sith.py extract-variable <file> <line> <col> --until L:C --name NAME [--diff] [--project DIR]
     python sith.py extract-function <file> <line> <col> --until L:C --name NAME [--diff] [--project DIR]
     python sith.py errors <file>
+    python sith.py context <file> <line> <col> [--project DIR]
+    python sith.py env list
+    python sith.py env find-virtualenvs [--path DIR]
+    python sith.py env info [<executable>]
+    python sith.py project init [<dir>] [--environment EXE] [--sys-path P[,P...]]
+                                [--added-sys-path P[,P...]]
+
+complete/infer/goto/signatures accept --interpreter [--namespaces FILE] (runtime
+namespace fallback); every command accepts --setting key=value (repeatable).
 """
 import ast
 import builtins
@@ -513,6 +522,18 @@ class RealInst(object):
         self.values = values  # thunk -> list of mapping values (dicts)
 
 
+class NsVal(object):
+    """A value described by an interpreter namespace (runtime fallback)."""
+    def __init__(self, key, entry):
+        self.key = key
+        self.entry = entry
+
+    @property
+    def typ(self):
+        t = self.entry.get('type')
+        return t if isinstance(t, str) and t else 'object'
+
+
 def wrap_real(obj, name=None):
     if inspect.ismodule(obj):
         return ModVal(name or getattr(obj, '__name__', ''), real=obj)
@@ -555,6 +576,8 @@ def val_key(v):
         return ('mod', v.name)
     if isinstance(v, RealVal):
         return ('obj', id(v.obj))
+    if isinstance(v, NsVal):
+        return ('ns', v.key, id(v.entry))
     return ('?', id(v))
 
 
@@ -619,6 +642,8 @@ def none_inst():
 def describe(val, name):
     if val is None:
         return 'statement', 'statement'
+    if isinstance(val, NsVal):
+        return val.typ, '%s (runtime)' % val.typ
     if isinstance(val, ModVal):
         return 'module', 'module %s' % name
     if isinstance(val, ClassVal):
@@ -1023,9 +1048,10 @@ class ModuleInfo(object):
             return mv
         if not dotted:
             return None
-        mv = self._local_module(_root(), dotted, display)
-        if mv is not None:
-            return mv
+        for base in search_roots():
+            mv = self._local_module(base, dotted, display)
+            if mv is not None:
+                return mv
         sp = find_stub_only(dotted)
         if sp is not None:
             mi = load_local_module(sp, dotted)
@@ -1643,6 +1669,8 @@ def _call_targets(fnode, s):
 
 def callsite_param_vals(d):
     """Dynamic parameter inference: union of argument types at call sites in the same file."""
+    if not SETTINGS['dynamic_params']:
+        return []
     fnode, idx, pkind = d.extra
     s = d.scope
     mi = s.module
@@ -1913,10 +1941,16 @@ def infer_name_vals(name, scope, pos):
         out = []
         for d in ds:
             out.extend(infer_def_vals(d))
+        if not out:
+            nv = ns_value(name)
+            if nv is not None:
+                return [nv]
         return uniq(out)
     if name == PLACEHOLDER:
         return []
     v = builtin_value(name)
+    if v is None:
+        v = ns_value(name)
     return [v] if v is not None else []
 
 
@@ -3027,6 +3061,8 @@ def attributes(v):
         return res
     if isinstance(v, FuncVal):
         return attributes(RealInst(types.FunctionType))
+    if isinstance(v, NsVal):
+        return ns_attributes(v)
     return []
 
 
@@ -3070,6 +3106,11 @@ def attr_vals(v, name):
         return (True, [wrap_real(o, name)]) if ok2 else (False, [])
     if isinstance(v, FuncVal):
         return attr_vals(RealInst(types.FunctionType), name)
+    if isinstance(v, NsVal):
+        for n, x in ns_attributes(v):
+            if n == name:
+                return True, [x] if x is not None else []
+        return False, []
     return False, []
 
 
@@ -3280,8 +3321,11 @@ def scope_by_indent(tree, node_scope, module_scope, lines, line_no, col):
 def matches(name, prefix, fuzzy):
     if not prefix:
         return True
-    n = name.lower()
-    p = prefix.lower()
+    if SETTINGS['case_insensitive']:
+        n = name.lower()
+        p = prefix.lower()
+    else:
+        n, p = name, prefix
     if not fuzzy:
         return n.startswith(p)
     i = 0
@@ -3412,7 +3456,8 @@ def _module_entry_list(mi, level, dotted):
             names |= list_modules_in(base)
         return sorted(names)
     if not base_parts:
-        names |= list_modules_in(_root())
+        for base in search_roots():
+            names |= list_modules_in(base)
         names |= set(n for n in stdlib_names() if _is_ident(n))
         return sorted(names)
     mv = mi.resolve_import('.'.join(base_parts), 0)
@@ -3620,6 +3665,14 @@ def complete(path, line_no, col, fuzzy):
             ok, obj = safe_getattr(builtins, name)
             typ, desc = describe(wrap_real(obj, name) if ok else None, name)
             results.append((name, typ, desc, False))
+        for name, entry in ns_items():
+            if name in seen or name == PLACEHOLDER:
+                continue
+            seen.add(name)
+            if not matches(name, prefix, fuzzy):
+                continue
+            typ, desc = describe(NsVal(name, entry), name)
+            results.append((name, typ, desc, False))
         for kw in keyword.kwlist:
             if matches(kw, prefix, fuzzy):
                 results.append((kw, 'keyword', kw, True))
@@ -3627,7 +3680,10 @@ def complete(path, line_no, col, fuzzy):
     results.sort(key=lambda r: (group_of(r[0], r[3]), r[0].lower(), r[0]))
     out = []
     for name, typ, desc, _ in results:
-        out.append({'name': name, 'complete': name[len(prefix):], 'type': typ,
+        comp = name[len(prefix):]
+        if SETTINGS['add_bracket'] and typ in ('function', 'class'):
+            comp += '('
+        out.append({'name': name, 'complete': comp, 'type': typ,
                     'description': desc})
     return out
 
@@ -3727,6 +3783,12 @@ def module_name_of(mi):
         return mi.qual_name
     path = os.path.abspath(mi.path)
     root = _root()
+    best = None
+    for base in [root] + search_roots():
+        if path.startswith(base.rstrip(os.sep) + os.sep) and (best is None or len(base) > len(best)):
+            best = base
+    if best is not None:
+        root = best
     rel = os.path.relpath(path, root)
     if rel.startswith('..'):
         if mi.name and mi.name != '__main__':
@@ -3963,6 +4025,8 @@ def val_out(v):
         return real_type_out(v.typ)
     if isinstance(v, RealVal):
         return real_obj_out(v.obj)
+    if isinstance(v, NsVal):
+        return ns_out(v)
     return None
 
 
@@ -3976,7 +4040,7 @@ def _value_type(vals, default):
             return 'function'
         if isinstance(v, (InstVal, RealInst)):
             return 'instance'
-        if isinstance(v, RealVal):
+        if isinstance(v, (RealVal, NsVal)):
             return describe(v, '')[0]
     return default
 
@@ -4474,6 +4538,9 @@ def navigate(mi, occ, parents, mode):
             ds = lookup_defs(node.id, s, _start(node))
             if not ds:
                 b = builtin_out(node.id)
+                if b is None:
+                    nv = ns_value(node.id)
+                    b = ns_out(nv) if nv is not None else None
                 return [b] if b else []
             return _defs_outs(ds)
         return _vals_outs(infer_vals(node, s, _start(node)))
@@ -5016,6 +5083,8 @@ def value_sigs(v):
         return out
     if isinstance(v, RealVal):
         return real_sigs(v.obj)
+    if isinstance(v, NsVal):
+        return ns_sigs(v)
     return []
 
 
@@ -6665,6 +6734,546 @@ def syntax_errors(path):
     return errors
 
 
+# ---------------------------------------------------------------------------
+# Settings, project configuration and interpreter namespaces
+# ---------------------------------------------------------------------------
+
+SETTING_DEFAULTS = {'case_insensitive': True, 'dynamic_params': True,
+                    'smart_sys_path': True, 'add_bracket': False}
+SETTINGS = dict(SETTING_DEFAULTS)
+
+CONFIG_DEFAULTS = {'environment_path': '', 'sys_path': [], 'added_sys_path': [],
+                   'smart_sys_path': True}
+_CONFIG = {}
+_TARGET_FILE = [None]
+_NAMESPACES = [None]  # list of dicts, or None when interpreter mode is off
+
+
+def parse_bool(text):
+    if isinstance(text, bool):
+        return text
+    if isinstance(text, str):
+        t = text.strip().lower()
+        if t == 'true':
+            return True
+        if t == 'false':
+            return False
+    raise ValueError(text)
+
+
+def config_path(root):
+    return os.path.join(root, '.sith', 'project.json')
+
+
+def read_config(root):
+    """Raw project configuration dict of `root` ({} if absent or unreadable)."""
+    p = config_path(root)
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, 'rb') as f:
+            data = json.loads(f.read().decode('utf-8'))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _str_list(v):
+    if isinstance(v, str):
+        return [x for x in v.split(',') if x]
+    if isinstance(v, list):
+        return [x for x in v if isinstance(x, str) and x]
+    return []
+
+
+def apply_config(root, cli_settings):
+    """Load the project config of `root` and compute the effective settings."""
+    global _CONFIG
+    raw = read_config(root)
+    cfg = dict(CONFIG_DEFAULTS)
+    env = raw.get('environment_path')
+    cfg['environment_path'] = env if isinstance(env, str) else ''
+    cfg['sys_path'] = _str_list(raw.get('sys_path'))
+    cfg['added_sys_path'] = _str_list(raw.get('added_sys_path'))
+    _CONFIG = cfg
+    SETTINGS.clear()
+    SETTINGS.update(SETTING_DEFAULTS)
+    sources = [raw]
+    if isinstance(raw.get('settings'), dict):
+        sources.append(raw['settings'])
+    for src in sources:
+        for k in SETTING_DEFAULTS:
+            if k in src:
+                try:
+                    SETTINGS[k] = parse_bool(src[k])
+                except ValueError:
+                    pass
+    SETTINGS.update(cli_settings)
+
+
+def _abs_in_root(p):
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.join(_root(), p)
+    return os.path.normpath(os.path.abspath(p))
+
+
+_roots_cache = {}
+
+
+def search_roots():
+    """Directories searched (in order) for absolute imports of project modules."""
+    key = (_root(), _TARGET_FILE[0], SETTINGS['smart_sys_path'], tuple(_CONFIG.get('sys_path', ())),
+           tuple(_CONFIG.get('added_sys_path', ())))
+    if key not in _roots_cache:
+        _roots_cache.clear()
+        _roots_cache[key] = _search_roots()
+    return _roots_cache[key]
+
+
+def _search_roots():
+    roots = []
+    if _CONFIG.get('sys_path'):
+        roots.extend(_abs_in_root(p) for p in _CONFIG['sys_path'])
+    elif SETTINGS['smart_sys_path']:
+        root = _root()
+        roots.append(root)
+        tf = _TARGET_FILE[0]
+        if tf:
+            d = os.path.dirname(os.path.abspath(tf))
+            top = None
+            while os.path.isfile(os.path.join(d, '__init__.py')):
+                parent = os.path.dirname(d)
+                if parent == d:
+                    break
+                d = parent
+                top = d
+            if top is not None:
+                roots.append(top)
+    roots.extend(_abs_in_root(p) for p in _CONFIG.get('added_sys_path', ()))
+    out = []
+    for r in roots:
+        if r not in out:
+            out.append(r)
+    return out
+
+
+def load_namespaces(path):
+    try:
+        with open(path, 'rb') as f:
+            data = json.loads(f.read().decode('utf-8'))
+    except OSError as e:
+        raise SithError('cannot read namespaces file: %s' % e)
+    except (ValueError, UnicodeDecodeError) as e:
+        raise SithError('invalid namespaces file: %s' % e)
+    if not isinstance(data, list) or not all(isinstance(x, dict) for x in data):
+        raise SithError('namespaces file must contain a JSON array of objects')
+    out = []
+    for ns in data:
+        clean = {}
+        for k, v in ns.items():
+            if isinstance(v, str):
+                v = {'type': v}
+            if isinstance(v, dict):
+                clean[k] = v
+        out.append(clean)
+    return out
+
+
+def ns_items():
+    """(name, entry) for every runtime name, first namespace wins."""
+    if not _NAMESPACES[0]:
+        return []
+    seen = set()
+    out = []
+    for ns in _NAMESPACES[0]:
+        for k, v in ns.items():
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append((k, v))
+    return out
+
+
+def ns_value(name):
+    if not _NAMESPACES[0] or name == PLACEHOLDER:
+        return None
+    for ns in _NAMESPACES[0]:
+        if name in ns:
+            return NsVal(name, ns[name])
+    return None
+
+
+def _ns_real(v):
+    """Statically known counterpart of a runtime value (or None)."""
+    e = v.entry
+    t = v.typ
+    if t == 'module':
+        for cand in (e.get('name'), e.get('module'), v.key):
+            if isinstance(cand, str) and cand and is_stdlib(cand):
+                mod = real_import(cand)
+                if mod is not None:
+                    return ModVal(v.key, real=mod)
+        return None
+    if t in ('class', 'function'):
+        mod = e.get('module')
+        nm = e.get('name') or v.key
+        if isinstance(mod, str) and mod and is_stdlib(mod) and isinstance(nm, str):
+            m = real_import(mod)
+            if m is not None:
+                ok, o = safe_getattr(m, nm)
+                if ok:
+                    return wrap_real(o, v.key)
+        return None
+    ok, typ = safe_getattr(builtins, t)
+    if ok and inspect.isclass(typ):
+        return RealInst(typ)
+    return None
+
+
+def ns_attributes(v):
+    real = _ns_real(v)
+    real_pairs = attributes(real) if real is not None else []
+    attrs = v.entry.get('attributes')
+    if not isinstance(attrs, list):
+        return real_pairs
+    rmap = dict(real_pairs)
+    out = []
+    seen = set()
+    for a in attrs:
+        if not isinstance(a, str) or a in seen:
+            continue
+        seen.add(a)
+        x = rmap.get(a)
+        out.append((a, x if x is not None else NsVal(a, {'type': 'instance'})))
+    return out
+
+
+def ns_out(v):
+    e = v.entry
+    t = v.typ
+    orig = e.get('name') if isinstance(e.get('name'), str) and e.get('name') else v.key
+    mod = e.get('module') if isinstance(e.get('module'), str) else ''
+    full = (mod + '.' + orig) if mod and t != 'module' else (mod or orig)
+    doc = e.get('value') if isinstance(e.get('value'), str) else ''
+    return mk(v.key, t, full, '', 0, 0, '%s (runtime)' % t, doc)
+
+
+def ns_sigs(v):
+    import re
+    if v.typ not in ('function', 'class', 'method', 'builtin_function_or_method', 'type',
+                     'builtin_function', 'lambda'):
+        real = _ns_real(v)
+        return value_sigs(real) if real is not None and not isinstance(real, RealInst) else []
+    real = _ns_real(v)
+    if real is not None:
+        sg = value_sigs(real)
+        if sg:
+            return sg
+    doc = v.entry.get('value') if isinstance(v.entry.get('value'), str) else ''
+    params = []
+    m = re.match(r'\s*(?:async\s+)?(?:def\s+|class\s+)?[\w.]*\s*\((.*)\)', doc or '', re.S)
+    if m:
+        try:
+            fn = ast.parse('def _f(%s): pass' % m.group(1)).body[0]
+            a = fn.args
+            allpos = list(a.posonlyargs) + list(a.args)
+            nd = len(a.defaults)
+
+            def fmt(p, d):
+                ann = ast.unparse(p.annotation) if p.annotation is not None else ''
+                return _fmt_param(p.arg, ann, ast.unparse(d) if d is not None else None)
+            for i, p in enumerate(allpos):
+                d = a.defaults[i - (len(allpos) - nd)] if i >= len(allpos) - nd else None
+                params.append(SigParam(fmt(p, d), 'posonly' if p in a.posonlyargs else 'pos', p.arg))
+            if a.vararg:
+                params.append(SigParam(fmt(ast.arg(arg='*' + a.vararg.arg, annotation=a.vararg.annotation),
+                                           None), 'var', a.vararg.arg))
+            for p, d in zip(a.kwonlyargs, a.kw_defaults):
+                params.append(SigParam(fmt(p, d), 'kwonly', p.arg))
+            if a.kwarg:
+                params.append(SigParam(fmt(ast.arg(arg='**' + a.kwarg.arg, annotation=a.kwarg.annotation),
+                                           None), 'kw', a.kwarg.arg))
+        except SyntaxError:
+            params = []
+    if v.typ == 'class' and params and params[0].name == 'self':
+        params = params[1:]
+    return [_sig(v.key, params, '', doc, '', 0)]
+
+
+# ---------------------------------------------------------------------------
+# Python environments
+# ---------------------------------------------------------------------------
+
+_PROBE = ('import sys, json, platform\n'
+          'print(json.dumps({"version": platform.python_version(), "prefix": sys.prefix,'
+          ' "base_prefix": getattr(sys, "base_prefix", getattr(sys, "real_prefix", sys.prefix)),'
+          ' "real_prefix": hasattr(sys, "real_prefix"), "sys_path": sys.path,'
+          ' "executable": sys.executable}))\n')
+
+_probe_cache = {}
+
+
+def probe_python(exe):
+    """Run `exe` to collect environment information; None if not a usable Python."""
+    import subprocess
+    exe = os.path.abspath(exe)
+    if exe in _probe_cache:
+        return _probe_cache[exe]
+    info = None
+    if os.path.isfile(exe) and os.access(exe, os.X_OK):
+        try:
+            env = dict(os.environ)
+            for k in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP'):
+                env.pop(k, None)
+            r = subprocess.run([exe, '-c', _PROBE], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=15, env=env, cwd=os.path.dirname(exe) or None)
+            if r.returncode == 0:
+                lines = r.stdout.decode('utf-8', 'replace').strip().splitlines()
+                data = json.loads(lines[-1]) if lines else None
+                if isinstance(data, dict) and isinstance(data.get('version'), str):
+                    info = data
+        except Exception:
+            info = None
+    _probe_cache[exe] = info
+    return info
+
+
+def _is_venv_info(exe, info):
+    if info.get('real_prefix') or info.get('prefix') != info.get('base_prefix'):
+        return True
+    d = os.path.dirname(os.path.dirname(os.path.abspath(exe)))
+    return os.path.isfile(os.path.join(d, 'pyvenv.cfg'))
+
+
+def env_entry(exe, info, extra=False):
+    out = {'executable': os.path.abspath(exe), 'version': info['version'],
+           'is_virtualenv': bool(_is_venv_info(exe, info))}
+    if extra:
+        out['prefix'] = info.get('prefix') or ''
+        out['sys_path'] = [p for p in (info.get('sys_path') or []) if isinstance(p, str)]
+    return out
+
+
+def _version_key(v):
+    import re
+    parts = []
+    for x in re.split(r'[.+-]', v):
+        m = re.match(r'(\d+)', x)
+        parts.append(int(m.group(1)) if m else -1)
+    return tuple(parts)
+
+
+def sort_envs(envs):
+    envs.sort(key=lambda e: e['executable'])
+    envs.sort(key=lambda e: _version_key(e['version']), reverse=True)
+    return envs
+
+
+def _python_names_in(d):
+    import re
+    out = []
+    try:
+        entries = sorted(os.listdir(d))
+    except OSError:
+        return out
+    rx = re.compile(r'^python(\d+(\.\d+)?)?(\.exe)?$', re.I)
+    for e in entries:
+        if rx.match(e):
+            p = os.path.join(d, e)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                out.append(p)
+    return out
+
+
+def env_list():
+    cands = []
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        if d:
+            cands.extend(_python_names_in(d))
+    if sys.executable:
+        cands.append(sys.executable)
+    for d in ('/usr/bin', '/usr/local/bin', '/opt/homebrew/bin', '/bin'):
+        cands.extend(_python_names_in(d))
+    groups = {}
+    order = []
+    for c in cands:
+        c = os.path.abspath(c)
+        key = os.path.normcase(os.path.realpath(c))
+        try:
+            st = os.stat(c)
+            key = (st.st_dev, st.st_ino)
+        except OSError:
+            pass
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        if c not in groups[key]:
+            groups[key].append(c)
+    envs = []
+    for key in order:
+        members = groups[key]
+        # Prefer the canonical (non-symlinked) location when available.
+        canon = [m for m in members if os.path.normcase(m) == os.path.normcase(os.path.realpath(m))]
+        chosen = None
+        for m in canon + members:
+            info = probe_python(m)
+            if info is not None:
+                chosen = (m, info)
+                break
+        if chosen:
+            envs.append(env_entry(chosen[0], chosen[1]))
+    return sort_envs(envs)
+
+
+def _venv_python(d):
+    for rel in (('bin', 'python'), ('bin', 'python3'), ('Scripts', 'python.exe')):
+        p = os.path.join(d, *rel)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def find_virtualenvs(path=None):
+    dirs = []
+    if path is not None:
+        if not os.path.isdir(path):
+            raise SithError('directory does not exist: %s' % path)
+        try:
+            for e in sorted(os.listdir(path)):
+                dirs.append(os.path.join(path, e))
+        except OSError:
+            pass
+    home = os.path.expanduser('~/.virtualenvs')
+    if os.path.isdir(home):
+        try:
+            for e in sorted(os.listdir(home)):
+                dirs.append(os.path.join(home, e))
+        except OSError:
+            pass
+    for base in (os.getcwd(), _root()):
+        for n in ('.venv', 'venv'):
+            dirs.append(os.path.join(base, n))
+    envs = []
+    seen = set()
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        exe = _venv_python(d)
+        if exe is None:
+            continue
+        exe = os.path.abspath(exe)
+        key = os.path.normcase(os.path.join(os.path.realpath(os.path.dirname(exe)),
+                                            os.path.basename(exe)))
+        if key in seen:
+            continue
+        seen.add(key)
+        info = probe_python(exe)
+        if info is None:
+            continue
+        ent = env_entry(exe, info)
+        if not ent['is_virtualenv']:
+            continue
+        envs.append(ent)
+    return sort_envs(envs)
+
+
+def env_info(exe=None):
+    import shutil
+    if not exe:
+        exe = _CONFIG.get('environment_path') or 'python3'
+        if exe != 'python3':
+            exe = _abs_in_root(exe) if not os.path.isabs(os.path.expanduser(exe)) and \
+                os.sep in exe else os.path.expanduser(exe)
+    path = None
+    if os.path.isfile(exe):
+        path = exe
+    elif os.sep not in exe and (os.altsep is None or os.altsep not in exe):
+        path = shutil.which(exe)
+        if path is None and exe == 'python3':
+            path = shutil.which('python') or sys.executable
+    if not path:
+        raise SithError('python executable not found: %s' % exe)
+    info = probe_python(path)
+    if info is None:
+        raise SithError('not a valid python executable: %s' % exe)
+    return env_entry(path, info, extra=True)
+
+
+# ---------------------------------------------------------------------------
+# Project configuration: project init
+# ---------------------------------------------------------------------------
+
+def project_init(d, updates):
+    d = os.path.abspath(d)
+    if os.path.exists(d) and not os.path.isdir(d):
+        raise SithError('not a directory: %s' % d)
+    cdir = os.path.join(d, '.sith')
+    p = config_path(d)
+    existing = {}
+    if os.path.isfile(p):
+        try:
+            with open(p, 'rb') as f:
+                existing = json.loads(f.read().decode('utf-8'))
+        except Exception:
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+    cfg = dict(CONFIG_DEFAULTS)
+    cfg['sys_path'] = []
+    cfg['added_sys_path'] = []
+    cfg.update(existing)
+    cfg.update(updates)
+    try:
+        os.makedirs(cdir, exist_ok=True)
+        tmp = p + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+        os.replace(tmp, p)
+    except OSError as e:
+        raise SithError('cannot write project configuration: %s' % e)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# context
+# ---------------------------------------------------------------------------
+
+def scope_context(path, line_no, col):
+    reset_state()
+    source = read_source(path)
+    lines = [l[:-1] if l.endswith('\r') else l for l in source.split('\n')]
+    if line_no < 1 or line_no > len(lines):
+        raise SithError('line out of range')
+    cur = lines[line_no - 1]
+    if col < 0 or col > len(cur):
+        raise SithError('column out of range')
+    tree, _, _ = fix_and_parse(lines)
+    apath = os.path.abspath(path)
+    mi = ModuleInfo(apath, os.path.splitext(os.path.basename(apath))[0])
+    mi.lines = lines
+    mi.set_tree(tree)
+    s = scope_by_indent(tree, mi.node_scope, mi.scope, lines, line_no, col)
+    out = []
+    while s is not None and s.kind != 'module':
+        if s.kind in ('function', 'class') and isinstance(s.node, FUNC_TYPES + (ast.ClassDef,)):
+            n = s.node
+            out.append({'name': n.name, 'type': 'class' if isinstance(n, ast.ClassDef) else 'function',
+                        'line': n.lineno, 'column': _char_col_of(lines, n.lineno, n.col_offset)})
+        s = s.parent
+    out.reverse()
+    return out
+
+
+def _char_col_of(lines, lineno, bcol):
+    try:
+        return len(lines[lineno - 1].encode('utf-8')[:bcol].decode('utf-8', 'replace'))
+    except IndexError:
+        return bcol
+
+
 USAGE = ('usage: sith.py complete <file> <line> <col> [--fuzzy] [--project DIR]\n'
          '       sith.py infer <file> <line> <col> [--project DIR]\n'
          '       sith.py goto <file> <line> <col> [--follow-imports] [--project DIR]\n'
@@ -6676,13 +7285,24 @@ USAGE = ('usage: sith.py complete <file> <line> <col> [--fuzzy] [--project DIR]\
          '       sith.py inline <file> <line> <col> [--diff] [--project DIR]\n'
          '       sith.py extract-variable <file> <line> <col> --until L:C --name NAME [--diff] [--project DIR]\n'
          '       sith.py extract-function <file> <line> <col> --until L:C --name NAME [--diff] [--project DIR]\n'
-         '       sith.py errors <file>\n')
+         '       sith.py errors <file>\n'
+         '       sith.py context <file> <line> <col> [--project DIR]\n'
+         '       sith.py env list\n'
+         '       sith.py env find-virtualenvs [--path DIR]\n'
+         '       sith.py env info [<executable>]\n'
+         '       sith.py project init [<dir>] [--environment EXE] [--sys-path P[,P...]]'
+         ' [--added-sys-path P[,P...]]\n'
+         'analysis commands accept --interpreter [--namespaces FILE];'
+         ' all commands accept --setting key=value\n')
 
 _ARITY = {'complete': 4, 'infer': 4, 'goto': 4, 'signatures': 4, 'references': 4,
           'search': 2, 'names': 2, 'rename': 4, 'inline': 4, 'extract-variable': 4,
-          'extract-function': 4, 'errors': 2}
+          'extract-function': 4, 'errors': 2, 'context': 4}
 
-_VALUE_OPTS = ('--project', '--scope', '--new-name', '--name', '--until')
+_VALUE_OPTS = ('--project', '--scope', '--new-name', '--name', '--until', '--namespaces',
+               '--path', '--environment', '--sys-path', '--added-sys-path', '--smart-sys-path')
+_MULTI_OPTS = ('--setting',)
+_ANALYSIS_CMDS = ('complete', 'infer', 'goto', 'signatures')
 
 
 def _emit(obj):
@@ -6703,12 +7323,28 @@ def main(argv):
     scope = 'file'
     all_scopes = False
     diff = False
+    interpreter = False
     opts = {}
+    multi = {'--setting': []}
     rest = []
+    _FOLLOW[0] = False
+    _NAMESPACES[0] = None
+    _TARGET_FILE[0] = None
     i = 0
     while i < len(args):
         a = args[i]
-        if a == '--fuzzy':
+        if a == '--interpreter':
+            interpreter = True
+        elif a in _MULTI_OPTS:
+            if i + 1 >= len(args):
+                sys.stderr.write(USAGE)
+                return 1
+            multi[a].append(args[i + 1])
+            i += 1
+        elif '=' in a and a.split('=', 1)[0] in _MULTI_OPTS:
+            k, v = a.split('=', 1)
+            multi[k].append(v)
+        elif a == '--fuzzy':
             fuzzy = True
         elif a == '--follow-imports':
             _FOLLOW[0] = True
@@ -6731,6 +7367,27 @@ def main(argv):
     args = rest
     project = opts.get('--project', project)
     scope = opts.get('--scope', scope)
+    # --setting key=value
+    cli_settings = {}
+    for kv in multi['--setting']:
+        if '=' not in kv:
+            sys.stderr.write('error: invalid setting (expected key=value): %s\n' % kv)
+            return 1
+        k, v = kv.split('=', 1)
+        k = k.strip()
+        if k not in SETTING_DEFAULTS:
+            sys.stderr.write('error: unknown setting: %s\n' % k)
+            return 1
+        try:
+            cli_settings[k] = parse_bool(v)
+        except ValueError:
+            sys.stderr.write('error: invalid value for setting %s: %s\n' % (k, v))
+            return 1
+    if '--namespaces' in opts and not interpreter:
+        sys.stderr.write('error: --namespaces requires --interpreter\n')
+        return 1
+    if args and args[0] in ('env', 'project'):
+        return _main_env_project(args, opts, project, cli_settings)
     if not args or args[0] not in _ARITY or len(args) != _ARITY[args[0]]:
         sys.stderr.write(USAGE)
         return 1
@@ -6755,8 +7412,19 @@ def main(argv):
         _PROJECT_ROOT = os.getcwd()
     else:
         _PROJECT_ROOT = os.path.dirname(os.path.abspath(args[1]))
+    if cmd != 'search':
+        _TARGET_FILE[0] = args[1]
+    apply_config(_root(), cli_settings)
+    if interpreter and '--namespaces' in opts and cmd in _ANALYSIS_CMDS:
+        try:
+            _NAMESPACES[0] = load_namespaces(opts['--namespaces'])
+        except SithError as e:
+            sys.stderr.write('error: %s\n' % e)
+            return 1
     try:
-        if cmd == 'complete':
+        if cmd == 'context':
+            _emit({'context': scope_context(args[1], line_no, col)})
+        elif cmd == 'complete':
             _emit({'completions': complete(args[1], line_no, col, fuzzy)})
         elif cmd in ('infer', 'goto'):
             _emit({'definitions': navigate_file(args[1], line_no, col, cmd)})
@@ -6803,6 +7471,56 @@ def main(argv):
         sys.stderr.write('error: %s\n' % e)
         return 1
     return 0
+
+
+def _main_env_project(args, opts, project, cli_settings):
+    global _PROJECT_ROOT
+    if len(args) < 2:
+        sys.stderr.write(USAGE)
+        return 1
+    cmd, sub = args[0], args[1]
+    extra = args[2:]
+    if project:
+        if not os.path.isdir(project):
+            sys.stderr.write('error: project directory does not exist: %s\n' % project)
+            return 1
+        _PROJECT_ROOT = os.path.abspath(project)
+    else:
+        _PROJECT_ROOT = os.getcwd()
+    try:
+        if cmd == 'env':
+            apply_config(_root(), cli_settings)
+            if sub == 'list' and not extra:
+                _emit({'environments': env_list()})
+            elif sub == 'find-virtualenvs' and not extra:
+                _emit({'environments': find_virtualenvs(opts.get('--path'))})
+            elif sub == 'info' and len(extra) <= 1:
+                _emit(env_info(extra[0] if extra else None))
+            else:
+                sys.stderr.write(USAGE)
+                return 1
+            return 0
+        if sub != 'init' or len(extra) > 1:
+            sys.stderr.write(USAGE)
+            return 1
+        target = extra[0] if extra else (project or os.getcwd())
+        updates = {}
+        if '--environment' in opts:
+            updates['environment_path'] = opts['--environment']
+        if '--sys-path' in opts:
+            updates['sys_path'] = _str_list(opts['--sys-path'])
+        if '--added-sys-path' in opts:
+            updates['added_sys_path'] = _str_list(opts['--added-sys-path'])
+        if '--smart-sys-path' in opts:
+            try:
+                updates['smart_sys_path'] = parse_bool(opts['--smart-sys-path'])
+            except ValueError:
+                raise SithError('invalid value for --smart-sys-path: %s' % opts['--smart-sys-path'])
+        _emit(project_init(target, updates))
+        return 0
+    except SithError as e:
+        sys.stderr.write('error: %s\n' % e)
+        return 1
 
 
 if __name__ == '__main__':
