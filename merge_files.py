@@ -6,6 +6,10 @@ reconciles their schemas (explicit or inferred), casts values, and writes a
 single CSV globally sorted by a composite key.  Sorting is done with a
 bounded-memory external merge sort; all inputs are streamed.
 
+With --partition-by / --max-rows-per-file / --max-bytes-per-file the output
+is a directory (written atomically via a sibling temp directory) containing
+Hive-style <col>=<val>/ partition directories and/or part-NNNNN.csv shards.
+
 Exit codes:
   0  success
   1  unexpected / I/O failure
@@ -985,6 +989,7 @@ def process(args):
                              % (args.temp_dir, e))
     tmpdir = tempfile.mkdtemp(prefix="merge_files_", dir=args.temp_dir)
     out_tmp = None
+    out_tmp_dir = None
     try:
         sources = open_sources(args, tmpdir)
         null_literal = args.csv_null_literal
@@ -1009,6 +1014,22 @@ def process(args):
                 raise MergeError(EXIT_KEY,
                                  "key column %r not present in resolved schema" % k)
         key_pos = [name_pos[k] for k in key_cols]
+
+        part_cols = []
+        if args.partition_by is not None:
+            for c in args.partition_by.split(","):
+                c = c.strip()
+                if c == "":
+                    raise MergeError(EXIT_USAGE, "invalid --partition-by specification: %r"
+                                     % args.partition_by)
+                if c not in part_cols:
+                    part_cols.append(c)
+            for c in part_cols:
+                if c not in name_pos:
+                    raise MergeError(EXIT_KEY, "partition column %r not present in "
+                                     "resolved schema" % c)
+        part_pos = [name_pos[c] for c in part_cols]
+        part_prefix = [encode_segment(c) + "=" for c in part_cols]
 
         mem_bytes = max(1, args.memory_limit_mb) * 1024 * 1024
         chunk_budget = max(256 * 1024, int(mem_bytes * 0.25))
@@ -1050,6 +1071,14 @@ def process(args):
                     out_row[j] = format_value(typ, cv)
                     key_vals[j] = (1, key_component(typ, cv))
                 key = tuple([key_vals[p] for p in key_pos])
+                if part_pos:
+                    segs = []
+                    for pre, p in zip(part_prefix, part_pos):
+                        if key_vals[p] is null_key:
+                            segs.append(pre + "_null")
+                        else:
+                            segs.append(pre + encode_segment(out_row[p]))
+                    key = ("/".join(segs),) + key
                 buf.append(Record(key, seq, out_row))
                 seq += 1
                 buf_size += row_size_estimate(out_row, key)
@@ -1076,7 +1105,12 @@ def process(args):
             streams.append(iter(buf))
         stream = merge_iters(streams, args.desc)
 
-        if args.output == "-":
+        if partitioned_mode(args):
+            out_tmp_dir = make_temp_output_dir(args.output)
+            write_partitioned(out_tmp_dir, names, stream, args, bool(part_pos))
+            commit_output_dir(out_tmp_dir, args.output)
+            out_tmp_dir = None
+        elif args.output == "-":
             out = sys.stdout
             try:
                 out.reconfigure(newline="")
@@ -1093,11 +1127,168 @@ def process(args):
             out_tmp = None
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        if out_tmp_dir is not None:
+            shutil.rmtree(out_tmp_dir, ignore_errors=True)
         if out_tmp is not None:
             try:
                 os.remove(out_tmp)
             except OSError:
                 pass
+
+
+_SAFE_CHARS = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+
+
+def encode_segment(s):
+    """Percent-encode UTF-8 bytes outside [A-Za-z0-9._-]."""
+    out = []
+    for b in s.encode("utf-8"):
+        if b in _SAFE_CHARS:
+            out.append(chr(b))
+        else:
+            out.append("%%%02X" % b)
+    return "".join(out)
+
+
+def partitioned_mode(args):
+    return (args.partition_by is not None or args.max_rows_per_file is not None
+            or args.max_bytes_per_file is not None)
+
+
+def make_temp_output_dir(output):
+    final = os.path.abspath(output)
+    if os.path.exists(final) and not os.path.isdir(final):
+        raise MergeError(EXIT_USAGE, "--output %s exists and is not a directory"
+                         % output)
+    parent = os.path.dirname(final)
+    try:
+        os.makedirs(parent, exist_ok=True)
+        return tempfile.mkdtemp(prefix="." + os.path.basename(final) + ".tmp-",
+                                dir=parent)
+    except OSError as e:
+        raise MergeError(EXIT_GENERIC, "cannot create output directory %s: %s"
+                         % (output, e))
+
+
+def commit_output_dir(tmp, output):
+    final = os.path.abspath(output)
+    if os.path.isdir(final):
+        # Move the old directory aside, swap in the new one, then discard.
+        parent = os.path.dirname(final)
+        old = tempfile.mkdtemp(prefix="." + os.path.basename(final) + ".old-",
+                               dir=parent)
+        os.rmdir(old)
+        os.rename(final, old)
+        try:
+            os.rename(tmp, final)
+        except OSError:
+            os.rename(old, final)
+            raise
+        shutil.rmtree(old, ignore_errors=True)
+    else:
+        os.rename(tmp, final)
+
+
+def csv_writer_kwargs(args):
+    kw = {"delimiter": ",", "quotechar": args.csv_quotechar,
+          "lineterminator": "\n", "quoting": csv.QUOTE_MINIMAL}
+    if args.csv_escapechar is not None:
+        kw["escapechar"] = args.csv_escapechar
+        kw["doublequote"] = False
+    else:
+        kw["doublequote"] = True
+    return kw
+
+
+class ShardWriter(object):
+    """Writes part-NNNNN.csv files in one directory honoring size limits."""
+
+    def __init__(self, directory, header_bytes, max_rows, max_bytes):
+        self.dir = directory
+        self.header = header_bytes
+        self.max_rows = max_rows
+        self.max_bytes = max_bytes
+        self.index = 0
+        self.f = None
+        self.rows = 0
+        self.size = 0
+
+    def _open(self):
+        os.makedirs(self.dir, exist_ok=True)
+        path = os.path.join(self.dir, "part-%05d.csv" % self.index)
+        self.index += 1
+        self.f = open(path, "wb", buffering=1024 * 1024)
+        self.f.write(self.header)
+        self.rows = 0
+        self.size = len(self.header)
+
+    def write(self, line):
+        if self.f is not None and self.rows > 0:
+            if ((self.max_rows is not None and self.rows + 1 > self.max_rows) or
+                    (self.max_bytes is not None
+                     and self.size + len(line) > self.max_bytes)):
+                self.close()
+        if self.f is None:
+            self._open()
+        self.f.write(line)
+        self.rows += 1
+        self.size += len(line)
+
+    def ensure_file(self):
+        if self.f is None and self.index == 0:
+            self._open()
+
+    def close(self):
+        if self.f is not None:
+            self.f.close()
+            self.f = None
+
+
+def write_partitioned(root, names, stream, args, by_field):
+    kw = csv_writer_kwargs(args)
+    buf = io.StringIO()
+    w = csv.writer(buf, **kw)
+
+    def render(row):
+        buf.seek(0)
+        buf.truncate()
+        w.writerow(row)
+        return buf.getvalue().encode("utf-8")
+
+    header = render(names)
+    max_rows = args.max_rows_per_file
+    max_bytes = args.max_bytes_per_file
+    if not by_field:
+        sw = ShardWriter(root, header, max_rows, max_bytes)
+        try:
+            for rec in stream:
+                sw.write(render(rec.row))
+            sw.ensure_file()
+        finally:
+            sw.close()
+        return
+    # Records arrive grouped by partition path (it leads the sort key);
+    # still keep a writer per partition in case a group reappears.
+    writers = {}
+    current = None
+    cur_path = None
+    try:
+        for rec in stream:
+            path = rec.key[0]
+            if path != cur_path:
+                if current is not None:
+                    current.close()
+                cur_path = path
+                current = writers.get(path)
+                if current is None:
+                    current = ShardWriter(os.path.join(root, *path.split("/")),
+                                          header, max_rows, max_bytes)
+                    writers[path] = current
+            current.write(render(rec.row))
+    finally:
+        if current is not None:
+            current.close()
 
 
 def write_output(out, names, stream, args):
@@ -1128,6 +1319,10 @@ def build_parser():
         description="Merge CSV/TSV/JSONL/Parquet files into one sorted CSV.")
     p.add_argument("--output", required=True, help="output path or - for stdout")
     p.add_argument("--key", required=True, help="comma-separated key columns")
+    p.add_argument("--partition-by", default=None,
+                   help="comma-separated columns for Hive-style partition directories")
+    p.add_argument("--max-rows-per-file", type=int, default=None)
+    p.add_argument("--max-bytes-per-file", type=int, default=None)
     p.add_argument("--desc", action="store_true", help="sort descending")
     p.add_argument("--schema", default=None, help="schema JSON file")
     p.add_argument("--infer", choices=["strict", "loose"], default="strict")
@@ -1160,6 +1355,16 @@ def main(argv=None):
         return EXIT_USAGE
     if args.parquet_row_group_bytes <= 0:
         sys.stderr.write("error: --parquet-row-group-bytes must be positive\n")
+        return EXIT_USAGE
+    if args.max_rows_per_file is not None and args.max_rows_per_file <= 0:
+        sys.stderr.write("error: --max-rows-per-file must be positive\n")
+        return EXIT_USAGE
+    if args.max_bytes_per_file is not None and args.max_bytes_per_file <= 0:
+        sys.stderr.write("error: --max-bytes-per-file must be positive\n")
+        return EXIT_USAGE
+    if partitioned_mode(args) and args.output == "-":
+        sys.stderr.write("error: --output must be a directory path (not '-') "
+                         "when partitioning\n")
         return EXIT_USAGE
     for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
         if sig is not None:
