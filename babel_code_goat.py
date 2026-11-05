@@ -7,6 +7,14 @@ Commands:
     test <solution_path> <tests_dir> --lang <python|javascript|typescript|cpp|rust> [--timeout SECONDS] [--tol FLOAT]
          [--list-tests] [--run <test_id>]... [--timeout-ms <int>] [--total-timeout-ms <int>]
 
+    profile <tests_dir> <solution_path> --lang <...> [-n <trials>] [--warmup <k>] [--memory]
+         [--list-tests] [--run <test_id>]... [--timeout-ms <int>] [--total-timeout-ms <int>] [--tol FLOAT]
+
+``profile`` requires the generated tester, runs the selected tests ``n`` times (the first ``k``
+are warmup runs and excluded from statistics) and prints status/passed/failed plus
+``runtime_ns`` {mean, std} per trial (population std) and, with ``--memory``, ``memory_kb``
+{mean, std} (peak RSS of the tester process). Timed-out trials are included in the statistics.
+
 ``test`` selection / timeouts: ``--list-tests`` only discovers (status "pass", passed = all ids);
 ``--run <id>`` (repeatable) restricts the run to the given ids; ``--timeout-ms`` bounds each test;
 ``--total-timeout-ms`` bounds the whole execution. Tests that time out or are never executed
@@ -6973,7 +6981,7 @@ def parse_events(path):
     return events
 
 
-def _kill(proc):
+def _kill(proc, usage=None):
     try:
         os.killpg(proc.pid, 9)
     except Exception:
@@ -6982,13 +6990,35 @@ def _kill(proc):
         except Exception:
             pass
     try:
-        proc.wait()
+        _reap(proc, True, usage)
     except Exception:
         pass
 
 
+def _reap(proc, block, usage):
+    """wait4()-based poll that records the child's peak RSS (KB) into ``usage``."""
+    if proc.returncode is not None:
+        return proc.returncode
+    try:
+        pid, status, ru = os.wait4(proc.pid, 0 if block else os.WNOHANG)
+    except ChildProcessError:
+        proc.returncode = 0 if proc.returncode is None else proc.returncode
+        return proc.returncode
+    except Exception:
+        return proc.wait() if block else proc.poll()
+    if pid == 0:
+        return None
+    if usage is not None:
+        rss = ru.ru_maxrss
+        if sys.platform == "darwin":
+            rss //= 1024
+        usage.append(rss)
+    proc.returncode = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else status
+    return proc.returncode
+
+
 def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judge=None,
-               deadline=None, startup=None):
+               deadline=None, startup=None, usage=None):
     """Run tests; return (results: id->bool, error: bool).
 
     ``timeout`` bounds each test (seconds without progress); ``startup`` bounds the time
@@ -7031,7 +7061,7 @@ def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judg
         killed = False
         expired = False
         while True:
-            rc = proc.poll()
+            rc = _reap(proc, False, usage)
             try:
                 size = os.path.getsize(res_path)
             except OSError:
@@ -7044,11 +7074,11 @@ def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judg
                 break
             if deadline is not None and now >= deadline:
                 killed = expired = True
-                _kill(proc)
+                _kill(proc, usage)
                 break
             if now - last_progress > (timeout if last_size else startup):
                 killed = True
-                _kill(proc)
+                _kill(proc, usage)
                 break
             time.sleep(0.005)
         events = parse_events(res_path)
@@ -7096,15 +7126,27 @@ def emit_result(status, passed, failed):
     return {"pass": 0, "fail": 1}.get(status, 2)
 
 
-def cmd_test(opts):
-    pos = opts["pos"]
+def _prepare(opts, profile=False):
+    """Shared front half of ``test`` / ``profile``: resolve paths, discover and select tests.
+
+    Returns ("exit", (status, passed, failed)) or ("run", ctx)."""
+    pos = list(opts["pos"])
     if opts.get("list_tests") and len(pos) == 1:
-        pos = [None, pos[0]]
+        pos = [pos[0], None] if profile else [None, pos[0]]
     if len(pos) < 2:
-        return emit_result("error", [], [])
-    solution, tests_dir = pos[0], pos[1]
+        return "exit", ("error", [], [])
+    if profile:
+        tests_dir, solution = pos[0], pos[1]
+        if solution and not os.path.isdir(tests_dir) and os.path.isdir(solution):
+            tests_dir, solution = solution, tests_dir
+    else:
+        solution, tests_dir = pos[0], pos[1]
+        if solution and os.path.isdir(solution) and not os.path.isdir(tests_dir):
+            solution, tests_dir = tests_dir, solution
     lang = opts.get("lang")
     tester_path = os.path.join(tests_dir, LANGS[lang]) if lang in LANGS else None
+    if profile and (tester_path is None or not os.path.isfile(tester_path)):
+        return "exit", ("error", [], [])
     meta = read_meta(tester_path) if tester_path and os.path.isfile(tester_path) else None
     ep = opts.get("entrypoint")
     if not ep and meta and isinstance(meta.get("entrypoint"), str):
@@ -7117,9 +7159,9 @@ def cmd_test(opts):
             try:
                 tests, ep = discover(tests_dir, None, excl)
             except DiscoveryError:
-                return emit_result("error", [], [])
+                return "exit", ("error", [], [])
         else:
-            return emit_result("error", [], [])
+            return "exit", ("error", [], [])
     ids = []
     for t in tests:
         if t["id"] not in ids:
@@ -7128,31 +7170,49 @@ def cmd_test(opts):
     if selected is not None:
         known = set(ids)
         if not selected or any(x not in known for x in selected):
-            return emit_result("error", [], [x for x in selected if x in known])
+            return "exit", ("error", [], [x for x in selected if x in known])
         ids = [i for i in ids if i in set(selected)]
         tests = [t for t in tests if t["id"] in set(selected)]
     if opts.get("list_tests"):
-        return emit_result("pass", ids, [])
-    if lang not in LANGS or not os.path.isfile(tester_path) or not os.path.isfile(solution):
-        return emit_result("error", [], ids)
+        return "exit", ("pass", ids, [])
+    if lang not in LANGS or not os.path.isfile(tester_path) or not solution or not os.path.isfile(solution):
+        return "exit", ("error", [], ids)
     timeout = opts.get("timeout", DEFAULT_TIMEOUT)
     startup = timeout
     if "timeout_ms" in opts:
         timeout = opts["timeout_ms"] / 1000.0
         startup = max(timeout, opts.get("timeout", DEFAULT_TIMEOUT))
-    total = opts.get("total_timeout_ms")
+    return "run", {"solution": os.path.abspath(solution), "tester": os.path.abspath(tester_path),
+                   "lang": lang, "tests": tests, "ids": ids, "timeout": timeout, "startup": startup,
+                   "total": opts.get("total_timeout_ms"), "tol": opts.get("tol")}
+
+
+def _run_once(ctx, prefix, workdir, usage=None):
+    """Execute the selected tests once; returns (results id->bool, error)."""
+    lang, tests, ids = ctx["lang"], ctx["tests"], ctx["ids"]
+    static = {t["id"]: bool(t["ok"]) for t in tests if t["kind"] == "loop"}
+    run_ids = [i for i in ids if i not in static]
+    judge = NativeJudge(tests, ctx["tol"]).judge if lang in NATIVE_LANGS else None
+    total = ctx["total"]
+    deadline = None if total is None else time.monotonic() + total / 1000.0
+    results, error = run_tester(prefix, ctx["solution"], run_ids, ctx["timeout"], workdir,
+                                lang, ctx["tol"], judge, deadline, ctx["startup"], usage)
+    results.update(static)
+    return results, error
+
+
+def cmd_test(opts):
+    action, val = _prepare(opts)
+    if action == "exit":
+        return emit_result(*val)
+    ctx = val
+    ids = ctx["ids"]
     workdir = tempfile.mkdtemp(prefix="bcg-run-")
     try:
-        prefix = build_command(lang, os.path.abspath(tester_path), workdir, os.path.abspath(solution))
+        prefix = build_command(ctx["lang"], ctx["tester"], workdir, ctx["solution"])
         if prefix is None:
             return emit_result("error", [], ids)
-        static = {t["id"]: bool(t["ok"]) for t in tests if t["kind"] == "loop"}
-        run_ids = [i for i in ids if i not in static]
-        judge = NativeJudge(tests, opts.get("tol")).judge if lang in NATIVE_LANGS else None
-        deadline = None if total is None else time.monotonic() + total / 1000.0
-        results, error = run_tester(prefix, os.path.abspath(solution), run_ids, timeout, workdir,
-                                    lang, opts.get("tol"), judge, deadline, startup)
-        results.update(static)
+        results, error = _run_once(ctx, prefix, workdir)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     passed = [i for i in ids if results.get(i) is True]
@@ -7160,6 +7220,65 @@ def cmd_test(opts):
     if error:
         return emit_result("error", passed, failed)
     return emit_result("pass" if not failed else "fail", passed, failed)
+
+
+def _stats(values):
+    if not values:
+        return {"mean": 0.0, "std": 0.0}
+    mean = math.fsum(values) / len(values)
+    var = math.fsum((v - mean) ** 2 for v in values) / len(values)
+    return {"mean": mean, "std": math.sqrt(var)}
+
+
+def emit_profile(status, passed, failed, opts, runtimes=(), memories=(), trials=0, warmup=0):
+    out = {"status": status, "passed": passed, "failed": failed,
+           "runtime_ns": _stats(list(runtimes))}
+    if opts.get("memory"):
+        out["memory_kb"] = _stats(list(memories))
+    out["trials"] = trials
+    out["warmup"] = warmup
+    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return {"pass": 0, "fail": 1}.get(status, 2)
+
+
+def cmd_profile(opts):
+    n = opts.get("trials", 1)
+    k = opts.get("warmup", 0)
+    if k >= n:
+        return emit_profile("error", [], [], opts)
+    action, val = _prepare(opts, profile=True)
+    if action == "exit":
+        return emit_profile(*val, opts)
+    ctx = val
+    ids = ctx["ids"]
+    runtimes, memories = [], []
+    ever_failed = set()
+    error = False
+    workdir = tempfile.mkdtemp(prefix="bcg-prof-")
+    try:
+        prefix = build_command(ctx["lang"], ctx["tester"], workdir, ctx["solution"])
+        if prefix is None:
+            return emit_profile("error", [], ids, opts)
+        for trial in range(n):
+            tdir = os.path.join(workdir, "trial%d" % trial)
+            os.makedirs(tdir, exist_ok=True)
+            usage = []
+            t0 = time.perf_counter_ns()
+            results, err = _run_once(ctx, prefix, tdir, usage)
+            elapsed = time.perf_counter_ns() - t0
+            if trial < k:
+                continue
+            runtimes.append(float(elapsed))
+            memories.append(float(max(usage)) if usage else 0.0)
+            error = error or err
+            ever_failed.update(i for i in ids if results.get(i) is not True)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    passed = [i for i in ids if i not in ever_failed]
+    failed = [i for i in ids if i in ever_failed]
+    status = "error" if error else ("pass" if not failed else "fail")
+    return emit_profile(status, passed, failed, opts, runtimes, memories, n, k)
 
 
 # ---------------------------------------------------------------------------
@@ -7170,7 +7289,8 @@ def parse_args(argv):
     opts = {"pos": []}
     valued = {"--entrypoint": "entrypoint", "--lang": "lang", "--timeout": "timeout", "--tol": "tol",
               "--timeout-ms": "timeout_ms", "--total-timeout-ms": "total_timeout_ms", "--run": "run"}
-    flags = {"--list-tests": "list_tests"}
+    flags = {"--list-tests": "list_tests", "--memory": "memory"}
+    valued.update({"-n": "trials", "--trials": "trials", "--warmup": "warmup"})
 
     def put(key, v):
         if key == "run":
@@ -7180,7 +7300,9 @@ def parse_args(argv):
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a.startswith("--"):
+        if a.startswith("-n") and a != "-n" and len(a) > 2:
+            put("trials", a[3:] if a[2] == "=" else a[2:])
+        elif a.startswith("--") or a == "-n":
             if "=" in a:
                 k, v = a.split("=", 1)
                 if k in valued:
@@ -7215,6 +7337,15 @@ def parse_args(argv):
             if v <= 0:
                 raise ValueError(f"{flag} must be a positive integer")
             opts[key] = v
+    for key, flag, lo in (("trials", "-n", 1), ("warmup", "--warmup", 0)):
+        if key in opts:
+            try:
+                v = int(str(opts[key]).strip())
+            except ValueError:
+                raise ValueError(f"{flag} must be an integer >= {lo}")
+            if v < lo:
+                raise ValueError(f"{flag} must be an integer >= {lo}")
+            opts[key] = v
     if "tol" in opts:
         try:
             opts["tol"] = float(opts["tol"])
@@ -7226,7 +7357,7 @@ def parse_args(argv):
 
 
 def main(argv):
-    if not argv or argv[0] not in ("generate", "test"):
+    if not argv or argv[0] not in ("generate", "test", "profile"):
         sys.stderr.write(__doc__)
         return 2
     cmd = argv[0]
@@ -7235,6 +7366,8 @@ def main(argv):
     except ValueError as e:
         if cmd == "test":
             return emit_result("error", [], [])
+        if cmd == "profile":
+            return emit_profile("error", [], [], {"memory": "--memory" in argv})
         sys.stderr.write(f"error: {e}\n")
         return 2
     if cmd == "generate":
@@ -7246,6 +7379,11 @@ def main(argv):
         except Exception as e:
             sys.stderr.write(f"error: {type(e).__name__}: {e}\n")
             return 1
+    if cmd == "profile":
+        try:
+            return cmd_profile(opts)
+        except Exception:
+            return emit_profile("error", [], [], opts)
     try:
         return cmd_test(opts)
     except Exception:
