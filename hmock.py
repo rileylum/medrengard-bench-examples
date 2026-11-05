@@ -3559,7 +3559,8 @@ class Context(object):
     _tmpl_fields = ('HTTPHeader', 'HTTPBody', 'HTTPPath', 'HTTPQueryString',
                     'HTTPContext', 'HTTPParams', 'Values',
                     'KafkaTopic', 'KafkaPayload',
-                    'AMQPExchange', 'AMQPRoutingKey', 'AMQPQueue', 'AMQPPayload')
+                    'AMQPExchange', 'AMQPRoutingKey', 'AMQPQueue', 'AMQPPayload',
+                    'GRPCService', 'GRPCMethod', 'GRPCPayload', 'GRPCHeader')
 
     def __init__(self, header, body, path, query):
         self.HTTPHeader = header
@@ -3575,6 +3576,10 @@ class Context(object):
         self.AMQPRoutingKey = ''
         self.AMQPQueue = ''
         self.AMQPPayload = ''
+        self.GRPCService = ''
+        self.GRPCMethod = ''
+        self.GRPCPayload = ''
+        self.GRPCHeader = Header(())
 
     def with_params(self, route, params):
         self.HTTPParams = params
@@ -4380,6 +4385,7 @@ class Behavior(object):
         self.raw = raw
         self.kafka_topic = None
         self.amqp = None
+        self.grpc = None
 
 
 def parse_mock(m, source, root=None):
@@ -4460,6 +4466,20 @@ def parse_mock(m, source, root=None):
             q = rk
         if q != '' or ex != '':
             amqp_exp = {'exchange': ex, 'routing_key': rk, 'queue': q}
+
+    grpc_exp = None
+    gexp = expect.get('grpc')
+    if gexp is not None:
+        if not isinstance(gexp, dict):
+            raise LoadError('%s: mock %s: expect.grpc must be a mapping' % (source, key))
+        gs = gexp.get('service')
+        gs = _scalar_str(gs).strip() if gs is not None else ''
+        gm = gexp.get('method')
+        gm = _scalar_str(gm).strip() if gm is not None else ''
+        if gs.startswith('.'):
+            gs = gs[1:]
+        if gs != '' or gm != '':
+            grpc_exp = (gs, gm)
 
     raw_actions = m.get('actions') or []
     if not isinstance(raw_actions, list):
@@ -4574,6 +4594,25 @@ def parse_mock(m, source, root=None):
                     payload = _read_body_file(root, _scalar_str(pff), source, key)
                 out['payload'] = payload
                 actions.append((order, name, out))
+            elif name == 'reply_grpc':
+                if not isinstance(spec, dict):
+                    raise LoadError('%s: mock %s: reply_grpc must be a mapping' % (source, key))
+                payload = spec.get('payload')
+                pff = spec.get('payload_from_file')
+                has_file = pff is not None and _scalar_str(pff) != ''
+                if payload is None and not has_file:
+                    raise LoadError('%s: mock %s: reply_grpc.payload is required unless '
+                                    'payload_from_file is set' % (source, key))
+                payload = _scalar_str(payload)
+                if payload == '' and has_file:
+                    payload = _read_body_file(root, _scalar_str(pff), source, key)
+                headers = spec.get('headers') or {}
+                if not isinstance(headers, dict):
+                    raise LoadError('%s: mock %s: reply_grpc.headers must be a mapping'
+                                    % (source, key))
+                headers = [(str(k), _scalar_str(v)) for k, v in headers.items()]
+                actions.append((order, 'reply_grpc', {'payload': payload,
+                                                      'headers': headers}))
             else:
                 log('warn', 'unsupported action ignored', key=key, action=str(name))
     # stable sort by order ascending (preserves relative order on ties)
@@ -4582,6 +4621,7 @@ def parse_mock(m, source, root=None):
     b = Behavior(key, kind, method, path, condition, actions, m, values)
     b.kafka_topic = kafka_topic
     b.amqp = amqp_exp
+    b.grpc = grpc_exp
     return b
 
 
@@ -5095,8 +5135,8 @@ def run_message_actions(b, ctx):
                 do_send_http(b, spec, ctx)
             elif typ in ('publish_kafka', 'publish_amqp'):
                 do_publish(b, typ, spec, ctx)
-            elif typ == 'reply_http':
-                log('debug', 'reply_http ignored for message-triggered behavior', key=b.key)
+            elif typ in ('reply_http', 'reply_grpc'):
+                log('debug', '%s ignored for message-triggered behavior' % typ, key=b.key)
         except Exception as e:  # pragma: no cover - defensive
             log('error', 'action failed', key=b.key, action=typ, err=repr(e))
 
@@ -5727,6 +5767,562 @@ def start_messaging(registry):
 
 
 # ---------------------------------------------------------------------------
+# gRPC: HTTP/2 cleartext server with descriptor-set based protobuf <-> JSON
+# ---------------------------------------------------------------------------
+
+import gzip as _gzip
+import struct as _struct
+import zlib as _zlib
+
+GRPC = None             # GRPCServer when HM_GRPC_ENABLED
+GRPC_DESCRIPTORS = None  # DescriptorSet loaded from HM_GRPC_DESCRIPTOR_SET_PATHS
+
+
+class DescriptorError(Exception):
+    pass
+
+
+def behaviors_need_grpc(behaviors):
+    for b in behaviors:
+        if getattr(b, 'kind', None) == KIND_TEMPLATE:
+            continue
+        if getattr(b, 'grpc', None):
+            return True
+        if any(typ == 'reply_grpc' for typ, _ in (b.actions or [])):
+            return True
+        raw = getattr(b, 'raw', None)
+        if isinstance(raw, dict) and isinstance(raw.get('expect'), dict) and \
+                raw['expect'].get('grpc') is not None:
+            return True
+    return False
+
+
+class DescriptorSet(object):
+    """Protobuf descriptors loaded from one or more FileDescriptorSet files."""
+
+    def __init__(self, paths):
+        from google.protobuf import descriptor_pb2, descriptor_pool
+        # Import the well-known types so they are available as dependencies
+        # even when the descriptor set was built without --include_imports.
+        for mod in ('any_pb2', 'api_pb2', 'duration_pb2', 'empty_pb2', 'field_mask_pb2',
+                    'source_context_pb2', 'struct_pb2', 'timestamp_pb2', 'type_pb2',
+                    'wrappers_pb2'):
+            try:
+                __import__('google.protobuf.' + mod)
+            except Exception:  # pragma: no cover - optional
+                pass
+        self.paths = paths
+        self.pool = descriptor_pool.DescriptorPool()
+        files = {}
+        order = []
+        for p in paths:
+            try:
+                with open(p, 'rb') as fh:
+                    data = fh.read()
+            except OSError as e:
+                raise DescriptorError('cannot read descriptor set %s: %s' % (p, e))
+            fds = descriptor_pb2.FileDescriptorSet()
+            try:
+                fds.ParseFromString(data)
+            except Exception as e:
+                raise DescriptorError('invalid descriptor set %s: %s' % (p, e))
+            if not data.strip(b'\x00') or len(fds.file) == 0:
+                raise DescriptorError('invalid descriptor set %s: no files' % p)
+            for f in fds.file:
+                if not f.name:
+                    raise DescriptorError('invalid descriptor set %s: file without name' % p)
+                if f.name not in files:
+                    files[f.name] = f
+                    order.append(f.name)
+        added = set()
+        default = descriptor_pool.Default()
+
+        def add(name, stack):
+            if name in added:
+                return
+            if name in stack:
+                raise DescriptorError('circular import of %s' % name)
+            fp = files.get(name)
+            if fp is None:
+                try:
+                    fd = default.FindFileByName(name)
+                except KeyError:
+                    raise DescriptorError('missing dependency %s in descriptor sets' % name)
+                fp = descriptor_pb2.FileDescriptorProto()
+                fd.CopyToProto(fp)
+            for dep in fp.dependency:
+                add(dep, stack + [name])
+            try:
+                self.pool.Add(fp)
+            except Exception as e:
+                raise DescriptorError('invalid descriptor %s: %s' % (name, e))
+            added.add(name)
+
+        for n in order:
+            add(n, [])
+        # Make sure every file builds (catches unresolved type references).
+        for n in order:
+            try:
+                self.pool.FindFileByName(n)
+            except Exception as e:
+                raise DescriptorError('invalid descriptor %s: %s' % (n, e))
+        self._classes = {}
+        self._lock = threading.Lock()
+
+    def find_method(self, service, method):
+        try:
+            sd = self.pool.FindServiceByName(service)
+        except KeyError:
+            return None
+        return sd.methods_by_name.get(method)
+
+    def message_class(self, desc):
+        from google.protobuf import message_factory
+        with self._lock:
+            c = self._classes.get(desc.full_name)
+            if c is None:
+                c = message_factory.GetMessageClass(desc)
+                self._classes[desc.full_name] = c
+            return c
+
+
+def grpc_descriptor_paths(root=None):
+    raw = os.environ.get('HM_GRPC_DESCRIPTOR_SET_PATHS') or ''
+    if root is None:
+        root = os.environ.get('HM_TEMPLATES_DIR', './templates')
+    out = []
+    for p in raw.split(','):
+        p = p.strip()
+        if not p:
+            continue
+        if not os.path.isabs(p):
+            p = os.path.join(root, p)
+        out.append(p)
+    return out
+
+
+def load_grpc_descriptors(root=None):
+    paths = grpc_descriptor_paths(root)
+    if not paths:
+        raise DescriptorError('HM_GRPC_DESCRIPTOR_SET_PATHS is not configured')
+    return DescriptorSet(paths)
+
+
+def proto_to_json(msg):
+    from google.protobuf import json_format
+    d = json_format.MessageToDict(msg)
+    return json.dumps(d, separators=(',', ':'), ensure_ascii=False)
+
+
+def json_to_proto(text, cls):
+    from google.protobuf import json_format
+    msg = cls()
+    if text.strip() == '':
+        return msg
+    json_format.Parse(text, msg, ignore_unknown_fields=True)
+    return msg
+
+
+def grpc_frame(data, compressed=False):
+    return _struct.pack('>BI', 1 if compressed else 0, len(data)) + data
+
+
+def grpc_unframe(data, encoding=''):
+    """Split a length-prefixed gRPC body into messages."""
+    msgs = []
+    i = 0
+    while i + 5 <= len(data):
+        flag, n = _struct.unpack('>BI', data[i:i + 5])
+        i += 5
+        if i + n > len(data):
+            raise ValueError('truncated grpc message')
+        m = data[i:i + n]
+        i += n
+        if flag & 1:
+            enc = (encoding or '').strip().lower()
+            if enc == 'gzip':
+                m = _gzip.decompress(m)
+            elif enc == 'deflate':
+                m = _zlib.decompress(m)
+            else:
+                raise ValueError('unsupported grpc compression %r' % encoding)
+        msgs.append(m)
+    if i != len(data):
+        raise ValueError('malformed grpc frame')
+    return msgs
+
+
+def _pct_encode_grpc_message(s):
+    out = []
+    for ch in s.encode('utf-8'):
+        if 0x20 <= ch <= 0x7e and ch != 0x25:
+            out.append(chr(ch))
+        else:
+            out.append('%%%02X' % ch)
+    return ''.join(out)
+
+
+GRPC_RESERVED_HEADERS = ('content-type', 'grpc-status', 'grpc-message', 'content-length',
+                         'te', 'transfer-encoding', 'connection')
+
+
+class _H2Conn(object):
+    """One HTTP/2 connection serving gRPC requests."""
+
+    def __init__(self, server, sock, addr):
+        import h2.config
+        import h2.connection
+        self.server = server
+        self.sock = sock
+        self.addr = addr
+        cfg = h2.config.H2Configuration(client_side=False, header_encoding='utf-8',
+                                        validate_inbound_headers=False,
+                                        normalize_inbound_headers=True)
+        self.conn = h2.connection.H2Connection(config=cfg)
+        self.cond = threading.Condition()
+        self.streams = {}   # stream id -> {'headers': [...], 'body': bytearray}
+        self.closed = False
+
+    def _flush(self):
+        data = self.conn.data_to_send()
+        if data:
+            self.sock.sendall(data)
+
+    def run(self):
+        import h2.events
+        import h2.exceptions
+        try:
+            with self.cond:
+                self.conn.initiate_connection()
+                self.conn.update_settings({0x4: 4 * 1024 * 1024})
+                self.conn.increment_flow_control_window(16 * 1024 * 1024)
+                self._flush()
+            while True:
+                data = self.sock.recv(65536)
+                if not data:
+                    break
+                with self.cond:
+                    try:
+                        events = self.conn.receive_data(data)
+                    except h2.exceptions.ProtocolError as e:
+                        log('debug', 'grpc http2 protocol error', err=str(e))
+                        self._flush()
+                        break
+                    for ev in events:
+                        self._event(ev, h2.events)
+                    self._flush()
+                    self.cond.notify_all()
+        except (OSError, ValueError) as e:
+            log('debug', 'grpc connection closed', err=str(e))
+        except Exception as e:  # pragma: no cover - defensive
+            log('error', 'grpc connection failed', err=repr(e))
+        finally:
+            with self.cond:
+                self.closed = True
+                self.cond.notify_all()
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    def _event(self, ev, events):
+        if isinstance(ev, events.RequestReceived):
+            self.streams[ev.stream_id] = {'headers': list(ev.headers), 'body': bytearray()}
+            if ev.stream_ended:
+                self._dispatch(ev.stream_id)
+        elif isinstance(ev, events.DataReceived):
+            st = self.streams.get(ev.stream_id)
+            if st is not None:
+                st['body'].extend(ev.data)
+            if ev.flow_controlled_length:
+                try:
+                    self.conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                except Exception:
+                    pass
+        elif isinstance(ev, events.StreamEnded):
+            self._dispatch(ev.stream_id)
+        elif isinstance(ev, events.TrailersReceived):
+            pass
+        elif isinstance(ev, events.StreamReset):
+            self.streams.pop(ev.stream_id, None)
+        elif isinstance(ev, events.ConnectionTerminated):
+            self.closed = True
+
+    def _dispatch(self, sid):
+        st = self.streams.get(sid)
+        if st is None or st.get('dispatched'):
+            return
+        st['dispatched'] = True
+        t = threading.Thread(target=self._serve_stream, args=(sid, st), daemon=True)
+        t.start()
+
+    # -- response writing (called from worker threads) ----------------------
+    def _send_headers(self, sid, headers, end_stream=False):
+        with self.cond:
+            if self.closed:
+                return
+            self.conn.send_headers(sid, headers, end_stream=end_stream)
+            self._flush()
+
+    def _send_data(self, sid, data):
+        view = memoryview(data)
+        while view:
+            with self.cond:
+                while not self.closed:
+                    try:
+                        win = self.conn.local_flow_control_window(sid)
+                    except Exception:
+                        return
+                    if win > 0:
+                        break
+                    self.cond.wait(1.0)
+                if self.closed:
+                    return
+                n = min(win, self.conn.max_outbound_frame_size, len(view))
+                self.conn.send_data(sid, bytes(view[:n]))
+                self._flush()
+            view = view[n:]
+
+    def respond(self, sid, status, message, headers=(), body=None):
+        try:
+            if body is None:
+                # Trailers-only response.
+                h = [(':status', '200'), ('content-type', 'application/grpc')]
+                h.extend(headers)
+                h.append(('grpc-status', str(status)))
+                h.append(('grpc-message', _pct_encode_grpc_message(message)))
+                self._send_headers(sid, h, end_stream=True)
+            else:
+                h = [(':status', '200'), ('content-type', 'application/grpc')]
+                h.extend(headers)
+                self._send_headers(sid, h)
+                self._send_data(sid, grpc_frame(body))
+                self._send_headers(sid, [('grpc-status', str(status)),
+                                         ('grpc-message', _pct_encode_grpc_message(message))],
+                                   end_stream=True)
+        except Exception as e:
+            log('debug', 'grpc response failed', err=repr(e))
+        finally:
+            with self.cond:
+                self.streams.pop(sid, None)
+
+    def _serve_stream(self, sid, st):
+        try:
+            self.server.handle(self, sid, st['headers'], bytes(st['body']))
+        except Exception as e:  # pragma: no cover - defensive
+            log('error', 'grpc handler failed', err=repr(e))
+            self.respond(sid, 13, 'internal error: %s' % e)
+
+
+class GRPCServer(object):
+    def __init__(self, host, port, get_behaviors, root=None):
+        self.host = host
+        self.port = port
+        self.get_behaviors = get_behaviors
+        self.root = root
+        self.sock = None
+        self._desc_lock = threading.Lock()
+
+    def bind(self):
+        fam = socket.AF_INET6 if ':' in self.host else socket.AF_INET
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((self.host, self.port))
+        s.listen(128)
+        self.sock = s
+
+    def start(self):
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while True:
+            try:
+                c, addr = self.sock.accept()
+            except OSError:
+                return
+            try:
+                c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            threading.Thread(target=_H2Conn(self, c, addr).run, daemon=True).start()
+
+    def descriptors(self):
+        global GRPC_DESCRIPTORS
+        if GRPC_DESCRIPTORS is not None:
+            return GRPC_DESCRIPTORS
+        with self._desc_lock:
+            if GRPC_DESCRIPTORS is None:
+                GRPC_DESCRIPTORS = load_grpc_descriptors(self.root)
+            return GRPC_DESCRIPTORS
+
+    def handle(self, h2c, sid, headers, body):
+        start = time.time()
+        hmap = {}
+        for k, v in headers:
+            if isinstance(k, bytes):
+                k = k.decode('utf-8', 'replace')
+            if isinstance(v, bytes):
+                v = v.decode('utf-8', 'replace')
+            hmap.setdefault(k.lower(), v)
+        path = hmap.get(':path', '')
+        path = path.split('?', 1)[0]
+        parts = path.strip('/').split('/')
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            h2c.respond(sid, 12, 'malformed method name: %s' % path)
+            return
+        service, method = urllib.parse.unquote(parts[0]), urllib.parse.unquote(parts[1])
+        header = Header([(k if isinstance(k, str) else k.decode('utf-8', 'replace'),
+                          v if isinstance(v, str) else v.decode('utf-8', 'replace'))
+                         for k, v in headers])
+        cands = [b for b in list(self.get_behaviors())
+                 if b.kind == KIND_BEHAVIOR and b.grpc == (service, method)]
+        if not cands:
+            log('info', 'grpc request', grpc_service=service, grpc_method=method,
+                grpc_status=12, key=None)
+            h2c.respond(sid, 12, 'unknown method %s for service %s' % (method, service))
+            return
+        try:
+            descs = self.descriptors()
+        except DescriptorError as e:
+            log('error', 'grpc descriptors unavailable', err=str(e))
+            h2c.respond(sid, 13, 'protobuf descriptors unavailable: %s' % e)
+            return
+        md = descs.find_method(service, method)
+        if md is None:
+            log('error', 'grpc method not found in descriptor sets', grpc_service=service,
+                grpc_method=method)
+            h2c.respond(sid, 12, 'unknown method %s for service %s' % (method, service))
+            return
+        try:
+            msgs = grpc_unframe(body, hmap.get('grpc-encoding', ''))
+            req = descs.message_class(md.input_type)()
+            if msgs:
+                req.ParseFromString(msgs[0])
+            payload = proto_to_json(req)
+        except Exception as e:
+            log('error', 'failed to decode grpc request', grpc_service=service,
+                grpc_method=method, err=str(e))
+            h2c.respond(sid, 13, 'failed to decode request: %s' % e)
+            return
+        matched = None
+        ctx = None
+        for b in cands:
+            ctx = Context(Header(()), '', '', '')
+            ctx.GRPCService = service
+            ctx.GRPCMethod = method
+            ctx.GRPCPayload = payload
+            ctx.GRPCHeader = header
+            ctx.Values = b.values
+            if condition_passes(b, ctx):
+                matched = b
+                break
+        if matched is None:
+            log('info', 'grpc request', grpc_service=service, grpc_method=method,
+                grpc_req=payload, grpc_status=12, key=None)
+            h2c.respond(sid, 12, 'no mock matched %s/%s' % (service, method))
+            return
+        status, res_payload = self._perform(h2c, sid, matched, ctx, descs, md)
+        log('info', 'grpc request', grpc_service=service, grpc_method=method,
+            grpc_req=payload, grpc_res=res_payload, grpc_status=status, key=matched.key,
+            latency_ms=round((time.time() - start) * 1000, 3))
+
+    def _perform(self, h2c, sid, b, ctx, descs, md):
+        sent = False
+        status, res_payload = 0, ''
+        for typ, spec in b.actions:
+            try:
+                if typ == 'reply_grpc':
+                    if sent:
+                        continue
+                    sent = True
+                    try:
+                        res_payload = render(spec['payload'], ctx)
+                        hdrs = [(k.strip().lower(), render(v, ctx).replace('\r', ' ')
+                                 .replace('\n', ' ')) for k, v in spec['headers']]
+                        hdrs = [(k, v) for k, v in hdrs
+                                if k and not k.startswith(':') and
+                                k not in GRPC_RESERVED_HEADERS]
+                        msg = json_to_proto(res_payload, descs.message_class(md.output_type))
+                        data = msg.SerializeToString()
+                    except Exception as e:
+                        log('error', 'failed to render reply_grpc', key=b.key, err=str(e))
+                        status = 13
+                        h2c.respond(sid, 13, 'failed to render response: %s' % e)
+                        continue
+                    h2c.respond(sid, 0, 'OK', hdrs, data)
+                elif typ == 'sleep':
+                    time.sleep(spec['duration'])
+                elif typ == 'redis':
+                    for item in spec['items']:
+                        try:
+                            render(item, ctx)
+                        except Exception as e:
+                            log('error', 'failed to render redis action', key=b.key,
+                                err=str(e))
+                elif typ == 'send_http':
+                    do_send_http(b, spec, ctx)
+                elif typ in ('publish_kafka', 'publish_amqp'):
+                    do_publish(b, typ, spec, ctx)
+            except Exception as e:  # pragma: no cover - defensive
+                log('error', 'action failed', key=b.key, action=typ, err=repr(e))
+        if not sent:
+            # No reply_grpc: answer with an empty response message.
+            h2c.respond(sid, 0, 'OK', [], b'')
+        return status, res_payload
+
+
+def start_grpc(registry):
+    """Start the gRPC server when HM_GRPC_ENABLED; exits on fatal config errors."""
+    global GRPC, GRPC_DESCRIPTORS
+    if not _env_bool('HM_GRPC_ENABLED', False):
+        return None
+    host = os.environ.get('HM_GRPC_HOST') or '0.0.0.0'
+    try:
+        port = int(os.environ.get('HM_GRPC_PORT') or '50051')
+    except ValueError:
+        log('error', 'invalid HM_GRPC_PORT', value=os.environ.get('HM_GRPC_PORT'))
+        sys.exit(1)
+    if behaviors_need_grpc(registry.behaviors):
+        try:
+            GRPC_DESCRIPTORS = load_grpc_descriptors(registry.root)
+        except DescriptorError as e:
+            log('error', 'failed to load grpc descriptor sets', err=str(e))
+            sys.exit(1)
+        for b in registry.behaviors:
+            if b.grpc and GRPC_DESCRIPTORS.find_method(b.grpc[0], b.grpc[1]) is None:
+                log('warn', 'grpc method not found in descriptor sets', key=b.key,
+                    grpc_service=b.grpc[0], grpc_method=b.grpc[1])
+    elif grpc_descriptor_paths(registry.root):
+        try:
+            GRPC_DESCRIPTORS = load_grpc_descriptors(registry.root)
+        except DescriptorError as e:
+            log('warn', 'failed to load grpc descriptor sets', err=str(e))
+    srv = GRPCServer(host, port, lambda: registry.behaviors, registry.root)
+    try:
+        srv.bind()
+    except OSError as e:
+        log('error', 'failed to start grpc server', err=str(e))
+        sys.exit(1)
+    srv.start()
+    GRPC = srv
+
+    def grpc_update(behaviors):
+        global GRPC_DESCRIPTORS
+        if not grpc_descriptor_paths(registry.root):
+            return
+        if not behaviors_need_grpc(behaviors) and GRPC_DESCRIPTORS is None:
+            return
+        try:
+            GRPC_DESCRIPTORS = load_grpc_descriptors(registry.root)
+        except DescriptorError as e:
+            log('error', 'failed to reload grpc descriptor sets, keeping previous',
+                err=str(e))
+    registry.listeners.append(grpc_update)
+    log('info', 'starting grpc server', host=host, port=port)
+    return srv
+
+
+# ---------------------------------------------------------------------------
 # Persistent storage for API-added mocks
 # ---------------------------------------------------------------------------
 
@@ -6165,6 +6761,266 @@ def parse_mocks_body(body):
         raise AdminError(400, 'invalid request body: %s' % e)
 
 
+# ---------------------------------------------------------------------------
+# Dry-run evaluation (POST /api/v1/evaluate)
+# ---------------------------------------------------------------------------
+
+EVAL_MATCHERS = ('http', 'kafka', 'amqp', 'grpc')
+EVAL_REQUIRED = {
+    'http': ('method', 'path'),
+    'kafka': ('topic',),
+    'amqp': ('exchange', 'routing_key'),
+    'grpc': ('service', 'method'),
+}
+EVAL_CONTEXT_KEYS = {
+    'http': 'http_context',
+    'kafka': 'kafka_context',
+    'amqp': 'amqp_context',
+    'grpc': 'grpc_context',
+}
+
+
+def _ev_str(v):
+    if v is None:
+        return ''
+    return _scalar_str(v)
+
+
+def _ev_str_map(v, name):
+    if v is None:
+        return []
+    if not isinstance(v, dict):
+        raise AdminError(400, '%s must be an object of strings' % name)
+    out = []
+    for k, x in v.items():
+        if isinstance(x, list):
+            for y in x:
+                out.append((str(k), _ev_str(y)))
+        else:
+            out.append((str(k), _ev_str(x)))
+    return out
+
+
+def _ev_validate(req):
+    if not isinstance(req, dict):
+        raise AdminError(400, 'request body must be a JSON object')
+    mock = req.get('mock')
+    if not isinstance(mock, dict):
+        raise AdminError(400, 'mock is required and must be an object')
+    key = mock.get('key')
+    if not isinstance(key, str) or key.strip() == '':
+        raise AdminError(400, 'mock.key must be a non-empty string')
+    expect = mock.get('expect')
+    if not isinstance(expect, dict):
+        raise AdminError(400, 'mock.expect must include at least one of: %s'
+                         % ', '.join(EVAL_MATCHERS))
+    declared = []
+    for name in EVAL_MATCHERS:
+        spec = expect.get(name)
+        if spec is None:
+            continue
+        if not isinstance(spec, dict):
+            raise AdminError(400, 'mock.expect.%s must be an object' % name)
+        for f in EVAL_REQUIRED[name]:
+            if _ev_str(spec.get(f)).strip() == '':
+                raise AdminError(400, 'mock.expect.%s.%s is required' % (name, f))
+        declared.append(name)
+    if not declared:
+        raise AdminError(400, 'mock.expect must include at least one of: %s'
+                         % ', '.join(EVAL_MATCHERS))
+    ctx = req.get('context')
+    if not isinstance(ctx, dict):
+        raise AdminError(400, 'context is required and must be an object')
+    for name, ck in EVAL_CONTEXT_KEYS.items():
+        v = ctx.get(ck)
+        if v is not None and not isinstance(v, dict):
+            raise AdminError(400, 'context.%s must be an object' % ck)
+    available = [n for n in declared if isinstance(ctx.get(EVAL_CONTEXT_KEYS[n]), dict)]
+    if not available:
+        raise AdminError(400, 'context must include %s' % ' or '.join(
+            'context.%s' % EVAL_CONTEXT_KEYS[n] for n in declared))
+    return mock, expect, ctx, declared, available
+
+
+def _ev_build_behavior(mock, reg):
+    if reg is not None and not _is_zero(mock.get('extend')):
+        raw = reg._raw(reg.fs_raw, reg.base, reg.sets) if hasattr(reg, '_raw') else []
+        raw = [(m, src) for m, src in raw
+               if not (isinstance(m, dict) and m.get('key') == mock.get('key'))]
+        raw.append((mock, 'evaluate'))
+        for b in build_mocks(raw, reg.root, apply=False):
+            if b.key == mock['key']:
+                return b
+    root = reg.root if reg is not None else None
+    return parse_mock(mock, 'evaluate', root)
+
+
+def _ev_match(name, expect, cctx):
+    spec = expect[name]
+    if name == 'http':
+        method = _ev_str(spec.get('method')).strip().upper()
+        path = _ev_str(spec.get('path'))
+        if not path.startswith('/'):
+            path = '/' + path
+        cm = _ev_str(cctx.get('method')).strip().upper()
+        cp = _ev_str(cctx.get('path')).split('?', 1)[0].split('#', 1)[0]
+        cp = urllib.parse.unquote(cp) or '/'
+        if not cp.startswith('/'):
+            cp = '/' + cp
+        if method != cm:
+            return False, None
+        params = match_path(path.split('/'), cp)
+        if params is None:
+            return False, None
+        return True, (path, params)
+    if name == 'kafka':
+        return _ev_str(spec.get('topic')) == _ev_str(cctx.get('topic')), None
+    if name == 'amqp':
+        ex = _ev_str(spec.get('exchange'))
+        rk = _ev_str(spec.get('routing_key'))
+        q = _ev_str(spec.get('queue'))
+        if q == '':
+            q = rk
+        cex = _ev_str(cctx.get('exchange'))
+        crk = _ev_str(cctx.get('routing_key'))
+        cq = _ev_str(cctx.get('queue'))
+        if ex != cex:
+            return False, None
+        if rk != crk and not _amqp_topic_match(rk, crk):
+            return False, None
+        if cq != '' and cq != q:
+            return False, None
+        return True, None
+    if name == 'grpc':
+        svc = _ev_str(spec.get('service')).strip().lstrip('.')
+        csvc = _ev_str(cctx.get('service')).strip().lstrip('.')
+        return (svc == csvc and _ev_str(spec.get('method')).strip() ==
+                _ev_str(cctx.get('method')).strip()), None
+    return False, None
+
+
+def _ev_context(ctx):
+    hc = ctx.get('http_context') if isinstance(ctx.get('http_context'), dict) else {}
+    qs = _ev_str(hc.get('query_string'))
+    path = _ev_str(hc.get('path'))
+    if '?' in path:
+        path, _, q2 = path.partition('?')
+        if qs == '':
+            qs = q2
+    if qs.startswith('?'):
+        qs = qs[1:]
+    raw_path = path + ('?' + qs if qs else '')
+    c = Context(Header(_ev_str_map(hc.get('headers'), 'context.http_context.headers')),
+                _ev_str(hc.get('body')), raw_path, qs)
+    kc = ctx.get('kafka_context')
+    if isinstance(kc, dict):
+        c.KafkaTopic = _ev_str(kc.get('topic'))
+        c.KafkaPayload = _ev_str(kc.get('payload'))
+    ac = ctx.get('amqp_context')
+    if isinstance(ac, dict):
+        c.AMQPExchange = _ev_str(ac.get('exchange'))
+        c.AMQPRoutingKey = _ev_str(ac.get('routing_key'))
+        c.AMQPQueue = _ev_str(ac.get('queue'))
+        c.AMQPPayload = _ev_str(ac.get('payload'))
+    gc = ctx.get('grpc_context')
+    if isinstance(gc, dict):
+        c.GRPCService = _ev_str(gc.get('service'))
+        c.GRPCMethod = _ev_str(gc.get('method'))
+        p = gc.get('payload')
+        c.GRPCPayload = p if isinstance(p, str) else (
+            '' if p is None else json.dumps(p, separators=(',', ':')))
+        c.GRPCHeader = Header(_ev_str_map(gc.get('headers'), 'context.grpc_context.headers'))
+    return c
+
+
+def _ev_reply_http(spec, ctx):
+    out_headers = [(k, render(v, ctx)) for k, v in spec['headers']]
+    binary = spec.get('binary')
+    if binary is not None:
+        rbody = binary
+    else:
+        rbody = render(spec['body'], ctx).encode('utf-8')
+    headers = [(k, v) for k, v in out_headers if k.lower() != 'content-length']
+    if binary is not None:
+        if not any(k.lower() == 'content-type' for k, _ in headers):
+            headers.insert(0, ('Content-Type', 'application/octet-stream'))
+        bname = spec.get('binary_file_name') or ''
+        if bname and not any(k.lower() == 'content-disposition' for k, _ in headers):
+            headers.append(('Content-Disposition', 'inline; filename="%s"' % bname))
+    elif not any(k.lower() == 'content-type' for k, _ in headers):
+        headers.insert(0, ('Content-Type', 'application/json'))
+    headers.append(('Content-Length', str(len(rbody))))
+    hmap = {}
+    ctype = 'application/json'
+    for k, v in headers:
+        if k.lower() == 'content-type':
+            ctype = v
+            k = 'Content-Type'
+        elif k.lower() == 'content-length':
+            k = 'Content-Length'
+        hmap[k] = v
+    return {'reply_http_action_performed': {
+        'status_code': str(spec['status_code']),
+        'content_type': ctype,
+        'body': rbody.decode('utf-8', 'replace'),
+        'headers': hmap,
+    }}
+
+
+def evaluate_mock(req, reg=None):
+    """Dry-run a mock against simulated channel contexts. Raises AdminError."""
+    mock, expect, ctx, declared, available = _ev_validate(req)
+    try:
+        b = _ev_build_behavior(mock, reg)
+    except LoadError as e:
+        raise AdminError(400, 'invalid mock: %s' % e)
+    passed = False
+    http_route = None
+    for name in available:
+        ok, extra = _ev_match(name, expect, ctx[EVAL_CONTEXT_KEYS[name]])
+        if ok:
+            passed = True
+            if name == 'http':
+                http_route = extra
+            break
+    if not passed:
+        return {'expect_passed': False, 'actions_performed': []}
+    c = _ev_context(ctx)
+    if http_route is not None:
+        c.with_params(http_route[0], http_route[1])
+    c.Values = b.values
+    rendered = ''
+    if b.condition:
+        try:
+            rendered = render(b.condition, c)
+        except Exception as e:
+            log('debug', 'evaluate condition render failed', key=b.key, err=str(e))
+            rendered = ''
+        cond_ok = rendered == 'true'
+    else:
+        cond_ok = True
+    if not cond_ok:
+        return {'expect_passed': True, 'condition_passed': False,
+                'condition_rendered': rendered, 'actions_performed': []}
+    performed = []
+    for typ, spec in b.actions:   # already sorted by order
+        try:
+            if typ == 'reply_http':
+                performed.append(_ev_reply_http(spec, c))
+            elif typ == 'publish_kafka':
+                performed.append({'publish_kafka_action_performed': {
+                    'topic': render(spec['topic'], c).strip(),
+                    'payload': render(spec['payload'], c),
+                }})
+        except AdminError:
+            raise
+        except Exception as e:
+            raise AdminError(400, 'failed to render %s action: %s' % (typ, e))
+    return {'expect_passed': True, 'condition_passed': True,
+            'condition_rendered': rendered, 'actions_performed': performed}
+
+
+
 class AdminHandler(Handler):
     server_version = 'hmock-admin'
 
@@ -6216,6 +7072,16 @@ class AdminHandler(Handler):
         if len(segs) < 3 or segs[0] != 'api' or segs[1] != 'v1':
             raise AdminError(404, 'not found')
         res, rest = segs[2], segs[3:]
+        if res == 'evaluate' and not rest:
+            if method != 'POST':
+                raise AdminError(405, 'method not allowed')
+            text = body.decode('utf-8-sig', 'replace')
+            try:
+                req = json.loads(text)
+            except ValueError as e:
+                raise AdminError(400, 'invalid JSON body: %s' % e)
+            self._json(200, evaluate_mock(req, reg))
+            return 200
         if res == 'health' and not rest:
             if method not in ('GET', 'HEAD'):
                 raise AdminError(405, 'method not allowed')
@@ -6316,6 +7182,7 @@ def main():
         sys.exit(1)
     log('info', 'mocks loaded', count=len(behaviors), dir=tdir)
     start_messaging(registry)
+    start_grpc(registry)
     try:
         server = MockServer((host, port), Handler, behaviors, cors=cors)
     except OSError as e:
