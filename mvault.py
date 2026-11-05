@@ -938,6 +938,170 @@ def format_str(text):
     return t
 
 
+# ---------------------------------------------------------------- annotations
+
+import re as _re
+import threading as _threading
+import uuid as _uuid
+
+_TIMECODE_RE = _re.compile(r"[0-9]+(?::[0-9]+){0,2}")
+ANNOTATION_LOCK = _threading.Lock()
+
+
+class AnnotationError(Exception):
+    def __init__(self, status, message):
+        Exception.__init__(self, message)
+        self.status = status
+        self.message = message
+
+
+def parse_timecode(text):
+    """Parse SS, MM:SS or HH:MM:SS (non-negative integer components) to seconds."""
+    if isinstance(text, bool):
+        raise ValueError("timecode must be a string")
+    if isinstance(text, int):
+        if text < 0:
+            raise ValueError("timecode must be non-negative")
+        return text
+    if not isinstance(text, str):
+        raise ValueError("timecode must be a string")
+    t = text.strip()
+    if not _TIMECODE_RE.fullmatch(t):
+        raise ValueError("invalid timecode format %s (expected SS, MM:SS or HH:MM:SS)"
+                         % json.dumps(text))
+    secs = 0
+    for part in t.split(":"):
+        secs = secs * 60 + int(part)
+    return secs
+
+
+def format_timecode(secs):
+    try:
+        secs = int(secs)
+    except (TypeError, ValueError):
+        return str(secs)
+    if secs < 0:
+        return str(secs)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%d:%02d:%02d" % (h, m, s)
+    return "%d:%02d" % (m, s)
+
+
+def _new_annotation_id(existing):
+    used = {a.get("id") for a in existing if isinstance(a, dict)}
+    while True:
+        aid = _uuid.uuid4().hex[:12]
+        if aid not in used:
+            return aid
+
+
+def _parse_json_body(data):
+    try:
+        obj = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise AnnotationError(400, "malformed JSON request body")
+    if not isinstance(obj, dict):
+        raise AnnotationError(400, "malformed JSON request body (expected an object)")
+    return obj
+
+
+def _require_str(obj, field):
+    if field not in obj or obj[field] is None:
+        raise AnnotationError(400, "missing required field '%s'" % field)
+    if not isinstance(obj[field], str):
+        raise AnnotationError(400, "field '%s' must be a string" % field)
+    return obj[field]
+
+
+def _optional_body(obj):
+    v = obj.get("body")
+    if v is not None and not isinstance(v, str):
+        raise AnnotationError(400, "field 'body' must be a string or null")
+    return v
+
+
+def mutate_annotation(name, category, entry_id, method, data):
+    """Apply an annotation mutation; return (redirect_category, timecode_or_None).
+
+    Raises AnnotationError on failure. The on-disk catalog is only replaced on success,
+    and catalog.bak always holds the catalog as it was before this request.
+    """
+    payload = _parse_json_body(data)
+    if method == "POST":
+        title = _require_str(payload, "title")
+        if "timecode" not in payload or payload["timecode"] is None:
+            raise AnnotationError(400, "missing required field 'timecode'")
+        try:
+            timecode = parse_timecode(payload["timecode"])
+        except ValueError as exc:
+            raise AnnotationError(400, str(exc))
+        body = _optional_body(payload)
+    else:
+        aid = _require_str(payload, "id")
+        if method == "PATCH":
+            if "title" not in payload and "body" not in payload:
+                raise AnnotationError(
+                    400, "missing field: at least one of 'title' or 'body' is required")
+            if "title" in payload:
+                _require_str(payload, "title")
+            if "body" in payload:
+                _optional_body(payload)
+    if not name or "\0" in name or not os.path.isdir(name):
+        raise AnnotationError(404, "vault '%s' does not exist" % name)
+    with ANNOTATION_LOCK:
+        try:
+            raw, version = read_raw_catalog(name)
+            validate_catalog(name, raw, version)
+        except MVaultError as exc:
+            raise AnnotationError(500, str(exc))
+        if category not in viewer_valid_categories(version):
+            raise AnnotationError(404, "category '%s' not found in vault '%s'"
+                                  % (category, name))
+        idx = None
+        for i, e in enumerate(raw.get(category) or []):
+            if isinstance(e, dict) and e.get("id") == entry_id:
+                idx = i
+                break
+        if idx is None:
+            raise AnnotationError(404, "entry '%s' not found in %s" % (entry_id, category))
+        target_cat = "episodes" if version == 1 else category
+        try:
+            catalog = migrate_to_v3(copy.deepcopy(raw), version)
+        except Exception as exc:
+            raise AnnotationError(500, "automatic migration to version %d failed: %s"
+                                  % (CURRENT_VERSION, exc))
+        entry = catalog[target_cat][idx]
+        anns = entry.get("annotations")
+        if not isinstance(anns, list):
+            anns = []
+            entry["annotations"] = anns
+        if method == "POST":
+            anns.append({"id": _new_annotation_id(anns), "timecode": timecode,
+                         "title": title, "body": body})
+        else:
+            pos = None
+            for i, a in enumerate(anns):
+                if isinstance(a, dict) and a.get("id") == aid:
+                    pos = i
+                    break
+            if pos is None:
+                raise AnnotationError(404, "annotation '%s' not found" % aid)
+            if method == "PATCH":
+                if "title" in payload:
+                    anns[pos]["title"] = payload["title"]
+                if "body" in payload:
+                    anns[pos]["body"] = payload["body"]
+            else:
+                del anns[pos]
+        try:
+            write_catalog(name, catalog, backup=True)
+        except MVaultError as exc:
+            raise AnnotationError(500, str(exc))
+    return target_cat, (timecode if method == "POST" else None)
+
+
 # ---------------------------------------------------------------- viewer server
 
 RECENT_COOKIE = "mvault_recent"
@@ -1261,7 +1425,8 @@ def make_handler():
             body = html_page("Redirect", "<p>Redirecting to <a href=\"%s\">%s</a></p>"
                              % (html_escape(location), html_escape(location)))
             hdrs = [("Location", location)] + list(headers or [])
-            self._send(303 if self.command == "POST" else 302, body, headers=hdrs, head=head)
+            status = 303 if self.command in ("POST", "PATCH", "DELETE") else 302
+            self._send(status, body, headers=hdrs, head=head)
 
         def _error(self, status, message, head=False):
             body = html_page("Error %d" % status, "<h1>Error %d</h1><p>%s</p>"
@@ -1298,11 +1463,50 @@ def make_handler():
         def do_POST(self):
             self._safe(self._post)
 
+        def do_PATCH(self):
+            self._safe(self._mutate)
+
+        def do_DELETE(self):
+            self._safe(self._mutate)
+
         def _method_not_allowed(self):
             body = html_page("Error 405", "<h1>Error 405</h1><p>Method not allowed.</p>")
-            self._send(405, body, headers=[("Allow", "GET, HEAD, POST")])
+            self._send(405, body, headers=[("Allow", "GET, HEAD, POST, PATCH, DELETE")])
 
-        do_PUT = do_DELETE = do_PATCH = _method_not_allowed
+        do_PUT = _method_not_allowed
+
+        def _read_body(self):
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            return self.rfile.read(length) if length > 0 else b""
+
+        def _json_error(self, status, message):
+            body = json.dumps({"error": message, "status": status}) + "\n"
+            self._send(status, body, ctype="application/json; charset=utf-8")
+
+        def _mutate(self, data=None):
+            segs, _ = self._split()
+            if data is None:
+                data = self._read_body()
+            if len(segs) != 4 or segs[0] != "catalog":
+                if self.command == "POST":
+                    self._error(404, "Not found.")
+                else:
+                    self._method_not_allowed()
+                return
+            name, category, entry_id = segs[1], segs[2], segs[3]
+            try:
+                cat, timecode = mutate_annotation(name, category, entry_id,
+                                                  self.command, data)
+            except AnnotationError as exc:
+                self._json_error(exc.status, exc.message)
+                return
+            loc = catalog_route(name, cat, entry_id)
+            if timecode is not None:
+                loc += "?timecode=%d" % timecode
+            self._redirect(loc)
 
         # ---- routing
         def _split(self):
@@ -1314,13 +1518,9 @@ def make_handler():
 
         def _post(self):
             segs, _ = self._split()
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                length = 0
-            data = self.rfile.read(length) if length > 0 else b""
+            data = self._read_body()
             if segs:
-                self._error(404, "Not found.")
+                self._mutate(data)
                 return
             form = urllib.parse.parse_qs(data.decode("utf-8", "replace"),
                                          keep_blank_values=True)
@@ -1365,7 +1565,7 @@ def make_handler():
                 self._redirect(catalog_route(name, default), [cookie], head)
                 return
             if len(segs) == 4:
-                status, body = self._detail(name, raw, version, category, segs[3])
+                status, body = self._detail(name, raw, version, category, segs[3], query)
             else:
                 status, body = self._listing(name, raw, version, category, None)
             self._send(status, body, headers=[cookie], head=head)
@@ -1421,7 +1621,7 @@ def make_handler():
             self._send(200, data, ctype=ctype, head=head)
 
         # ---- entry detail
-        def _detail(self, name, raw, version, category, entry_id):
+        def _detail(self, name, raw, version, category, entry_id, query=None):
             entries = raw.get(category) or []
             entry = None
             for e in entries:
@@ -1472,8 +1672,20 @@ def make_handler():
                 % (html_escape(entry_id), show(title), show(desc), show(published),
                    show(width), show(height), show(width), show(height),
                    html_escape(link), html_escape(link)))
+            seek = None
+            for tv in (query or {}).get("timecode", []):
+                try:
+                    seek = parse_timecode(tv)
+                except ValueError:
+                    seek = None
+            if seek is not None:
+                parts.append("<p class=\"seek\" data-timecode=\"%d\">Playback position: "
+                             "<span class=\"timecode\">%s</span> (%d s)</p>"
+                             % (seek, format_timecode(seek), seek))
             if media is not None:
                 murl = "/vault/%s/media/%s" % (_q(name), _q(media))
+                if seek is not None:
+                    murl += "#t=%d" % seek
                 mtype = file_mime(os.path.join(name, "media", media), "media")
                 tag = "audio" if mtype.startswith("audio/") else "video"
                 if mtype.startswith("image/"):
@@ -1486,6 +1698,13 @@ def make_handler():
                 parts.append("<section class=\"media downloaded\"><h2>Media</h2>%s"
                              "<p><a class=\"media-link\" href=\"%s\">%s</a></p></section>"
                              % (player, html_escape(murl), html_escape(media)))
+                if seek is not None and not mtype.startswith("image/"):
+                    parts.append(
+                        "<script>(function(){var m=document.querySelector("
+                        "'section.media %s');if(!m)return;var t=%d;function go(){"
+                        "try{m.currentTime=t;}catch(e){}}if(m.readyState>=1)go();"
+                        "else m.addEventListener('loadedmetadata',go);})();</script>"
+                        % (tag, seek))
             else:
                 parts.append("<section class=\"media not-downloaded\"><h2>Media</h2>"
                              "<p class=\"no-media\">Media not downloaded.</p></section>")
@@ -1494,6 +1713,36 @@ def make_handler():
                 parts.append("<section class=\"preview\"><h2>Preview</h2>"
                              "<img src=\"%s\" alt=\"preview\" style=\"max-width:480px\">"
                              "</section>" % html_escape(purl))
+            anns = [a for a in (entry.get("annotations") or []) if isinstance(a, dict)] \
+                if version == 3 and isinstance(entry.get("annotations"), list) else []
+            ann_items = []
+            for a in anns:
+                aid = str(a.get("id"))
+                tc = a.get("timecode")
+                tc_href = catalog_route(name, category, entry_id)
+                if is_int(tc):
+                    tc_href += "?timecode=%d" % tc
+                abody = a.get("body")
+                ann_items.append(
+                    "<li class=\"annotation\" id=\"annotation-%s\" data-id=\"%s\" "
+                    "data-timecode=\"%s\"><a class=\"timecode\" href=\"%s\">%s</a> "
+                    "<span class=\"annotation-title\">%s</span> "
+                    "<span class=\"annotation-id\">[%s]</span>%s</li>"
+                    % (html_escape(aid), html_escape(aid), html_escape(tc),
+                       html_escape(tc_href), html_escape(format_timecode(tc)),
+                       html_escape(a.get("title")), html_escape(aid),
+                       "" if abody is None else
+                       "<div class=\"annotation-body\">%s</div>" % html_escape(abody)))
+            if ann_items:
+                parts.append("<section class=\"annotations\" id=\"annotations\">"
+                             "<h2>Annotations</h2><ol>\n%s\n</ol></section>"
+                             % "\n".join(ann_items))
+            else:
+                parts.append("<section class=\"annotations\" id=\"annotations\">"
+                             "<h2>Annotations</h2><p class=\"no-annotations\">"
+                             "No annotations.</p></section>")
+            parts.append("<script type=\"application/json\" id=\"annotation-data\">%s"
+                         "</script>" % json_for_html(anns))
             parts.append("<script type=\"application/json\" id=\"chart-data\">%s</script>"
                          % json_for_html(charts))
             chart_html = []
