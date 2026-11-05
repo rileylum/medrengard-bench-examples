@@ -22,6 +22,7 @@ import yaml
 
 DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 MOUNT_PREFIX = "mount://"
+BACKUP_PREFIX = "backup://"
 STRATEGY_KINDS = ("full", "pack", "verify", "dry-run")
 DEFAULT_MAX_PACK_BYTES = 1048576
 
@@ -300,6 +301,9 @@ def load_schedule(path: str) -> dict:
         if source is None:
             source = MOUNT_PREFIX
         strategy = parse_strategy(job.get("strategy"), job_id)
+        destination = job.get("destination")
+        if destination is not None and not isinstance(destination, str):
+            raise ScheduleError(f"job {job_id}: destination must be a string")
         entry = {
             "strategy": strategy,
             "id": job_id,
@@ -307,6 +311,7 @@ def load_schedule(path: str) -> dict:
             "kind": kind,
             "exclude": exclude,
             "source": str(source),
+            "destination": destination,
         }
         if entry["enabled"]:
             if kind in ("daily", "weekly"):
@@ -368,6 +373,44 @@ def resolve_source(source: str, mount: str) -> str:
         rel = source
     rel = rel.strip("/")
     return os.path.join(mount, rel) if rel else mount
+
+
+def resolve_destination(destination, backup):
+    """Return the base destination directory, or None if no backups exist."""
+    if destination is None or backup is None:
+        return None
+    if destination.startswith(BACKUP_PREFIX):
+        rel = destination[len(BACKUP_PREFIX):]
+    else:
+        rel = destination
+    rel = rel.strip("/")
+    return os.path.join(backup, rel) if rel else backup
+
+
+def file_sha256(path: str) -> str | None:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return "sha256:" + h.hexdigest()
+
+
+def load_dest_state(dest_root: str | None, job_id: str) -> dict[str, str]:
+    """Map relative path -> checksum for existing (non-.tar) backups of a job."""
+    state: dict[str, str] = {}
+    if dest_root is None:
+        return state
+    job_dir = os.path.join(dest_root, job_id)
+    for rel in list_files(job_dir):
+        if rel.lower().endswith(".tar"):
+            continue
+        digest = file_sha256(os.path.join(job_dir, rel))
+        if digest is not None:
+            state[rel] = digest
+    return state
 
 
 def list_files(root: str) -> list[str]:
@@ -482,6 +525,13 @@ def run(args) -> int:
               "exclude_count": len(job["exclude"])})
         strategy = job.get("strategy")
         skind = strategy["kind"] if strategy else None
+        dest_state = load_dest_state(
+            resolve_destination(job.get("destination"), args.backup), job_id)
+        if dest_state:
+            emit({"event": "DEST_STATE_LOADED", "job_id": job_id,
+                  "files_total": len(dest_state)})
+        incremental = skind in ("full", "verify")
+        skipped_unchanged = 0
         if strategy:
             emit({"event": "STRATEGY_SELECTED", "job_id": job_id, "kind": skind})
         packer = None
@@ -499,6 +549,13 @@ def run(args) -> int:
                 emit({"event": "FILE_SELECTED", "job_id": job_id, "path": path})
                 if skind:
                     data = read_file(root, path)
+                    if incremental and path in dest_state:
+                        digest = sha256_tag(data)
+                        if dest_state[path] == digest:
+                            skipped_unchanged += 1
+                            emit({"event": "FILE_SKIPPED_UNCHANGED", "job_id": job_id,
+                                  "path": path, "hash": digest})
+                            continue
                     total_size += len(data)
                     if skind == "pack":
                         packer.add(path, data)
@@ -517,6 +574,8 @@ def run(args) -> int:
             done["packs"] = packer.packs
         if skind:
             done["total_size"] = total_size
+            done["files_skipped_unchanged"] = skipped_unchanged
+            done["dest_state_files"] = len(dest_state)
         emit(done)
     return 0
 
@@ -527,6 +586,7 @@ def main(argv=None) -> int:
     parser.add_argument("--now", required=True)
     parser.add_argument("--duration", default="24")
     parser.add_argument("--mount", default=".")
+    parser.add_argument("--backup", default=None)
     args = parser.parse_args(argv)
     try:
         return run(args)
