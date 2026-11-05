@@ -54,6 +54,10 @@ class AutoLocked(Exception):
     """Raised when the vault was idle for longer than the auto-lock timeout."""
 
 
+class ManualLock(Exception):
+    """Raised when the user explicitly locks the vault from the main menu."""
+
+
 # ---------------------------------------------------------------- crypto ---
 
 def derive_keys(master_key, salt, iterations=KDF_ITERATIONS):
@@ -688,6 +692,7 @@ def read_line_completing(prompt, candidates_fn):
         return read_line(prompt)
     old = rl.get_completer()
     rl.set_completer(make_completer(candidates_fn))
+    started = time.monotonic()
     try:
         try:
             line = input(prompt)
@@ -702,6 +707,7 @@ def read_line_completing(prompt, candidates_fn):
                 rl.remove_history_item(n - 1)
         except Exception:
             pass
+    _check_idle(started)
     return line.rstrip("\r\n")
 
 
@@ -823,10 +829,11 @@ def unlock():
     try:
         _cfg, salt, iterations = load_config()
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        print("Error: vault config file is missing or unreadable (%s). "
-              "The vault cannot be opened without it." % CONFIG_PATH,
-              file=sys.stderr)
-        print("Error: config file missing or invalid: %s" % exc)
+        if not os.path.isfile(CONFIG_PATH):
+            config_missing_error()
+        print("Error: the config file %s is unreadable (%s). The config file "
+              "is required to unlock the vault. Please restore it from a "
+              "backup and try again." % (CONFIG_PATH, exc))
         sys.exit(2)
     with open(VAULT_PATH, "rb") as fh:
         blob = fh.read()
@@ -1082,11 +1089,14 @@ def main_menu(vault):
         clear_screen()
         print(COMPACT_BANNER)
         print("%d saved in the vault" % len(vault.items))
-        print("[s] search   [all] show all   [a] add   [cat] categories   [q] quit")
+        print("[s] search   [all] show all   [a] add   [cat] categories   "
+              "[l] lock   [q] quit")
         choice = read_line("> ").strip().lower()
         action = None
         if choice == "q":
             raise QuitProgram()
+        elif choice == "l":
+            raise ManualLock()
         elif choice == "s":
             action = "search"
         elif choice == "all":
@@ -1275,6 +1285,10 @@ def build_parser():
                         help="export secrets to FILE and exit")
     parser.add_argument("-f", metavar="FORMAT", dest="format", default="json",
                         help="import/export file format (only 'json')")
+    parser.add_argument("-e", action="store_true", dest="erase",
+                        help="erase the vault and config files, then exit")
+    parser.add_argument("-k", action="store_true", dest="change_key",
+                        help="show how to change the master key, then exit")
     return parser
 
 
@@ -1326,15 +1340,61 @@ def apply_ttl_flags(args):
         save_settings()
 
 
+def config_missing_error():
+    print("Error: the vault file %s exists but the config file %s is "
+          "missing. The config file is required to unlock the vault. "
+          "Please restore the config file (for example from a backup) "
+          "and try again." % (VAULT_PATH, CONFIG_PATH))
+    sys.exit(2)
+
+
 def ensure_vault():
     """Run first-time setup if needed; exit if the metadata is missing."""
     if not os.path.isfile(VAULT_PATH):
         run_setup()
     elif not os.path.isfile(CONFIG_PATH):
-        print("Error: vault data exists at %s but the config file %s is "
-              "missing. The vault cannot be opened without its salt."
-              % (VAULT_PATH, CONFIG_PATH))
-        sys.exit(2)
+        config_missing_error()
+
+
+def print_change_key_advice():
+    print("Changing the master key is not done in place; the vault is not "
+          "modified by this command.")
+    print("To change the master key:")
+    print("  1. Export the current vault to JSON:")
+    print("       python pwd_manager.py -x vault_export.json")
+    print("  2. Create a new vault with the desired master key (move the old "
+          "vault and config files aside, or use new -v/-c paths), e.g.:")
+    print("       python pwd_manager.py -v NEW_VAULT_PATH -c NEW_CONFIG_PATH")
+    print("  3. Import that JSON into the new vault:")
+    print("       python pwd_manager.py -v NEW_VAULT_PATH -c NEW_CONFIG_PATH "
+          "-i vault_export.json")
+    print("Then securely delete the exported JSON file, since it contains "
+          "your secrets in plain text.")
+
+
+def run_erase():
+    targets = [p for p in (VAULT_PATH, CONFIG_PATH) if os.path.exists(p)]
+    print("Vault file:  %s" % VAULT_PATH)
+    print("Config file: %s" % CONFIG_PATH)
+    if not targets:
+        print("Nothing to erase: neither the vault file nor the config file "
+              "exists.")
+        return 0
+    if not ask_yes_no("Erase the vault and config files permanently? "
+                      "This cannot be undone."):
+        print("Erase cancelled; nothing was deleted.")
+        return 0
+    failed = False
+    for path in targets:
+        try:
+            os.remove(path)
+        except OSError as exc:
+            print("Error: could not delete %s: %s" % (path, exc))
+            failed = True
+    if failed:
+        return 1
+    print("The vault and config files have been deleted.")
+    return 0
 
 
 def run_interactive():
@@ -1349,6 +1409,10 @@ def run_interactive():
             print()
             print("Vault locked after %s second(s) of inactivity."
                   % _fmt_seconds(auto_lock_seconds()))
+            vault = unlock()
+        except ManualLock:
+            _lock_armed = False
+            print("Vault locked.")
             vault = unlock()
 
 
@@ -1366,6 +1430,11 @@ def main(argv=None):
             return 2
     try:
         apply_paths(args)
+        if args.change_key:
+            print_change_key_advice()
+            return 0
+        if args.erase:
+            return run_erase()
         load_settings()
         apply_ttl_flags(args)
         ensure_vault()
