@@ -133,15 +133,58 @@ class Vault:
         raw = json.dumps(self.data, sort_keys=True).encode("utf-8")
         _atomic_write(VAULT_PATH, encrypt(self.keys, raw))
 
-    def add(self, name, url, login, password, notes):
+    @property
+    def categories(self):
+        return self.data.setdefault("categories", [])
+
+    def add(self, name, url, login, password, notes, category_id=None):
         item_id = self.data["next_id"]
         self.data["next_id"] = item_id + 1
         self.items.append({
             "id": item_id, "name": name, "url": url, "login": login,
-            "password": password, "notes": notes,
+            "password": password, "notes": notes, "category": category_id,
         })
         self.save()
         return item_id
+
+    def delete(self, item_id):
+        self.data["items"] = [it for it in self.items if it["id"] != item_id]
+        self.save()
+
+    # categories
+    def sorted_categories(self):
+        return sorted(self.categories, key=lambda c: c["id"])
+
+    def get_category(self, cat_id):
+        for c in self.categories:
+            if c["id"] == cat_id:
+                return c
+        return None
+
+    def category_name(self, cat_id):
+        if cat_id is None:
+            return ""
+        c = self.get_category(cat_id)
+        return c["name"] if c else ""
+
+    def add_category(self, name):
+        cat_id = self.data.setdefault("next_category_id", 1)
+        self.data["next_category_id"] = cat_id + 1
+        self.categories.append({"id": cat_id, "name": name})
+        self.save()
+        return cat_id
+
+    def rename_category(self, cat_id, name):
+        self.get_category(cat_id)["name"] = name
+        self.save()
+
+    def category_in_use(self, cat_id):
+        return any(it.get("category") == cat_id for it in self.items)
+
+    def delete_category(self, cat_id):
+        self.data["categories"] = [c for c in self.categories
+                                   if c["id"] != cat_id]
+        self.save()
 
     def sorted_items(self):
         return sorted(self.items, key=lambda it: it["id"])
@@ -159,7 +202,8 @@ class Vault:
 
 
 def empty_vault_data():
-    return {"version": CONFIG_VERSION, "next_id": 1, "items": []}
+    return {"version": CONFIG_VERSION, "next_id": 1, "items": [],
+            "next_category_id": 1, "categories": []}
 
 
 # -------------------------------------------------------------------- io ---
@@ -192,12 +236,7 @@ def clear_screen():
     sys.stdout.flush()
 
 
-def render_table(items):
-    if not items:
-        return "Empty!"
-    headers = ["Item", "Category", "Name", "URL", "Login"]
-    rows = [[str(it["id"]), "", it.get("name", ""), it.get("url", ""),
-             it.get("login", "")] for it in items]
+def _grid(headers, rows):
     widths = [max(len(h), *(len(r[i]) for r in rows))
               for i, h in enumerate(headers)]
 
@@ -209,6 +248,57 @@ def render_table(items):
     lines.extend(fmt(r) for r in rows)
     lines.append(sep)
     return "\n".join(lines)
+
+
+def render_table(items, vault=None):
+    if not items:
+        return "Empty!"
+    headers = ["Item", "Category", "Name", "URL", "Login"]
+    rows = [[str(it["id"]),
+             vault.category_name(it.get("category")) if vault else "",
+             it.get("name", ""), it.get("url", ""), it.get("login", "")]
+            for it in items]
+    return _grid(headers, rows)
+
+
+def render_categories(vault):
+    cats = vault.sorted_categories()
+    if not cats:
+        return "Empty!"
+    return _grid(["ID", "Category"], [[str(c["id"]), c["name"]] for c in cats])
+
+
+def ask_yes_no(prompt):
+    """Ask a yes/no question; default is No. Re-prompts on invalid input."""
+    while True:
+        ans = read_line("%s [y / n]: " % prompt).strip().lower()
+        if ans == "y":
+            return True
+        if ans in ("n", ""):
+            return False
+        print("Please answer 'y' or 'n'.")
+
+
+def read_notes():
+    print("Notes (up to %d lines, submit a blank line to finish):"
+          % MAX_NOTE_LINES)
+    lines = []
+    while True:
+        line = read_line("")
+        if line.strip() == "":
+            break
+        if len(lines) < MAX_NOTE_LINES:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def choose_category_id(vault, prompt):
+    """Show the category table then ask for an ID. Returns ID or None."""
+    print(render_categories(vault))
+    raw = read_line(prompt).strip()
+    if raw.isdigit() and vault.get_category(int(raw)) is not None:
+        return int(raw)
+    return None
 
 
 # ------------------------------------------------------------------ flows ---
@@ -267,39 +357,155 @@ def unlock():
 
 def add_secret(vault):
     print("Add a new secret")
+    category_id = None
+    if vault.categories:
+        category_id = choose_category_id(
+            vault, "Category ID (leave empty for no category): ")
     name = read_line("Name: ")
     url = read_line("URL: ")
     login = read_line("Login: ")
     password = read_secret("Password: ")
-    print("Notes (up to %d lines, submit a blank line to finish):"
-          % MAX_NOTE_LINES)
-    lines = []
-    while True:
-        line = read_line("")
-        if line.strip() == "":
-            break
-        if len(lines) < MAX_NOTE_LINES:
-            lines.append(line)
-    item_id = vault.add(name, url, login, password, "\n".join(lines))
+    notes = read_notes()
+    item_id = vault.add(name, url, login, password, notes, category_id)
     print("Secret saved with ID %d." % item_id)
     return "menu"
 
 
-def item_view(vault, item):
-    clear_screen()
-    print(render_table([item]))
+def show_item(vault, item):
+    print(render_table([item], vault))
     if item.get("notes"):
         print("Notes:")
         print(item["notes"])
+
+
+def edit_category(vault, item):
+    current = vault.category_name(item.get("category"))
+    print("Current category: %s" % (current if current else "Empty!"))
+    if not vault.categories:
+        print("Empty!")
+        return False
+    new_id = choose_category_id(vault, "New category ID: ")
+    if new_id is None:
+        print("Unknown category ID; the secret was not changed.")
+        return False
+    item["category"] = new_id
+    vault.save()
+    print("Category updated.")
+    return True
+
+
+def edit_field(vault, item, field, label):
+    print("Current %s: %s" % (label, item.get(field, "")))
+    if field == "password":
+        value = read_secret("New password: ")
+    elif field == "notes":
+        value = read_notes()
+    else:
+        value = read_line("New %s: " % label)
+    item[field] = value
+    vault.save()
+    print("%s updated." % label.capitalize())
+    return True
+
+
+EDIT_FIELDS = {
+    "n": ("name", "name"),
+    "u": ("url", "URL"),
+    "l": ("login", "login"),
+    "p": ("password", "password"),
+    "o": ("notes", "notes"),
+}
+
+
+def edit_menu(vault, item):
     while True:
-        choice = read_line("[s] new search  [b] back to menu: ").strip().lower()
+        choice = read_line("Edit: [c] category  [n] name  [u] URL  [l] login  "
+                           "[p] password  [o] notes  [b] back: ").strip().lower()
+        if choice == "b":
+            return
+        if choice == "c":
+            if edit_category(vault, item):
+                return
+            continue
+        if choice in EDIT_FIELDS:
+            field, label = EDIT_FIELDS[choice]
+            edit_field(vault, item, field, label)
+            return
+        print("Please choose one of c, n, u, l, p, o or b.")
+
+
+def item_view(vault, item):
+    clear_screen()
+    show_item(vault, item)
+    while True:
+        choice = read_line("[s] new search  [b] back to menu  [e] edit  "
+                           "[d] delete: ").strip().lower()
         if choice == "s":
             return "search"
         if choice == "b":
             return "menu"
         if choice == "q":
             raise QuitProgram()
-        print("Please enter 's' or 'b'.")
+        if choice == "e":
+            edit_menu(vault, item)
+            show_item(vault, item)
+            continue
+        if choice == "d":
+            if ask_yes_no("Delete secret '%s'?" % item.get("name", "")):
+                vault.delete(item["id"])
+                print("Secret deleted.")
+                return "menu"
+            print("Secret kept.")
+            continue
+        print("Please enter 's', 'b', 'e' or 'd'.")
+
+
+def category_menu(vault):
+    clear_screen()
+    while True:
+        print(render_categories(vault))
+        choice = read_line("[a] add category  [r] rename category  "
+                           "[d] delete category  [b] back: ").strip().lower()
+        if choice == "b":
+            return
+        if choice == "q":
+            raise QuitProgram()
+        if choice == "a":
+            name = read_line("Category name: ").strip()
+            if not name:
+                print("Category name cannot be empty.")
+                continue
+            cid = vault.add_category(name)
+            print("Category '%s' added with ID %d." % (name, cid))
+        elif choice == "r":
+            cid = choose_category_id(vault, "Category ID to rename: ")
+            if cid is None:
+                print("Unknown category ID.")
+                continue
+            name = read_line("New category name: ").strip()
+            if not name:
+                print("Category name cannot be empty.")
+                continue
+            old = vault.get_category(cid)["name"]
+            vault.rename_category(cid, name)
+            print("Category '%s' renamed to '%s'." % (old, name))
+        elif choice == "d":
+            cid = choose_category_id(vault, "Category ID to delete: ")
+            if cid is None:
+                print("Unknown category ID.")
+                continue
+            cname = vault.get_category(cid)["name"]
+            if vault.category_in_use(cid):
+                print("Cannot delete category '%s': it is still assigned to "
+                      "at least one secret." % cname)
+                continue
+            if ask_yes_no("Delete category '%s'?" % cname):
+                vault.delete_category(cid)
+                print("Category '%s' deleted." % cname)
+            else:
+                print("Category kept.")
+        else:
+            print("Please enter 'a', 'r', 'd' or 'b'.")
 
 
 def search(vault):
@@ -336,7 +542,7 @@ def search(vault):
             if nxt == "search":
                 continue
             return nxt
-        print(render_table(results))
+        print(render_table(results, vault))
         choice = read_line("Select an item by ID: ").strip()
         chosen = None
         if choice.isdigit():
@@ -358,7 +564,7 @@ def main_menu(vault):
         clear_screen()
         print(COMPACT_BANNER)
         print("%d saved in the vault" % len(vault.items))
-        print("[s] search   [all] show all   [a] add   [q] quit")
+        print("[s] search   [all] show all   [a] add   [cat] categories   [q] quit")
         choice = read_line("> ").strip().lower()
         action = None
         if choice == "q":
@@ -366,10 +572,13 @@ def main_menu(vault):
         elif choice == "s":
             action = "search"
         elif choice == "all":
-            print(render_table(vault.sorted_items()))
+            print(render_table(vault.sorted_items(), vault))
             action = "search"
         elif choice == "a":
             action = "add"
+        elif choice == "cat":
+            category_menu(vault)
+            continue
         else:
             continue
         while action in ("search", "add"):
