@@ -13,9 +13,10 @@ HELP_TEXT = """\
 usage: circopt.py [--help] [--version] [--json] <command> [args]
 
 Commands:
-  check <file.circ>    Parse and validate a .circ circuit file and report
-                       its interface.
-  eval <file.circ> [--set name=value ...] [--default 0|1] [--allow-extra]
+  check <file> [--format auto|circ|json|bench]
+                       Parse and validate a circuit file (.circ, .json or
+                       .bench) and report its interface.
+  eval <file> [--format auto|circ|json|bench] [--set name=value ...] [--default 0|1] [--allow-extra]
        [--radix bin|hex|dec] [--mode 2val|3val]
                        Evaluate the circuit (2-valued, or 3-valued with X)
                        and print outputs.
@@ -90,6 +91,11 @@ WidthMismatchError = _mk("WidthMismatchError", 3)
 IndexOutOfBoundsError = _mk("IndexOutOfBoundsError", 3)
 InputWidthMismatchError = _mk("InputWidthMismatchError", 3)
 RadixNotAllowedIn3ValError = _mk("RadixNotAllowedIn3ValError", 1)
+UnknownInputFormatError = _mk("UnknownInputFormatError", 1)
+JsonParseError = _mk("JsonParseError", 2)
+JsonSchemaError = _mk("JsonSchemaError", 3)
+BenchParseError = _mk("BenchParseError", 2)
+RedefinitionError = _mk("RedefinitionError", 3)
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +716,314 @@ def load_circ(path):
 
 
 # ---------------------------------------------------------------------------
+# JSON and BENCH formats
+# ---------------------------------------------------------------------------
+
+FORMAT_BY_EXT = {".circ": "circ", ".json": "json", ".bench": "bench"}
+FORMATS = ("auto", "circ", "json", "bench")
+
+
+def resolve_format(path, fmt):
+    if fmt == "auto":
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in FORMAT_BY_EXT:
+            raise UnknownInputFormatError(
+                "cannot determine input format from extension %r of %s "
+                "(use --format circ|json|bench)" % (ext, path), path)
+        return FORMAT_BY_EXT[ext]
+    return fmt
+
+
+def read_text(path, decode_err_cls):
+    if not os.path.isfile(path):
+        raise FileNotFoundErr("file not found: %s" % path, path)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise FileNotFoundErr("cannot read file %s: %s" % (path, e), path)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise decode_err_cls("file is not valid UTF-8: %s" % e, path, 1, 1)
+    if text.startswith("﻿"):
+        text = text[1:]
+    return text
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _parse_rhs(text, file, where):
+    if "\n" in text or "\r" in text:
+        raise CircParseError("%s: expression must not contain newlines" % where,
+                             file)
+    toks = tokenize(text, file, None)
+    p = LineParser(toks, file, None)
+    expr = p.parse_expr()
+    t = p.peek()
+    if t.kind != "eol":
+        raise p.err("unexpected %r after expression" % t.value, t)
+    return expr
+
+
+def load_json_circuit(path):
+    text = read_text(path, JsonParseError)
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise JsonParseError("invalid JSON: %s" % e.msg, path, e.lineno, e.colno)
+    except ValueError as e:
+        raise JsonParseError("invalid JSON: %s" % e, path)
+
+    def bad(msg):
+        return JsonSchemaError(msg, path)
+
+    if not isinstance(doc, dict):
+        raise bad("top-level JSON value must be an object")
+    required = ("format_version", "inputs", "outputs", "wires", "assignments")
+    for k in required:
+        if k not in doc:
+            raise bad("missing required key %r" % k)
+    for k in doc:
+        if k not in required:
+            raise bad("unknown key %r" % k)
+    fv = doc["format_version"]
+    if not _is_int(fv) or fv != 1:
+        raise bad("format_version must be 1, got %s" % json.dumps(fv))
+
+    items = []
+    for kind, key in (("input", "inputs"), ("output", "outputs"), ("wire", "wires")):
+        ports = doc[key]
+        if not isinstance(ports, list):
+            raise bad("%r must be an array" % key)
+        names = []
+        for i, p in enumerate(ports):
+            where = "%s[%d]" % (key, i)
+            if not isinstance(p, dict):
+                raise bad("%s must be an object" % where)
+            for k in ("name", "msb", "lsb"):
+                if k not in p:
+                    raise bad("%s: missing required key %r" % (where, k))
+            for k in p:
+                if k not in ("name", "msb", "lsb"):
+                    raise bad("%s: unknown key %r" % (where, k))
+            name, msb, lsb = p["name"], p["msb"], p["lsb"]
+            if not isinstance(name, str) or not IDENT_RE.fullmatch(name):
+                raise bad("%s: name must be an identifier string, got %s"
+                          % (where, json.dumps(name)))
+            if name.lower() in KEYWORDS or name == "X":
+                raise bad("%s: %r is a reserved word" % (where, name))
+            if not _is_int(msb) or not _is_int(lsb):
+                raise bad("%s: msb and lsb must be integers" % where)
+            if lsb < 0 or msb < lsb:
+                raise bad("%s: invalid range [%d:%d] (need msb >= lsb >= 0)"
+                          % (where, msb, lsb))
+            names.append((name, None, msb, lsb))
+        if names:
+            items.append(("decl", kind, names, None, None))
+
+    assigns = doc["assignments"]
+    if not isinstance(assigns, list):
+        raise bad("'assignments' must be an array")
+    parsed = []
+    for i, a in enumerate(assigns):
+        where = "assignments[%d]" % i
+        if not isinstance(a, dict):
+            raise bad("%s must be an object" % where)
+        for k in ("lhs", "rhs"):
+            if k not in a:
+                raise bad("%s: missing required key %r" % (where, k))
+        for k in a:
+            if k not in ("lhs", "rhs"):
+                raise bad("%s: unknown key %r" % (where, k))
+        lhs, rhs = a["lhs"], a["rhs"]
+        if not isinstance(lhs, str) or not IDENT_RE.fullmatch(lhs):
+            raise bad("%s: lhs must be an identifier string, got %s"
+                      % (where, json.dumps(lhs)))
+        if not isinstance(rhs, str):
+            raise bad("%s: rhs must be a string" % where)
+        parsed.append((lhs, rhs, where))
+    for lhs, rhs, where in parsed:
+        expr = _parse_rhs(rhs, path, where)
+        items.append(("assign", lhs, expr, None, None))
+    return build_circuit(items, path)
+
+
+BENCH_OPS = {"NOT", "BUF", "AND", "OR", "XOR", "NAND", "NOR", "XNOR"}
+
+
+class BenchLineParser(LineParser):
+    def err(self, msg, tok):
+        return BenchParseError(msg, self.file, self.lineno, tok.col)
+
+    def expect_ident(self, what):
+        t = self.peek()
+        if t.kind == "ident":
+            self.next()
+            nt = self.peek()
+            if nt.kind == "punct" and nt.value in "[]":
+                raise self.err("vector syntax is not allowed in BENCH files "
+                               "(signals are scalar)", nt)
+            return t
+        if t.kind == "num":
+            raise self.err("literals are not allowed in BENCH files (%r)"
+                           % t.value, t)
+        if t.kind == "punct" and t.value in "[]":
+            raise self.err("vector syntax is not allowed in BENCH files", t)
+        found = "end of line" if t.kind == "eol" else repr(t.value)
+        raise self.err("expected %s, found %s" % (what, found), t)
+
+    def parse_bench_expr(self):
+        t = self.expect_ident("identifier or operator")
+        nt = self.peek()
+        if nt.kind == "punct" and nt.value == "(":
+            op = t.value.upper()
+            if op not in BENCH_OPS:
+                raise self.err("unknown or unsupported BENCH operator %r"
+                               % t.value, t)
+            self.next()
+            args = []
+            if self.is_punct(")"):
+                self.next()
+                return Call(op, args, self.lineno, t.col)
+            while True:
+                args.append(self.parse_bench_expr())
+                st = self.peek()
+                if st.kind == "punct" and st.value == ",":
+                    self.next()
+                    continue
+                if st.kind == "punct" and st.value == ")":
+                    self.next()
+                    break
+                if st.kind == "num":
+                    raise self.err("literals are not allowed in BENCH files", st)
+                if st.kind == "punct" and st.value in "[]":
+                    raise self.err("vector syntax is not allowed in BENCH files", st)
+                found = "end of line" if st.kind == "eol" else repr(st.value)
+                raise self.err("expected ',' or ')', found %s" % found, st)
+            return Call(op, args, self.lineno, t.col)
+        return Ident(t.value, self.lineno, t.col)
+
+
+def _bench_tokenize(line, file, lineno):
+    try:
+        return tokenize(line, file, lineno)
+    except CircParseError as e:
+        raise BenchParseError(e.message, e.file, e.line, e.col)
+
+
+def load_bench_circuit(path):
+    text = read_text(path, BenchParseError)
+    inputs = []          # (name, line, col)
+    outputs = []         # (name, line, col)
+    assigns = []         # (lhs, expr, line, col)
+    defined = {}         # name -> description of first definition
+    for idx, raw in enumerate(text.split("\n")):
+        lineno = idx + 1
+        line = raw.rstrip("\r")
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        if "[" in line.split("#", 1)[0] or "]" in line.split("#", 1)[0]:
+            s = line.split("#", 1)[0]
+            pos = min(i for i in (s.find("["), s.find("]")) if i >= 0)
+            raise BenchParseError("'[' and ']' are not allowed in BENCH files "
+                                  "(signals are scalar)", path, lineno, pos + 1)
+        toks = _bench_tokenize(line, path, lineno)
+        if toks[0].kind == "eol":
+            continue
+        p = BenchLineParser(toks, path, lineno)
+        first = toks[0]
+        kw = first.value.upper() if first.kind == "ident" else None
+        if kw in ("INPUT", "OUTPUT") and toks[1].kind == "punct" and toks[1].value == "(":
+            p.next()
+            p.next()
+            nt = p.expect_ident("signal name")
+            p.expect_punct(")")
+            t = p.peek()
+            if t.kind != "eol":
+                raise p.err("unexpected %r after %s(...)" % (t.value, kw), t)
+            if kw == "INPUT":
+                if nt.value in defined:
+                    raise RedefinitionError(
+                        "signal %r already defined (%s)" % (nt.value, defined[nt.value]),
+                        path, lineno, nt.col)
+                defined[nt.value] = "input at line %d" % lineno
+                inputs.append((nt.value, lineno, nt.col))
+            else:
+                outputs.append((nt.value, lineno, nt.col))
+            continue
+        if first.kind == "num":
+            raise p.err("literals are not allowed in BENCH files (%r)" % first.value,
+                        first)
+        if first.kind != "ident":
+            raise p.err("expected INPUT, OUTPUT or assignment", first)
+        lhs = p.expect_ident("signal name")
+        p.expect_punct("=")
+        ot = p.peek()
+        if not (ot.kind == "ident" and p.is_punct("(", 1)):
+            if ot.kind == "num":
+                raise p.err("literals are not allowed in BENCH files (%r)"
+                            % ot.value, ot)
+            raise p.err("expected operator call OP(...) on right-hand side", ot)
+        expr = p.parse_bench_expr()
+        t = p.peek()
+        if t.kind != "eol":
+            if t.kind == "num":
+                raise p.err("literals are not allowed in BENCH files", t)
+            raise p.err("unexpected %r after expression" % t.value, t)
+        if lhs.value in defined:
+            raise RedefinitionError(
+                "signal %r already defined (%s)" % (lhs.value, defined[lhs.value]),
+                path, lineno, lhs.col)
+        defined[lhs.value] = "assigned at line %d" % lineno
+        assigns.append((lhs.value, expr, lineno, lhs.col))
+
+    items = []
+    if inputs:
+        items.append(("decl", "input", [(n, col, 0, 0) for n, _, col in inputs],
+                      inputs[0][1], None))
+    if assigns:
+        items.append(("decl", "wire", [(n, col, 0, 0) for n, _, _, col in assigns],
+                      assigns[0][2], None))
+    for lhs, expr, lineno, col in assigns:
+        items.append(("assign", lhs, expr, lineno, col))
+    c = build_circuit(items, path)
+    seen = set()
+    for name, lineno, col in outputs:
+        if name not in c.kinds:
+            raise UndefinedNameError(
+                "OUTPUT(%s) references undefined signal %r" % (name, name),
+                path, lineno, col)
+        if name not in seen:
+            seen.add(name)
+            c.outputs.append(name)
+    return c
+
+
+def load_circuit(path, fmt="auto"):
+    """Load a circuit in the given format; return (circuit, format)."""
+    fmt = resolve_format(path, fmt)
+    if fmt == "circ":
+        return load_circ(path), fmt
+    if fmt == "json":
+        return load_json_circuit(path), fmt
+    return load_bench_circuit(path), fmt
+
+
+def get_format_opt(opts):
+    if opts and opts.get("--format"):
+        raw = opts["--format"][-1]
+        f = raw.strip().lower()
+        if f not in FORMATS:
+            raise CliUsageError("invalid --format %r (expected auto, circ, json "
+                                "or bench)" % raw)
+        return f
+    return "auto"
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -729,12 +1043,12 @@ def sig_text(c, names):
     return " ".join(parts) or "(none)"
 
 
-def cmd_check(args):
+def cmd_check(args, opts=None):
     if len(args) != 1:
         raise CliUsageError("check requires exactly one file argument")
-    c = load_circ(args[0])
+    c, fmt = load_circuit(args[0], get_format_opt(opts))
     result = {
-        "format": "circ",
+        "format": fmt,
         "inputs": sig_list(c, c.inputs),
         "outputs": sig_list(c, c.outputs),
     }
@@ -962,6 +1276,7 @@ def evaluate(c, inputs):
 def cmd_eval(args, opts):
     if len(args) != 1:
         raise CliUsageError("eval requires exactly one file argument")
+    get_format_opt(opts)
     mode = "2val"
     if opts.get("--mode"):
         mode = opts["--mode"][-1].strip().lower()
@@ -999,7 +1314,7 @@ def cmd_eval(args, opts):
             default = parse_bit(opts["--default"][-1], "--default")
     allow_extra = bool(opts.get("--allow-extra"))
 
-    c = load_circ(args[0])
+    c, _fmt = load_circuit(args[0], get_format_opt(opts))
     inputs = {}
     input_set = set(c.inputs)
     for name, raw, (v, w) in sets:
@@ -1049,8 +1364,8 @@ def cmd_eval(args, opts):
 COMMANDS = {"check": cmd_check, "eval": cmd_eval}
 # command -> {flag: takes_value}
 COMMAND_FLAGS = {
-    "check": {},
-    "eval": {"--set": True, "--default": True, "--allow-extra": False,
+    "check": {"--format": True},
+    "eval": {"--format": True, "--set": True, "--default": True, "--allow-extra": False,
              "--radix": True, "--mode": True},
 }
 ALL_VALUE_FLAGS = {f for d in COMMAND_FLAGS.values() for f, v in d.items() if v}
@@ -1142,7 +1457,7 @@ def main(argv):
             if missing_value is not None:
                 raise CliUsageError("flag %s requires a value" % missing_value)
             if command == "check":
-                result, text = cmd_check(positional[1:])
+                result, text = cmd_check(positional[1:], opts)
             else:
                 result, text = COMMANDS[command](positional[1:], opts)
         except CircoptError:
