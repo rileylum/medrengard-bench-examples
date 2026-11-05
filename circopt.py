@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""circopt - circuit tool (Part 1: CLI basics and `check`; Part 2: `eval`)."""
+"""circopt - circuit tool (Part 1: CLI basics and `check`; Part 2: `eval`;
+Part 3: vectors, richer expressions and `--radix`)."""
 
 import json
 import os
@@ -15,6 +16,7 @@ Commands:
   check <file.circ>    Parse and validate a .circ circuit file and report
                        its interface.
   eval <file.circ> [--set name=value ...] [--default 0|1] [--allow-extra]
+       [--radix bin|hex|dec]
                        Evaluate the circuit (2-valued) and print outputs.
 
 Global flags:
@@ -37,6 +39,12 @@ OPERATORS = {
     "NAND": (2, None),
     "NOR": (2, None),
     "XNOR": (2, None),
+    "MUX": (3, 3),
+    "ITE": (3, 3),
+    "REDUCE_AND": (1, 1),
+    "REDUCE_OR": (1, 1),
+    "REDUCE_XOR": (1, 1),
+    "EQ": (2, 2),
 }
 
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -77,6 +85,80 @@ CycleError = _mk("CycleError", 3)
 MissingInputError = _mk("MissingInputError", 1)
 UnknownInputError = _mk("UnknownInputError", 1)
 InputValueParseError = _mk("InputValueParseError", 2)
+WidthMismatchError = _mk("WidthMismatchError", 3)
+IndexOutOfBoundsError = _mk("IndexOutOfBoundsError", 3)
+InputWidthMismatchError = _mk("InputWidthMismatchError", 3)
+
+
+# ---------------------------------------------------------------------------
+# Literals
+# ---------------------------------------------------------------------------
+
+_BIN_DIGITS = set("01")
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+_DEC_DIGITS = set("0123456789")
+
+
+def parse_literal(text):
+    """Parse a literal; return (value, width). Raise ValueError on bad syntax."""
+    t = text
+    if t in ("0", "1"):
+        return int(t), 1
+    if "'" in t:
+        size_s, _, rest = t.partition("'")
+        size_s = size_s.replace("_", "")
+        if not size_s or not set(size_s) <= _DEC_DIGITS:
+            raise ValueError("invalid literal size in %r" % text)
+        width = int(size_s)
+        if width < 1:
+            raise ValueError("literal width must be at least 1 in %r" % text)
+        if not rest:
+            raise ValueError("missing base in literal %r" % text)
+        base = rest[0].lower()
+        digits = rest[1:].replace("_", "")
+        if not digits:
+            raise ValueError("missing digits in literal %r" % text)
+        if base == "b":
+            ok, radix = _BIN_DIGITS, 2
+        elif base == "h":
+            ok, radix = _HEX_DIGITS, 16
+        elif base == "d":
+            ok, radix = _DEC_DIGITS, 10
+        else:
+            raise ValueError("invalid base %r in literal %r" % (rest[0], text))
+        if not set(digits) <= ok:
+            raise ValueError("invalid digits in literal %r" % text)
+        value = int(digits, radix)
+        if value >= (1 << width):
+            raise ValueError("literal %r value %d does not fit in %d bit(s)"
+                             % (text, value, width))
+        return value, width
+    if len(t) >= 2 and t[0] == "0" and t[1] in "bBxX":
+        digits = t[2:].replace("_", "")
+        if not digits:
+            raise ValueError("missing digits in literal %r" % text)
+        if t[1] in "bB":
+            if not set(digits) <= _BIN_DIGITS:
+                raise ValueError("invalid binary digits in literal %r" % text)
+            return int(digits, 2), len(digits)
+        if not set(digits) <= _HEX_DIGITS:
+            raise ValueError("invalid hex digits in literal %r" % text)
+        return int(digits, 16), 4 * len(digits)
+    raise ValueError("invalid literal %r" % text)
+
+
+def mask(w):
+    return (1 << w) - 1
+
+
+def format_value(value, width, radix):
+    if width == 1:
+        return str(value)
+    if radix == "hex":
+        return "0x" + format(value, "0%dx" % ((width + 3) // 4))
+    if radix == "dec":
+        return str(value)
+    return "0b" + format(value, "0%db" % width)
 
 
 # ---------------------------------------------------------------------------
@@ -115,17 +197,17 @@ def tokenize(text, file, lineno):
             j = i
             while j < n and (text[j].isalnum() or text[j] == "_"):
                 j += 1
+            if j < n and text[j] == "'":
+                j += 1
+                while j < n and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
             toks.append(Tok("num", text[i:j], i + 1))
             i = j
             continue
-        if c in "(),=":
+        if c in "(),=[]:{}":
             toks.append(Tok("punct", c, i + 1))
             i += 1
             continue
-        if c in "[]":
-            raise CircParseError(
-                "brackets are not supported in scalar .circ files",
-                file, lineno, i + 1)
         raise CircParseError("unexpected character %r" % c, file, lineno, i + 1)
     # End-of-line token: placed at the last non-blank character position.
     stripped = text.split("#", 1)[0].rstrip()
@@ -144,8 +226,23 @@ class Ident(Expr):
 
 
 class Const(Expr):
-    def __init__(self, value, line, col):
-        self.value, self.line, self.col = value, line, col
+    def __init__(self, value, width, line, col):
+        self.value, self.width, self.line, self.col = value, width, line, col
+
+
+class Index(Expr):
+    def __init__(self, name, idx, line, col):
+        self.name, self.idx, self.line, self.col = name, idx, line, col
+
+
+class Slice(Expr):
+    def __init__(self, name, hi, lo, line, col):
+        self.name, self.hi, self.lo, self.line, self.col = name, hi, lo, line, col
+
+
+class Concat(Expr):
+    def __init__(self, parts, line, col):
+        self.parts, self.line, self.col = parts, line, col
 
 
 class Call(Expr):
@@ -179,15 +276,55 @@ class LineParser:
         what = "end of line" if t.kind == "eol" else repr(t.value)
         raise self.err("expected %r, found %s" % (p, what), t)
 
+    def is_punct(self, p, k=0):
+        t = self.peek(k)
+        return t.kind == "punct" and t.value == p
+
+    def expect_int(self):
+        t = self.peek()
+        if t.kind == "num" and t.value.isdigit():
+            self.next()
+            return int(t.value)
+        what = "end of line" if t.kind == "eol" else repr(t.value)
+        raise self.err("expected integer, found %s" % what, t)
+
+    def parse_range(self):
+        """Parse '[' int (':' int)? ']' ; returns (a, b or None)."""
+        self.expect_punct("[")
+        a = self.expect_int()
+        b = None
+        if self.is_punct(":"):
+            self.next()
+            b = self.expect_int()
+        self.expect_punct("]")
+        return a, b
+
     def parse_expr(self):
         t = self.peek()
         if t.kind == "eol":
             raise self.err("unexpected end of line, expected expression", t)
         if t.kind == "num":
             self.next()
-            if t.value in ("0", "1"):
-                return Const(int(t.value), self.lineno, t.col)
-            raise self.err("invalid literal %r (only 0 and 1 allowed)" % t.value, t)
+            try:
+                value, width = parse_literal(t.value)
+            except ValueError as ex:
+                raise self.err(str(ex), t)
+            return Const(value, width, self.lineno, t.col)
+        if t.kind == "punct" and t.value == "{":
+            self.next()
+            parts = []
+            while True:
+                parts.append(self.parse_expr())
+                st = self.peek()
+                if st.kind == "punct" and st.value == ",":
+                    self.next()
+                    continue
+                if st.kind == "punct" and st.value == "}":
+                    self.next()
+                    break
+                what = "end of line" if st.kind == "eol" else repr(st.value)
+                raise self.err("expected ',' or '}', found %s" % what, st)
+            return Concat(parts, self.lineno, t.col)
         if t.kind == "ident":
             self.next()
             nt = self.peek()
@@ -216,6 +353,11 @@ class LineParser:
                 raise self.err("literal X values are not allowed in .circ files", t)
             if t.value.lower() in KEYWORDS:
                 raise self.err("keyword %r cannot be used as an expression" % t.value, t)
+            if self.is_punct("["):
+                a, b = self.parse_range()
+                if b is None:
+                    return Index(t.value, a, self.lineno, t.col)
+                return Slice(t.value, a, b, self.lineno, t.col)
             return Ident(t.value, self.lineno, t.col)
         raise self.err("unexpected %r, expected expression" % t.value, t)
 
@@ -252,7 +394,16 @@ def parse_circ(text, file):
                 if t.value == "X":
                     raise p.err("'X' is reserved for the unknown literal", t)
                 p.next()
-                names.append((t.value, t.col))
+                msb, lsb = 0, 0
+                if p.is_punct("["):
+                    rt = p.peek()
+                    msb, lsb = p.parse_range()
+                    if lsb is None:
+                        raise p.err("vector declaration requires [msb:lsb]", rt)
+                    if msb < lsb:
+                        raise p.err("invalid range [%d:%d]: msb must be >= lsb"
+                                    % (msb, lsb), rt)
+                names.append((t.value, t.col, msb, lsb))
                 nt = p.peek()
                 if nt.kind == "punct" and nt.value == ",":
                     p.next()
@@ -287,15 +438,19 @@ class Circuit:
         self.outputs = []
         self.wires = []
         self.kinds = {}
+        self.ranges = {}  # name -> (msb, lsb)
         self.assigns = {}  # name -> expr
         self.order = []
 
 
 def expr_refs(e, out):
-    if isinstance(e, Ident):
+    if isinstance(e, (Ident, Index, Slice)):
         out.append(e)
     elif isinstance(e, Call):
         for a in e.args:
+            expr_refs(a, out)
+    elif isinstance(e, Concat):
+        for a in e.parts:
             expr_refs(a, out)
 
 
@@ -312,6 +467,71 @@ def check_arity(e, file):
                              file, e.line, e.col)
         for a in e.args:
             check_arity(a, file)
+    elif isinstance(e, Concat):
+        for a in e.parts:
+            check_arity(a, file)
+
+
+BITWISE_NARY = {"AND", "OR", "XOR", "NAND", "NOR", "XNOR"}
+
+
+def check_width(e, c, file):
+    """Compute and annotate expression widths (e.w)."""
+    if isinstance(e, Const):
+        e.w = e.width
+    elif isinstance(e, Ident):
+        msb, lsb = c.ranges[e.name]
+        e.w = msb - lsb + 1
+    elif isinstance(e, Index):
+        msb, lsb = c.ranges[e.name]
+        if not (lsb <= e.idx <= msb):
+            raise IndexOutOfBoundsError(
+                "index %d out of bounds for %r [%d:%d] (width %d)"
+                % (e.idx, e.name, msb, lsb, msb - lsb + 1), file, e.line, e.col)
+        e.w = 1
+    elif isinstance(e, Slice):
+        msb, lsb = c.ranges[e.name]
+        if e.hi < e.lo or not (lsb <= e.lo and e.hi <= msb):
+            raise IndexOutOfBoundsError(
+                "slice [%d:%d] out of bounds for %r [%d:%d] (width %d)"
+                % (e.hi, e.lo, e.name, msb, lsb, msb - lsb + 1),
+                file, e.line, e.col)
+        e.w = e.hi - e.lo + 1
+    elif isinstance(e, Concat):
+        e.w = sum(check_width(p, c, file) for p in e.parts)
+    else:
+        ws = [check_width(a, c, file) for a in e.args]
+        op = e.op
+        if op in ("NOT", "BUF"):
+            e.w = ws[0]
+        elif op in BITWISE_NARY:
+            for w in ws[1:]:
+                if w != ws[0]:
+                    raise WidthMismatchError(
+                        "%s operand widths differ: %d vs %d" % (op, ws[0], w),
+                        file, e.line, e.col)
+            e.w = ws[0]
+        elif op in ("MUX", "ITE"):
+            if ws[0] != 1:
+                raise WidthMismatchError(
+                    "%s selector must have width 1, got width %d" % (op, ws[0]),
+                    file, e.line, e.col)
+            if ws[1] != ws[2]:
+                raise WidthMismatchError(
+                    "%s data operand widths differ: %d vs %d" % (op, ws[1], ws[2]),
+                    file, e.line, e.col)
+            e.w = ws[1]
+        elif op.startswith("REDUCE_"):
+            e.w = 1
+        elif op == "EQ":
+            if ws[0] != ws[1]:
+                raise WidthMismatchError(
+                    "EQ operand widths differ: %d vs %d" % (ws[0], ws[1]),
+                    file, e.line, e.col)
+            e.w = 1
+        else:
+            raise CircoptError("unknown operator %s" % op)
+    return e.w
 
 
 def build_circuit(items, file):
@@ -324,12 +544,13 @@ def build_circuit(items, file):
             if seen_assign:
                 raise DeclarationAfterAssignmentError(
                     "%s declaration after assignment" % kind, file, lineno, col)
-            for name, ncol in names:
+            for name, ncol, msb, lsb in names:
                 if name in c.kinds:
                     raise DuplicateNameError(
                         "name %r already declared as %s" % (name, c.kinds[name]),
                         file, lineno, ncol)
                 c.kinds[name] = kind
+                c.ranges[name] = (msb, lsb)
                 {"input": c.inputs, "output": c.outputs, "wire": c.wires}[kind].append(name)
         else:
             seen_assign = True
@@ -355,6 +576,13 @@ def build_circuit(items, file):
                 raise UndefinedNameError("undefined name %r" % r.name,
                                          file, r.line, r.col)
         check_arity(expr, file)
+        ew = check_width(expr, c, file)
+        msb, lsb = c.ranges[lhs]
+        lw = msb - lsb + 1
+        if ew != lw:
+            raise WidthMismatchError(
+                "assignment to %r: target width %d, expression width %d"
+                % (lhs, lw, ew), file, lineno, col)
         c.assigns[lhs] = expr
         c.order.append(lhs)
     # Unassigned
@@ -420,8 +648,20 @@ def load_circ(path):
 # Commands
 # ---------------------------------------------------------------------------
 
-def sig_list(names):
-    return [{"name": n, "msb": 0, "lsb": 0} for n in sorted(names)]
+def sig_list(c, names):
+    return [{"name": n, "msb": c.ranges[n][0], "lsb": c.ranges[n][1]}
+            for n in sorted(names)]
+
+
+def sig_text(c, names):
+    parts = []
+    for n in sorted(names):
+        msb, lsb = c.ranges[n]
+        if (msb, lsb) == (0, 0):
+            parts.append(n)
+        else:
+            parts.append("%s[%d:%d]" % (n, msb, lsb))
+    return " ".join(parts) or "(none)"
 
 
 def cmd_check(args):
@@ -430,14 +670,11 @@ def cmd_check(args):
     c = load_circ(args[0])
     result = {
         "format": "circ",
-        "inputs": sig_list(c.inputs),
-        "outputs": sig_list(c.outputs),
+        "inputs": sig_list(c, c.inputs),
+        "outputs": sig_list(c, c.outputs),
     }
     text = "OK %s\ninputs: %s\noutputs: %s" % (
-        args[0],
-        " ".join(sorted(c.inputs)) or "(none)",
-        " ".join(sorted(c.outputs)) or "(none)",
-    )
+        args[0], sig_text(c, c.inputs), sig_text(c, c.outputs))
     return result, text
 
 
@@ -452,28 +689,62 @@ def parse_bit(text, what):
     raise InputValueParseError("invalid value %r for %s (expected 0 or 1)" % (text, what))
 
 
-def eval_expr(e, env):
+def parse_runtime_literal(text, what):
+    v = text.strip()
+    try:
+        return parse_literal(v)
+    except ValueError as ex:
+        raise InputValueParseError("invalid value %r for %s: %s" % (text, what, ex))
+
+
+def eval_expr(e, env, c):
     if isinstance(e, Const):
         return e.value
     if isinstance(e, Ident):
         return env[e.name]
-    vals = [eval_expr(a, env) for a in e.args]
+    if isinstance(e, Index):
+        lsb = c.ranges[e.name][1]
+        return (env[e.name] >> (e.idx - lsb)) & 1
+    if isinstance(e, Slice):
+        lsb = c.ranges[e.name][1]
+        return (env[e.name] >> (e.lo - lsb)) & mask(e.w)
+    if isinstance(e, Concat):
+        r = 0
+        for p in e.parts:
+            r = (r << p.w) | eval_expr(p, env, c)
+        return r
+    vals = [eval_expr(a, env, c) for a in e.args]
     op = e.op
+    m = mask(e.w)
     if op == "BUF":
         return vals[0]
     if op == "NOT":
-        return 1 - vals[0]
+        return ~vals[0] & m
     if op in ("AND", "NAND"):
-        r = 1 if all(vals) else 0
-        return r if op == "AND" else 1 - r
+        r = vals[0]
+        for v in vals[1:]:
+            r &= v
+        return r if op == "AND" else ~r & m
     if op in ("OR", "NOR"):
-        r = 1 if any(vals) else 0
-        return r if op == "OR" else 1 - r
+        r = vals[0]
+        for v in vals[1:]:
+            r |= v
+        return r if op == "OR" else ~r & m
     if op in ("XOR", "XNOR"):
         r = 0
         for v in vals:
             r ^= v
-        return r if op == "XOR" else 1 - r
+        return r if op == "XOR" else ~r & m
+    if op in ("MUX", "ITE"):
+        return vals[1] if vals[0] else vals[2]
+    if op == "REDUCE_AND":
+        return 1 if vals[0] == mask(e.args[0].w) else 0
+    if op == "REDUCE_OR":
+        return 1 if vals[0] else 0
+    if op == "REDUCE_XOR":
+        return bin(vals[0]).count("1") & 1
+    if op == "EQ":
+        return 1 if vals[0] == vals[1] else 0
     raise CircoptError("unknown operator %s" % op)
 
 
@@ -510,7 +781,7 @@ def topo_order(c):
 def evaluate(c, inputs):
     env = dict(inputs)
     for name in topo_order(c):
-        env[name] = eval_expr(c.assigns[name], env)
+        env[name] = eval_expr(c.assigns[name], env, c)
     return env
 
 
@@ -525,20 +796,32 @@ def cmd_eval(args, opts):
         name = name.strip()
         if not name:
             raise InputValueParseError("invalid --set %r (empty name)" % s)
-        sets.append((name, parse_bit(val, name)))
+        sets.append((name, val, parse_runtime_literal(val, name)))
     default = None
     if opts.get("--default"):
         default = parse_bit(opts["--default"][-1], "--default")
     allow_extra = bool(opts.get("--allow-extra"))
+    radix = "bin"
+    if opts.get("--radix"):
+        radix = opts["--radix"][-1].strip().lower()
+        if radix not in ("bin", "hex", "dec"):
+            raise CliUsageError("invalid --radix %r (expected bin, hex or dec)"
+                                % opts["--radix"][-1])
 
     c = load_circ(args[0])
     inputs = {}
     input_set = set(c.inputs)
-    for name, v in sets:
+    for name, raw, (v, w) in sets:
         if name not in input_set:
             if allow_extra:
                 continue
             raise UnknownInputError("unknown input %r" % name)
+        msb, lsb = c.ranges[name]
+        dw = msb - lsb + 1
+        if w != dw:
+            raise InputWidthMismatchError(
+                "value %r for input %r has width %d, but declared width is %d"
+                % (raw.strip(), name, w, dw))
         inputs[name] = v
     missing = [n for n in sorted(c.inputs) if n not in inputs]
     if missing:
@@ -546,16 +829,22 @@ def cmd_eval(args, opts):
             raise MissingInputError("missing value for input(s): %s"
                                     % ", ".join(missing))
         for n in missing:
-            inputs[n] = default
+            msb, lsb = c.ranges[n]
+            inputs[n] = mask(msb - lsb + 1) if default else 0
     env = evaluate(c, inputs)
     outs = sorted(c.outputs)
     result = {
         "mode": "2val",
-        "radix": "bin",
-        "outputs": [{"name": n, "msb": 0, "lsb": 0, "value": str(env[n])}
-                    for n in outs],
+        "radix": radix,
+        "outputs": [],
     }
-    text = "\n".join("%s=%d" % (n, env[n]) for n in outs)
+    lines = []
+    for n in outs:
+        msb, lsb = c.ranges[n]
+        val = format_value(env[n], msb - lsb + 1, radix)
+        result["outputs"].append({"name": n, "msb": msb, "lsb": lsb, "value": val})
+        lines.append("%s=%s" % (n, val))
+    text = "\n".join(lines)
     return result, text
 
 
@@ -563,7 +852,8 @@ COMMANDS = {"check": cmd_check, "eval": cmd_eval}
 # command -> {flag: takes_value}
 COMMAND_FLAGS = {
     "check": {},
-    "eval": {"--set": True, "--default": True, "--allow-extra": False},
+    "eval": {"--set": True, "--default": True, "--allow-extra": False,
+             "--radix": True},
 }
 ALL_VALUE_FLAGS = {f for d in COMMAND_FLAGS.values() for f, v in d.items() if v}
 ALL_CMD_FLAGS = {f for d in COMMAND_FLAGS.values() for f in d}
