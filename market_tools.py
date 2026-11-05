@@ -2,7 +2,7 @@
 """EVE market tooling API.
 
 Launch: python market_tools.py --sde ./sde [--port 8000] [--address 0.0.0.0]
-Uses only the Python standard library.
+Requires numpy + scipy (HiGHS MILP) for POST /v1/compress.
 """
 from __future__ import annotations
 
@@ -22,6 +22,13 @@ import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+try:  # optional at import time; required for /v1/compress
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    from scipy.sparse import coo_matrix
+except ImportError:  # pragma: no cover
+    np = None
 
 csv.field_size_limit(sys.maxsize)
 
@@ -230,6 +237,37 @@ class SDE:
                         self.ship_volumes[k] = float(v.strip().strip("'\""))
                     except ValueError:
                         continue
+
+    def ore_variants(self) -> dict[int, str]:
+        """Classify ore types into variant tiers (base/plus5/plus10/plus15/plus100)."""
+        cached = getattr(self, "_variants", None)
+        if cached is not None:
+            return cached
+        families: dict[tuple, list[int]] = {}
+        for tid, mats in self.materials.items():
+            gid = self.type_group.get(tid)
+            if self.group_category.get(gid) != ASTEROID_CATEGORY:
+                continue
+            key = (gid, frozenset(m for m, _ in mats))
+            families.setdefault(key, []).append(tid)
+        tiers = [(1.0, "base"), (1.05, "plus5"), (1.10, "plus10"), (1.15, "plus15"), (2.0, "plus100")]
+        out: dict[int, str] = {}
+
+        def stripped(tid):
+            n = self.type_names.get(tid, "")
+            n = re.sub(r"^(Batch\s+)?Compressed\s+", "", n)
+            return n
+
+        for tids in families.values():
+            totals = {t: sum(q for _, q in self.materials[t]) for t in tids}
+            base = min(tids, key=lambda t: (len(stripped(t)), totals[t], t))
+            bsum = totals[base]
+            for t in tids:
+                ratio = totals[t] / bsum if bsum else 1.0
+                best = min(tiers, key=lambda tr: abs(tr[0] - ratio))
+                out[t] = best[1] if abs(best[0] - ratio) <= 0.02 else "base"
+        self._variants = out
+        return out
 
     def resolve(self, name: str):
         tid = self.type_by_name.get(name)
@@ -456,6 +494,8 @@ RIG_RM = {None: 0.0, "t1": 1.0, "t2": 3.0}
 SECURITY_SEC = {"highsec": 0.0, "lowsec": 0.06, "nullsec": 0.12}
 IMPLANT_IM = {None: 0.0, "RX-801": 0.01, "RX-802": 0.02, "RX-804": 0.04}
 MARKETS = {"jita": "jita", "amarr": "amarr", "dodixie": "dodixie", "rens": "rens", "hek": "hek"}
+MIP_GAP = 1e-7
+MIP_TIME_LIMIT = 10.0
 DEFAULT_EFFICIENCY = {"ore": 0.9063, "gas": 0.95, "scrap": 0.55}
 
 
@@ -619,7 +659,120 @@ def reprocess(sde: SDE, items: dict[int, int], model: YieldModel, drill_down: bo
     return products
 
 
+def sde_mq(sde, tid: int, mid: int) -> int:
+    return sum(q for m, q in sde.materials.get(tid, []) if m == mid)
+
+
 # --------------------------------------------------------------------------- state
+
+
+class _PortionEvaluator:
+    """Exact (floor-rounded) yield/cost evaluation and local repair of a portion plan."""
+
+    def __init__(self, sde, cands, targets, mats, cpm, tax):
+        self.sde = sde
+        self.info = {c[0]: c for c in cands}
+        self.targets = targets
+        self.mats = mats
+        self.cpm = cpm
+        self.tax = tax
+        self.tmats = {tid: [(m, q) for m, q in sde.materials[tid] if m in targets and m in set(mats)]
+                      for tid in self.info}
+
+    def yield_of(self, tid, m_q, n):
+        return int(math.floor(m_q * n * self.info[tid][4] + 1e-9)) if n > 0 else 0
+
+    def produced(self, portions):
+        out = {m: 0 for m in self.mats}
+        for tid, n in portions.items():
+            for m, q in self.tmats[tid]:
+                out[m] += self.yield_of(tid, q, n)
+        return out
+
+    def units_cost(self, tid, start_units, units):
+        """Cost of buying `units` more after `start_units` already bought; None if not enough volume."""
+        _t, _cls, portion, vol, _y, _ymap, sells = self.info[tid]
+        have = start_units
+        need = units
+        cost = 0.0
+        for o in sells:
+            if need <= 0:
+                break
+            if have >= o.volume_remain:
+                have -= o.volume_remain
+                continue
+            take = min(o.volume_remain - have, need)
+            have = 0
+            cost += take * o.price
+            need -= take
+        if need > 0:
+            return None
+        return cost * (1 + self.tax) + units * vol * self.cpm
+
+    def cost(self, portions):
+        tot = 0.0
+        for tid, n in portions.items():
+            if n > 0:
+                tot += self.units_cost(tid, 0, n * self.info[tid][2])
+        return tot
+
+    def finalize(self, portions):
+        portions = dict(portions)
+        got = self.produced(portions)
+        # repair shortfalls greedily (cheapest cost per unit of shortfall covered)
+        for _ in range(1000000):
+            short = {m: self.targets[m] - got[m] for m in self.mats if got[m] < self.targets[m]}
+            if not short:
+                break
+            best = None
+            for tid, (_t, _c, portion, _v, y, ymap, _s) in self.info.items():
+                n = portions.get(tid, 0)
+                gain = 0
+                for m, q in self.tmats[tid]:
+                    if m in short:
+                        d = self.yield_of(tid, q, n + 1) - self.yield_of(tid, q, n)
+                        gain += min(d, short[m]) / max(self.targets[m], 1)
+                if gain <= 0:
+                    continue
+                nc = self.units_cost(tid, n * portion, portion)
+                if nc is None:
+                    continue
+                score = nc / gain
+                if best is None or score < best[0]:
+                    best = (score, tid)
+            if best is None:
+                return None
+            tid = best[1]
+            n = portions.get(tid, 0)
+            for m, q in self.tmats[tid]:
+                got[m] += self.yield_of(tid, q, n + 1) - self.yield_of(tid, q, n)
+            portions[tid] = n + 1
+        # prune: drop portions (most expensive marginal first) while targets still hold
+        changed = True
+        while changed:
+            changed = False
+            order = []
+            for tid, n in portions.items():
+                if n > 0:
+                    portion = self.info[tid][2]
+                    order.append((-(self.units_cost(tid, (n - 1) * portion, portion) or 0.0), tid))
+            order.sort()
+            for _neg, tid in order:
+                while portions[tid] > 0:
+                    n = portions[tid]
+                    ok = True
+                    for m, q in self.tmats[tid]:
+                        d = self.yield_of(tid, q, n) - self.yield_of(tid, q, n - 1)
+                        if got[m] - d < self.targets[m]:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                    for m, q in self.tmats[tid]:
+                        got[m] -= self.yield_of(tid, q, n) - self.yield_of(tid, q, n - 1)
+                    portions[tid] = n - 1
+                    changed = True
+        return {t: n for t, n in portions.items() if n > 0}
 
 
 class State:
@@ -840,6 +993,339 @@ class State:
             "yields": model.report(),
             "products": prod_out,
         }
+
+    # ---- compression
+    def _hub_order_list(self, keys: list[str]) -> list[Order]:
+        with self.lock:
+            self._rebuild()
+            out: list[Order] = []
+            merged = list(self._merged.values())
+            for key in keys:
+                hid = self.hub_ids[key]
+                at_hub = [o for o in merged if o.location_id == hid]
+                if not at_hub and key in self.books:
+                    at_hub = list(self.books[key].values())
+                out.extend(at_hub)
+        seen = set()
+        uniq = []
+        for o in out:
+            if o.order_id not in seen:
+                seen.add(o.order_id)
+                uniq.append(o)
+        return uniq
+
+    def compress(self, body):
+        if np is None:
+            raise ApiError(500, "INTERNAL_ERROR", "numpy/scipy are required for /v1/compress")
+        if not isinstance(body, dict):
+            raise _bad_request("", "Request body must be a JSON object")
+        mats = body.get("materials")
+        if not isinstance(mats, dict) or not mats:
+            raise _bad_request("materials", "materials must be a non-empty object mapping material names to quantities")
+        for name, q in mats.items():
+            if isinstance(q, bool) or not isinstance(q, (int, float)) or (isinstance(q, float) and not q.is_integer()) or q < 0:
+                raise _bad_request(f"materials.{name}", f"Quantity for {name!r} must be a non-negative integer, got {q!r}")
+        hubs_raw = body.get("hubs")
+        if hubs_raw is None:
+            hubs_raw = ["jita"]
+        if isinstance(hubs_raw, str):
+            hubs_raw = [hubs_raw]
+        if not isinstance(hubs_raw, list) or not hubs_raw:
+            raise _bad_request("hubs", "hubs must be a non-empty list of hub names")
+        hubs: list[str] = []
+        for h in hubs_raw:
+            if not isinstance(h, str) or h.strip().lower() not in MARKETS:
+                raise _bad_request("hubs", f"Unknown hub {h!r}; expected one of Jita, Amarr, Dodixie, Rens, Hek")
+            k = MARKETS[h.strip().lower()]
+            if k not in hubs:
+                hubs.append(k)
+
+        def num(key, default, lo=0.0, hi=None):
+            v = body.get(key)
+            if v is None:
+                return default
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v < lo or (hi is not None and v > hi) or v != v:
+                raise _bad_request(key, f"{key} must be a non-negative number, got {v!r}")
+            return float(v)
+
+        cpm = num("cost_per_m3", 0.0)
+        tax = num("collateral_tax", 0.0)
+        eff_raw = body.get("efficiencies")
+        if eff_raw is None:
+            eff_raw = {}
+        if not isinstance(eff_raw, dict):
+            raise _bad_request("efficiencies", "efficiencies must be an object")
+        eff = dict(DEFAULT_EFFICIENCY)
+        for k in ("ore", "gas", "scrap"):
+            v = eff_raw.get(k)
+            if v is None:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 <= v <= 1):
+                raise _bad_request(f"efficiencies.{k}", f"efficiencies.{k} must be a number between 0 and 1, got {v!r}")
+            eff[k] = float(v)
+        var_raw = body.get("ore_variants")
+        if var_raw is None:
+            var_raw = {}
+        if not isinstance(var_raw, dict):
+            raise _bad_request("ore_variants", "ore_variants must be an object")
+        variants = {}
+        for k in ("base", "plus5", "plus10", "plus15"):
+            v = var_raw.get(k, True)
+            if v is None:
+                v = True
+            if not isinstance(v, bool):
+                raise _bad_request(f"ore_variants.{k}", f"ore_variants.{k} must be a boolean")
+            variants[k] = v
+        v100 = var_raw.get("plus100")
+        variants["plus100"] = variants["plus15"] if not isinstance(v100, bool) else v100
+
+        sde = self.sde
+        targets: dict[int, int] = {}
+        unknown = []
+        for name, q in mats.items():
+            tid = sde.resolve(name) if isinstance(name, str) else None
+            if tid is None:
+                unknown.append(name)
+                continue
+            targets[tid] = targets.get(tid, 0) + int(q)
+        if unknown:
+            raise JsonError(404, {"error": "UNKNOWN_ITEMS", "details": sorted(unknown)})
+
+        orders = self._hub_order_list(hubs)
+        by_type: dict[int, tuple[list, list]] = {}
+        for o in orders:
+            b, s_ = by_type.setdefault(o.type_id, ([], []))
+            (b if o.is_buy else s_).append(o)
+        price_cache: dict[int, tuple] = {}
+
+        def p5(tid):
+            if tid not in price_cache:
+                buys, sells = by_type.get(tid, ([], []))
+                bt, st = thresholds(buys, sells)
+                fb, fs = apply_filter(buys, sells, bt, st)
+                price_cache[tid] = (five_pct(fb, True), five_pct(fs, False))
+            return price_cache[tid]
+
+        # ---- candidates
+        vmap = sde.ore_variants()
+        active = {t for t, q in targets.items() if q > 0}
+        cands = []  # (tid, cls, portion, volume, yields{mid: per-portion float}, sorted sell orders)
+        for tid, (_b, sells) in by_type.items():
+            sells = [o for o in sells if o.volume_remain > 0]
+            if not sells or tid not in sde.materials:
+                continue
+            gid = sde.type_group.get(tid)
+            if gid in GAS_GROUPS:
+                cls = "gas"
+            elif sde.group_category.get(gid) == ASTEROID_CATEGORY:
+                cls = "ore"
+                if not variants.get(vmap.get(tid, "base"), True):
+                    continue
+            else:
+                continue
+            y = eff[cls]
+            ymap = {m: q * y for m, q in sde.materials[tid] if m in active}
+            if not ymap:
+                continue
+            sells.sort(key=lambda o: (o.price, o.order_id))
+            cands.append((tid, cls, sde.type_portion.get(tid, 1), sde.volume(tid), y, ymap, sells))
+        if active:
+            if not cands:
+                raise ApiError(404, "NO_CANDIDATES",
+                               "No ore or gas with sell orders in the selected hubs yields the requested materials")
+            covered = set()
+            for c in cands:
+                covered.update(c[5])
+            missing = sorted(sde.type_names.get(m, str(m)) for m in active - covered)
+            if missing:
+                raise ApiError(404, "NO_CANDIDATES",
+                               "No ore or gas with sell orders in the selected hubs yields: " + ", ".join(missing))
+        cands.sort(key=lambda c: c[0])
+
+        # ---- feasibility pre-check (upper bound on yields)
+        for m in active:
+            cap = 0
+            for tid, cls, portion, vol, y, ymap, sells in cands:
+                if m in ymap:
+                    n = sum(o.volume_remain for o in sells) // portion
+                    cap += int(math.floor(sde_mq(sde, tid, m) * n * y + 1e-9))
+            if cap < targets[m]:
+                raise ApiError(400, "INFEASIBLE",
+                               f"Cannot meet target for {sde.type_names.get(m, m)}: requested {targets[m]}, "
+                               f"at most {cap} obtainable from available sell volume")
+
+        portions: dict[int, int] = {}
+        if active:
+            portions = self._solve_compress(cands, targets, active, cpm, tax)
+
+        # ---- build purchases
+        buy_list = {}
+        items_total = 0.0
+        total_volume = 0.0
+        produced: dict[int, int] = {}
+        for tid, cls, portion, vol, y, ymap, sells in cands:
+            n = portions.get(tid, 0)
+            if n <= 0:
+                continue
+            need = n * portion
+            purchases: dict[str, list] = {}
+            cost = 0.0
+            for o in sells:
+                if need <= 0:
+                    break
+                take = min(need, o.volume_remain)
+                need -= take
+                cost += take * o.price
+                st = self.station_name(o.location_id)
+                pr = purchases.setdefault(st, [0, 0.0])
+                pr[0] += take
+                pr[1] += take * o.price
+            qty = n * portion
+            items_total += cost
+            total_volume += qty * vol
+            for mid, mq in sde.materials[tid]:
+                out = int(math.floor(mq * n * y + 1e-9))
+                if out > 0:
+                    produced[mid] = produced.get(mid, 0) + out
+            buy_list[sde.type_names.get(tid, str(tid))] = {
+                "quantity": qty,
+                "cost": round(cost, 2),
+                "volume": round(qty * vol, 2),
+                "category": cls,
+                "purchases": {
+                    st: {"quantity": q, "total": round(t, 2), "avg_price": round(t / q, 2) if q else 0.0}
+                    for st, (q, t) in purchases.items()
+                },
+            }
+        buy_list = dict(sorted(buy_list.items()))
+
+        shipping = total_volume * cpm
+        collateral = items_total * tax
+        raw_ship = 0.0
+        material_value = 0.0
+        excess_value = 0.0
+        yields = {}
+        for m in sorted(set(produced) | set(targets), key=lambda t: sde.type_names.get(t, str(t))):
+            actual = produced.get(m, 0)
+            b5, s5 = p5(m)
+            tgt = targets.get(m)
+            if tgt is not None:
+                raw_ship += tgt * sde.volume(m) * cpm
+                if s5 is not None:
+                    material_value += tgt * s5
+            excess = actual - (tgt or 0)
+            if excess > 0 and s5 is not None:
+                excess_value += excess * s5
+            yields[sde.type_names.get(m, str(m))] = {
+                "target": tgt,
+                "actual": actual,
+                "buy": round(actual * b5, 2) if b5 is not None else None,
+                "sell": round(actual * s5, 2) if s5 is not None else None,
+            }
+        return {
+            "buy_list": buy_list,
+            "total": round(items_total + shipping + collateral, 2),
+            "shipping": round(shipping, 2),
+            "collateral_tax": round(collateral, 2),
+            "items": round(items_total, 2),
+            "raw_ship": round(raw_ship, 2),
+            "material_value": round(material_value, 2),
+            "excess_value": round(excess_value, 2),
+            "yields": yields,
+        }
+
+    def _solve_compress(self, cands, targets, active, cpm, tax) -> dict[int, int]:
+        sde = self.sde
+        mats = sorted(active)
+        midx = {m: i for i, m in enumerate(mats)}
+        cost = []
+        lb = []
+        ub = []
+        integ = []
+        rows, cols, vals = [], [], []
+        clb, cub = [], []
+        nvar = 0
+        nrow = 0
+
+        def var(c, lo, hi, is_int):
+            nonlocal nvar
+            cost.append(c)
+            lb.append(lo)
+            ub.append(hi)
+            integ.append(1 if is_int else 0)
+            nvar += 1
+            return nvar - 1
+
+        target_rows: dict[int, list[int]] = {m: [] for m in mats}
+        n_vars = {}
+        for tid, cls, portion, vol, y, ymap, sells in cands:
+            avail = sum(o.volume_remain for o in sells)
+            nmax = avail // portion
+            # more portions than needed to alone cover every target it yields cannot help
+            useful = max(math.ceil(targets[m] / per) + 1 for m, per in ymap.items() if per > 0) if any(
+                per > 0 for per in ymap.values()) else 0
+            nmax = min(nmax, useful)
+            if nmax <= 0:
+                continue
+            nv = var(0.0, 0, nmax, True)
+            n_vars[tid] = nv
+            # sum_o x_o - portion*n == 0
+            r = nrow
+            nrow += 1
+            cum = 0
+            for o in sells:
+                if cum >= nmax * portion:
+                    break
+                cum += o.volume_remain
+                xv = var(o.price * (1 + tax) + vol * cpm, 0, o.volume_remain, False)
+                rows.append(r); cols.append(xv); vals.append(1.0)
+            rows.append(r); cols.append(nv); vals.append(-float(portion))
+            clb.append(0.0); cub.append(0.0)
+            for m, per in ymap.items():
+                yv = var(0.0, 0, math.floor(per * nmax + 1e-9), True)
+                r = nrow
+                nrow += 1
+                rows.append(r); cols.append(yv); vals.append(1.0)
+                rows.append(r); cols.append(nv); vals.append(-per)
+                clb.append(-np.inf); cub.append(1e-9)
+                target_rows[m].append(yv)
+        for m in mats:
+            r = nrow
+            nrow += 1
+            for yv in target_rows[m]:
+                rows.append(r); cols.append(yv); vals.append(1.0)
+            clb.append(float(targets[m])); cub.append(np.inf)
+        A = coo_matrix((vals, (rows, cols)), shape=(nrow, nvar)).tocsr()
+        c_arr = np.array(cost)
+        cons = LinearConstraint(A, np.array(clb), np.array(cub))
+        bnds = Bounds(np.array(lb, dtype=float), np.array(ub, dtype=float))
+        ev = _PortionEvaluator(sde, cands, targets, mats, cpm, tax)
+
+        # 1) LP relaxation -> rounded, repaired, pruned heuristic solution
+        lp = milp(c=c_arr, constraints=cons, bounds=bnds, options={"time_limit": 30.0, "disp": False})
+        if lp.status == 2:
+            raise ApiError(400, "INFEASIBLE", "Cannot meet material targets with the available market volume")
+        best = None
+        if lp.x is not None:
+            start = {tid: max(0, int(math.floor(lp.x[nv] + 1e-6))) for tid, nv in n_vars.items()}
+            sol = ev.finalize(start)
+            if sol is not None:
+                best = (ev.cost(sol), sol)
+        # 2) exact MILP (time limited), keep the better of the two
+        res = milp(c=c_arr, constraints=cons, integrality=np.array(integ), bounds=bnds,
+                   options={"time_limit": MIP_TIME_LIMIT, "mip_rel_gap": MIP_GAP, "disp": False})
+        if res.x is not None:
+            start = {tid: max(0, int(round(res.x[nv]))) for tid, nv in n_vars.items()}
+            sol = ev.finalize(start)
+            if sol is not None:
+                c_ = ev.cost(sol)
+                if best is None or c_ < best[0] - 1e-6:
+                    best = (c_, sol)
+        if best is None:
+            raise ApiError(400, "INFEASIBLE", "Cannot meet material targets with the available market volume")
+        return best[1]
+
+
 
     # ---- endpoints
     def _check_region(self, region_id: int):
@@ -1156,6 +1642,9 @@ def make_handler(state: State):
                     api_key = self.headers.get("X-API-Key")
                     body = self._json_body(lambda m: _bad_request("", m))
                     return self._send(201, state.reprocess(body, api_key))
+                if method == "POST" and parts == ["v1", "compress"]:
+                    body = self._json_body(lambda m: _bad_request("", m))
+                    return self._send(200, state.compress(body))
                 if method == "POST":
                     self._body()
                 return self._send(404, {"error": "NOT_FOUND", "details": f"No route for {method} {url.path}"})
