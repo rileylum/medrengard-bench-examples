@@ -1,3 +1,5 @@
 # No third-party dependencies: dynamic_buffer.py and the generated Python
 # modules use only the standard library (Python >= 3.8). Generated
-# JavaScript modules use only Node.js built-ins.
+# JavaScript modules use only Node.js built-ins. Generated C++ modules need a
+# C++17 compiler and only the standard library (plus POSIX stat/newlocale);
+# generated Rust crates have no crate dependencies (Rust >= 1.70).
