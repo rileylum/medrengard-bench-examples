@@ -1048,6 +1048,188 @@ def make_recent_cookie(names):
     return "%s=%s; Path=/; Max-Age=%d; SameSite=Lax" % (RECENT_COOKIE, value, RECENT_MAX_AGE)
 
 
+MEDIA_MIME_FALLBACK = {
+    "mp4": "video/mp4", "m4v": "video/mp4", "webm": "video/webm", "mkv": "video/x-matroska",
+    "mov": "video/quicktime", "avi": "video/x-msvideo", "flv": "video/x-flv",
+    "mpeg": "video/mpeg", "mpg": "video/mpeg", "ogv": "video/ogg", "ts": "video/mp2t",
+    "3gp": "video/3gpp", "mp3": "audio/mpeg", "m4a": "audio/mp4", "aac": "audio/aac",
+    "ogg": "audio/ogg", "opus": "audio/opus", "weba": "audio/webm", "wav": "audio/wav",
+    "flac": "audio/flac", "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+    "gif": "image/gif", "webp": "image/webp", "avif": "image/avif", "bmp": "image/bmp",
+    "svg": "image/svg+xml",
+}
+
+
+def sniff_mime(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except OSError:
+        return None
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "audio/wav"
+    if head.startswith(b"RIFF") and head[8:12] == b"AVI ":
+        return "video/x-msvideo"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"M4A ", b"M4B "):
+            return "audio/mp4"
+        if brand == b"qt  ":
+            return "video/quicktime"
+        return "video/mp4"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm" if b"webm" in head else "video/x-matroska"
+    if head.startswith(b"OggS"):
+        return "audio/ogg"
+    if head.startswith(b"fLaC"):
+        return "audio/flac"
+    if head.startswith(b"ID3") or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    if head.startswith(b"FLV"):
+        return "video/x-flv"
+    return None
+
+
+def file_mime(path, kind):
+    """Return a MIME type for a served vault file; kind is 'media' or 'preview'."""
+    import mimetypes
+    fname = os.path.basename(path)
+    ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+    good_prefixes = ("video/", "audio/", "image/") if kind == "media" else ("image/",)
+    mime = MEDIA_MIME_FALLBACK.get(ext)
+    if mime is None and ext:
+        guess = mimetypes.guess_type(fname, strict=False)[0]
+        if guess and guess.startswith(good_prefixes):
+            mime = guess
+    if mime is None or not mime.startswith(good_prefixes):
+        sniffed = sniff_mime(path)
+        if sniffed and sniffed.startswith(good_prefixes):
+            mime = sniffed
+    if mime is None or not mime.startswith(good_prefixes):
+        mime = "video/mp4" if kind == "media" else "image/jpeg"
+    return mime
+
+
+def vault_files(name, sub):
+    """Completed (non-partial) regular files in <vault>/<sub>/, sorted."""
+    d = os.path.join(name, sub)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    out = []
+    for fname in names:
+        if is_partial_name(fname):
+            continue
+        if os.path.isfile(os.path.join(d, fname)):
+            out.append(fname)
+    return sorted(out)
+
+
+def match_file_for_id(files, entry_id):
+    """Pick the saved filename containing entry_id (prefer exact stem matches)."""
+    if not entry_id:
+        return None
+    candidates = [f for f in files if entry_id in f]
+    if not candidates:
+        fid = safe_filename_id(entry_id)
+        candidates = [f for f in files if fid and fid in f]
+    if not candidates:
+        return None
+    fid = safe_filename_id(entry_id)
+
+    def rank(f):
+        stem = f.rsplit(".", 1)[0] if "." in f else f
+        if stem in (entry_id, fid) or f in (entry_id, fid):
+            return (0, len(f), f)
+        if f.startswith((entry_id, fid)):
+            return (1, len(f), f)
+        return (2, len(f), f)
+    return min(candidates, key=rank)
+
+
+def entry_source_link(raw, version, entry_id):
+    import urllib.parse
+    q = urllib.parse.quote(str(entry_id), safe="-_.~!$&'()*+,;=:@")
+    if version == 1:
+        base = v1_source_url(raw.get("source_id", ""))
+    else:
+        base = str(raw.get("source", ""))
+    return "%s/entry/%s" % (base.rstrip("/"), q)
+
+
+def chart_points(history, version):
+    """Return [{"timestamp": iso, "value": v}, ...] oldest first."""
+    if not isinstance(history, dict):
+        return []
+    if version == 1:
+        keys = sorted(history.keys(), key=_v1_key)
+        out = []
+        for k in keys:
+            try:
+                ts = epoch_key_to_iso(k)
+            except (ValueError, TypeError, OverflowError):
+                ts = str(k)
+            out.append({"timestamp": ts, "value": history[k]})
+        return out
+    return [{"timestamp": k, "value": history[k]} for k in sorted(history.keys())]
+
+
+def json_for_html(obj):
+    return (json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def svg_chart(field, points):
+    points = [(p["timestamp"], p["value"]) for p in points]
+    vals = [(i, v) for i, (_, v) in enumerate(points) if is_int(v) or isinstance(v, float)]
+    w, h, pad = 600, 200, 30
+    if not vals:
+        return "<p class=\"no-chart\">No numeric %s data.</p>" % html_escape(field)
+    lo = min(v for _, v in vals)
+    hi = max(v for _, v in vals)
+    span = (hi - lo) or 1
+    n = max(len(points) - 1, 1)
+
+    def xy(i, v):
+        x = pad + (w - 2 * pad) * (i / n if len(points) > 1 else 0.5)
+        y = h - pad - (h - 2 * pad) * ((v - lo) / span if hi != lo else 0.5)
+        return "%.1f,%.1f" % (x, y)
+    # break the line at null values
+    segments, cur = [], []
+    for i, (_, v) in enumerate(points):
+        if is_int(v) or isinstance(v, float):
+            cur.append(xy(i, v))
+        elif cur:
+            segments.append(cur)
+            cur = []
+    if cur:
+        segments.append(cur)
+    lines = "".join("<polyline fill=\"none\" stroke=\"#0645ad\" stroke-width=\"2\" "
+                    "points=\"%s\"/>" % " ".join(seg) for seg in segments)
+    dots = "".join("<circle r=\"3\" fill=\"#0645ad\" cx=\"%s\" cy=\"%s\"/>"
+                   % tuple(xy(i, v).split(",")) for i, v in vals)
+    labels = ("<text x=\"2\" y=\"%d\" font-size=\"10\">%s</text>"
+              "<text x=\"2\" y=\"%d\" font-size=\"10\">%s</text>"
+              % (pad - 5, html_escape(hi), h - pad + 15, html_escape(lo)))
+    return ("<svg class=\"chart\" role=\"img\" aria-label=\"%s chart\" width=\"%d\" "
+            "height=\"%d\" viewBox=\"0 0 %d %d\">%s%s%s</svg>"
+            % (html_escape(field), w, h, w, h, lines, dots, labels))
+
+
 def make_handler():
     import http.server
     import urllib.parse
@@ -1153,6 +1335,9 @@ def make_handler():
             if not segs:
                 self._landing(query, head)
                 return
+            if segs[0] == "vault":
+                self._static(segs, head)
+                return
             if segs[0] != "catalog":
                 self._error(404, "Not found.", head)
                 return
@@ -1179,9 +1364,156 @@ def make_handler():
             if category not in viewer_valid_categories(version) or len(segs) > 4:
                 self._redirect(catalog_route(name, default), [cookie], head)
                 return
-            entry_id = segs[3] if len(segs) == 4 else None
-            status, body = self._listing(name, raw, version, category, entry_id)
+            if len(segs) == 4:
+                status, body = self._detail(name, raw, version, category, segs[3])
+            else:
+                status, body = self._listing(name, raw, version, category, None)
             self._send(status, body, headers=[cookie], head=head)
+
+        # ---- static vault files
+        def _static(self, segs, head):
+            # Reject traversal attempts before touching the filesystem.
+            raw_path = urllib.parse.urlsplit(self.path).path
+            lowered = raw_path.lower()
+            if len(segs) >= 3 and (
+                    ".." in segs[3:] or "%2e%2e" in lowered or "/../" in raw_path + "/"
+                    or any(("/" in p or "\\" in p or "\0" in p or p in (".", ".."))
+                           for p in segs[3:])):
+                self._error(403, "Forbidden.", head)
+                return
+            if len(segs) != 4 or segs[2] not in ("media", "preview"):
+                self._error(404, "Not found.", head)
+                return
+            name, kind, item = segs[1], segs[2], segs[3]
+            if not name or "\0" in name:
+                self._redirect("/?notfound=" + _q(name), head=head)
+                return
+            try:
+                viewer_load(name)
+            except MVaultError as exc:
+                if "does not exist" in str(exc):
+                    self._redirect("/?notfound=" + _q(name), head=head)
+                else:
+                    self._redirect("/?invalid=" + _q(name), head=head)
+                return
+            if kind == "media":
+                sub = "media"
+                files = vault_files(name, sub)
+                fname = item if item in files else None
+            else:
+                sub = "previews"
+                fname = match_file_for_id(vault_files(name, sub), item)
+            if fname is None:
+                self._error(404, "File not found.", head)
+                return
+            base = os.path.realpath(os.path.join(name, sub))
+            path = os.path.realpath(os.path.join(base, fname))
+            if os.path.dirname(path) != base:
+                self._error(403, "Forbidden.", head)
+                return
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                self._error(404, "File not found.", head)
+                return
+            ctype = file_mime(path, kind)
+            self._send(200, data, ctype=ctype, head=head)
+
+        # ---- entry detail
+        def _detail(self, name, raw, version, category, entry_id):
+            entries = raw.get(category) or []
+            entry = None
+            for e in entries:
+                if isinstance(e, dict) and e.get("id") == entry_id:
+                    entry = e
+                    break
+            back = catalog_route(name, category)
+            if entry is None:
+                body = ("<p><a class=\"back\" href=\"%s\">&larr; Back to %s / %s</a></p>"
+                        "<h1>Error 404</h1><p class=\"error entry-not-found\">"
+                        "Entry '%s' not found in %s.</p>"
+                        % (html_escape(back), html_escape(name), html_escape(category),
+                           html_escape(entry_id), html_escape(category)))
+                return 404, html_page("Entry not found", body)
+            title_vals = _sorted_history(entry.get("title"), version)
+            title = title_vals[-1] if title_vals else None
+            desc_vals = _sorted_history(entry.get("description"), version)
+            desc = desc_vals[-1] if desc_vals else None
+            published = entry.get("published")
+            width, height = entry.get("width"), entry.get("height")
+            link = entry_source_link(raw, version, entry_id)
+            removed = viewer_is_removed(entry, version)
+            media = match_file_for_id(vault_files(name, "media"), entry_id)
+            preview = match_file_for_id(vault_files(name, "previews"), entry_id)
+            charts = {f: chart_points(entry.get(f), version) for f in ("views", "likes")}
+
+            def show(v):
+                return "&mdash;" if v is None else html_escape(v)
+            parts = [
+                "<p><a class=\"back\" href=\"%s\">&larr; Back to %s / %s</a></p>"
+                % (html_escape(back), html_escape(name), html_escape(category)),
+                "<h1 class=\"entry-title\">%s</h1>"
+                % (html_escape(title) if title is not None else html_escape(entry_id)),
+            ]
+            if removed:
+                parts.append("<p class=\"removed-flag error\">REMOVED from source</p>")
+            parts.append(
+                "<dl class=\"metadata\">\n"
+                "<dt>ID</dt><dd class=\"id\">%s</dd>\n"
+                "<dt>Title</dt><dd class=\"title\">%s</dd>\n"
+                "<dt>Description</dt><dd class=\"description\">%s</dd>\n"
+                "<dt>Published</dt><dd class=\"published\">%s</dd>\n"
+                "<dt>Dimensions</dt><dd class=\"dimensions\">"
+                "<span class=\"width\">%s</span> &times; <span class=\"height\">%s</span>"
+                " (width %s, height %s)</dd>\n"
+                "<dt>Source</dt><dd class=\"source\"><a class=\"source-link\" href=\"%s\">"
+                "%s</a></dd>\n</dl>"
+                % (html_escape(entry_id), show(title), show(desc), show(published),
+                   show(width), show(height), show(width), show(height),
+                   html_escape(link), html_escape(link)))
+            if media is not None:
+                murl = "/vault/%s/media/%s" % (_q(name), _q(media))
+                mtype = file_mime(os.path.join(name, "media", media), "media")
+                tag = "audio" if mtype.startswith("audio/") else "video"
+                if mtype.startswith("image/"):
+                    player = "<img src=\"%s\" alt=\"media\">" % html_escape(murl)
+                else:
+                    player = ("<%s controls preload=\"metadata\" src=\"%s\">"
+                              "<source src=\"%s\" type=\"%s\"></%s>"
+                              % (tag, html_escape(murl), html_escape(murl),
+                                 html_escape(mtype), tag))
+                parts.append("<section class=\"media downloaded\"><h2>Media</h2>%s"
+                             "<p><a class=\"media-link\" href=\"%s\">%s</a></p></section>"
+                             % (player, html_escape(murl), html_escape(media)))
+            else:
+                parts.append("<section class=\"media not-downloaded\"><h2>Media</h2>"
+                             "<p class=\"no-media\">Media not downloaded.</p></section>")
+            if preview is not None:
+                purl = "/vault/%s/preview/%s" % (_q(name), _q(entry_id))
+                parts.append("<section class=\"preview\"><h2>Preview</h2>"
+                             "<img src=\"%s\" alt=\"preview\" style=\"max-width:480px\">"
+                             "</section>" % html_escape(purl))
+            parts.append("<script type=\"application/json\" id=\"chart-data\">%s</script>"
+                         % json_for_html(charts))
+            chart_html = []
+            for f in ("views", "likes"):
+                pts = charts[f]
+                if len(pts) < 2:
+                    continue
+                rows = "".join("<tr><td>%s</td><td>%s</td></tr>"
+                               % (html_escape(t), "null" if v is None else html_escape(v))
+                               for t, v in ((p["timestamp"], p["value"]) for p in pts))
+                chart_html.append(
+                    "<section class=\"chart %s\" id=\"chart-%s\"><h3>%s</h3>%s"
+                    "<table><thead><tr><th>Timestamp</th><th>%s</th></tr></thead>"
+                    "<tbody>%s</tbody></table></section>"
+                    % (f, f, f, svg_chart(f, pts), f, rows))
+            if chart_html:
+                parts.append("<section class=\"charts\"><h2>History</h2>%s</section>"
+                             % "".join(chart_html))
+            page_title = "%s / %s / %s" % (name, category, entry_id)
+            return 200, html_page(page_title, "\n".join(parts))
 
         # ---- pages
         def _landing(self, query, head):
