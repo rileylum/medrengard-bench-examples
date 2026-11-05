@@ -30,30 +30,48 @@ class ClientError(Exception):
         self.status = status
 
 
+def _dist(ds):
+    if not ds:
+        return {"average": None, "median": None, "max": None, "min": None,
+                "stddev": None}
+    return {
+        "average": round(statistics.fmean(ds), 3),
+        "median": round(statistics.median(ds), 3),
+        "max": round(max(ds), 3),
+        "min": round(min(ds), 3),
+        "stddev": round(statistics.pstdev(ds), 3),
+    }
+
+
 class Stats:
     def __init__(self):
         self._lock = threading.Lock()
         self._durations = []
+        self._cmd_durations = []
+        self._cmd_total = 0
 
-    def add(self, d):
+    def add(self, duration, cmd_durations, cmd_total):
         with self._lock:
-            self._durations.append(d)
+            self._durations.append(duration)
+            self._cmd_durations.extend(cmd_durations)
+            self._cmd_total += cmd_total
 
     def snapshot(self):
         with self._lock:
             ds = list(self._durations)
-        if not ds:
-            return {"ran": 0, "duration": {"average": None, "median": None,
-                                           "max": None, "min": None, "stddev": None}}
+            cds = list(self._cmd_durations)
+            total = self._cmd_total
+        n = len(ds)
         return {
-            "ran": len(ds),
-            "duration": {
-                "average": round(statistics.fmean(ds), 3),
-                "median": round(statistics.median(ds), 3),
-                "max": round(max(ds), 3),
-                "min": round(min(ds), 3),
-                "stddev": round(statistics.pstdev(ds), 3),
+            "ran": n,
+            "commands": {
+                "total": total,
+                "ran": len(cds),
+                "average": round(total / n, 3) if n else None,
+                "average_ran": round(len(cds) / n, 3) if n else None,
+                "duration": _dist(cds),
             },
+            "duration": _dist(ds),
         }
 
 
@@ -64,6 +82,15 @@ def _is_number(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _check_cmd(cmd, where):
+    if not isinstance(cmd, str):
+        raise ClientError(f"{where} must be a string", "INVALID_FIELD")
+    if not cmd.strip():
+        raise ClientError(f"{where} must be a non-empty string", "INVALID_FIELD")
+    if "\x00" in cmd:
+        raise ClientError(f"{where} must not contain NUL bytes", "INVALID_FIELD")
+
+
 def validate(body):
     if not isinstance(body, dict):
         raise ClientError("request body must be a JSON object", "INVALID_REQUEST")
@@ -71,12 +98,41 @@ def validate(body):
     if "command" not in body or body["command"] is None:
         raise ClientError("'command' is required", "MISSING_FIELD")
     command = body["command"]
-    if not isinstance(command, str):
-        raise ClientError("'command' must be a string", "INVALID_FIELD")
-    if not command.strip():
-        raise ClientError("'command' must be a non-empty string", "INVALID_FIELD")
-    if "\x00" in command:
-        raise ClientError("'command' must not contain NUL bytes", "INVALID_FIELD")
+    if isinstance(command, str):
+        _check_cmd(command, "'command'")
+    elif isinstance(command, list):
+        if not command:
+            raise ClientError("'command' array must not be empty", "INVALID_FIELD")
+        chain = []
+        for i, item in enumerate(command):
+            where = f"'command[{i}]'"
+            if not isinstance(item, dict):
+                raise ClientError(f"{where} must be an object", "INVALID_FIELD")
+            if "cmd" not in item or item["cmd"] is None:
+                raise ClientError(f"{where}.cmd is required", "MISSING_FIELD")
+            _check_cmd(item["cmd"], f"{where}.cmd")
+            t = item.get("timeout")
+            if t is not None and (not _is_number(t) or not math.isfinite(t) or t <= 0):
+                raise ClientError(f"{where}.timeout must be a positive number of seconds",
+                                  "INVALID_FIELD")
+            req = item.get("required")
+            if req is None:
+                req = False
+            if not isinstance(req, bool):
+                raise ClientError(f"{where}.required must be a boolean", "INVALID_FIELD")
+            chain.append({"cmd": item["cmd"],
+                          "timeout": None if t is None else float(t),
+                          "required": req})
+        command = chain
+    else:
+        raise ClientError("'command' must be a string or an array of command objects",
+                          "INVALID_FIELD")
+
+    coe = body.get("continue_on_error")
+    if coe is None:
+        coe = False
+    if not isinstance(coe, bool):
+        raise ClientError("'continue_on_error' must be a boolean", "INVALID_FIELD")
 
     env = body.get("env")
     if env is None:
@@ -128,7 +184,7 @@ def validate(body):
 
     track = validate_track(body.get("track"))
 
-    return command, env, clean_files, stdin, float(timeout), track
+    return command, env, clean_files, stdin, float(timeout), track, coe
 
 
 COMPRESSIONS = {".gz": "gz", ".bz2": "bz2"}
@@ -325,7 +381,52 @@ def _kill_group(proc):
             pass
 
 
-def execute(command, env, files, stdin, timeout, track=None):
+def run_one(command, workdir, run_env, stdin, timeout):
+    timed_out = False
+    start = time.monotonic()
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", command],
+        cwd=workdir,
+        env=run_env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(input=stdin.encode("utf-8"), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = b"", b""
+    duration = time.monotonic() - start
+    # Clean up any leftover background children of the run.
+    if not timed_out:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    exit_code = -1 if timed_out else proc.returncode
+    if exit_code is None:
+        exit_code = -1
+    elif exit_code < 0 and not timed_out:
+        exit_code = 128 + (-exit_code)
+
+    return {
+        "stdout": (out or b"").decode("utf-8", errors="replace"),
+        "stderr": (err or b"").decode("utf-8", errors="replace"),
+        "exit_code": exit_code,
+        "duration": round(duration, 3),
+        "timed_out": timed_out,
+    }, duration
+
+
+def execute(command, env, files, stdin, timeout, track=None, continue_on_error=False):
+    """Returns (response, total_duration, per-command durations, command count)."""
     workdir = tempfile.mkdtemp(prefix="run-")
     try:
         for rel, content in files.items():
@@ -341,51 +442,48 @@ def execute(command, env, files, stdin, timeout, track=None):
         run_env = dict(os.environ)
         run_env.update(env)
 
-        timed_out = False
-        start = time.monotonic()
-        proc = subprocess.Popen(
-            ["/bin/sh", "-c", command],
-            cwd=workdir,
-            env=run_env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            out, err = proc.communicate(input=stdin.encode("utf-8"), timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_group(proc)
-            try:
-                out, err = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                out, err = b"", b""
-        duration = time.monotonic() - start
-        # Clean up any leftover background children of the run.
-        if not timed_out:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                pass
+        if isinstance(command, str):
+            res, duration = run_one(command, workdir, run_env, stdin, timeout)
+            result = {"id": str(uuid.uuid4())}
+            result.update(res)
+            result["files"] = collect_tracked(workdir, track) if track else {}
+            return result, duration, [duration], 1
 
-        exit_code = -1 if timed_out else proc.returncode
-        if exit_code is None:
-            exit_code = -1
-        elif exit_code < 0 and not timed_out:
-            exit_code = 128 + (-exit_code)
+        results = []
+        durations = []
+        failed = False
+        first_stdin = True
+        for item in command:
+            if failed and not continue_on_error and not item["required"]:
+                continue
+            t = item["timeout"] if item["timeout"] is not None else timeout
+            res, dur = run_one(item["cmd"], workdir, run_env,
+                               stdin if first_stdin else "", t)
+            first_stdin = False
+            entry = {"cmd": item["cmd"]}
+            entry.update(res)
+            if item["required"]:
+                entry["required"] = True
+            results.append(entry)
+            durations.append(dur)
+            if res["exit_code"] != 0 or res["timed_out"]:
+                failed = True
 
+        overall = 0
+        for r in results:
+            if r["exit_code"] != 0:
+                overall = r["exit_code"]
+                break
+        total = sum(durations)
         result = {
             "id": str(uuid.uuid4()),
-            "stdout": (out or b"").decode("utf-8", errors="replace"),
-            "stderr": (err or b"").decode("utf-8", errors="replace"),
-            "exit_code": exit_code,
-            "duration": round(duration, 3),
-            "timed_out": timed_out,
+            "commands": results,
+            "exit_code": overall,
+            "duration": round(sum(r["duration"] for r in results), 3),
+            "timed_out": any(r["timed_out"] for r in results),
+            "files": collect_tracked(workdir, track) if track else {},
         }
-        if track:
-            result["files"] = collect_tracked(workdir, track)
-        return result, duration
+        return result, total, durations, len(command)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -451,13 +549,13 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, UnicodeDecodeError):
                 raise ClientError("malformed JSON body", "INVALID_JSON")
             args = validate(body)
-            result, duration = execute(*args)
+            result, duration, cmd_durs, cmd_total = execute(*args)
         except ClientError as e:
             self.close_connection = True if e.status == 413 else self.close_connection
             return self._error(e.status, e.code, e.message)
         except Exception as e:  # unexpected
             return self._error(500, "INTERNAL_ERROR", f"internal error: {e}")
-        STATS.add(duration)
+        STATS.add(duration, cmd_durs, cmd_total)
         self._send(201, result)
 
     def do_GET(self):
