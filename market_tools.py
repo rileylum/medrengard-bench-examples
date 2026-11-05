@@ -7,7 +7,9 @@ import gzip
 import io
 import json
 import os
+import math
 import re
+import secrets
 import sys
 import threading
 import zlib
@@ -72,6 +74,15 @@ class SDE:
         self.system_by_name = {}
         self.stations = {}  # station_id -> (name, system_id, region_id)
         self.station_by_name = {}
+        self.type_exact = {}
+        self.type_group = {}
+        self.type_volume = {}
+        self.type_portion = {}
+        self.group_category = {}
+        self.group_name = {}
+        self.materials = {}  # type_id -> [(material_id, qty)]
+        self.reprocess_skill = {}  # type_id -> skill type_id
+        self.ship_volumes = {}  # group name -> packaged volume
 
         f = _open_sde(sde_dir, "invTypes")
         if f:
@@ -84,6 +95,19 @@ class SDE:
                     name = row.get("typeName") or ""
                     self.types[tid] = name
                     self.type_by_name.setdefault(name.lower(), tid)
+                    self.type_exact.setdefault(name, tid)
+                    try:
+                        self.type_group[tid] = int(row.get("groupID") or 0)
+                    except ValueError:
+                        self.type_group[tid] = 0
+                    try:
+                        self.type_volume[tid] = float(row.get("volume") or 0)
+                    except ValueError:
+                        self.type_volume[tid] = 0.0
+                    try:
+                        self.type_portion[tid] = max(1, int(float(row.get("portionSize") or 1)))
+                    except ValueError:
+                        self.type_portion[tid] = 1
         f = _open_sde(sde_dir, "mapRegions")
         if f:
             with f:
@@ -117,6 +141,56 @@ class SDE:
                         continue
                     self.stations[stid] = (row["stationName"], sysid, rid)
                     self.station_by_name[row["stationName"]] = stid
+        f = _open_sde(sde_dir, "invGroups")
+        if f:
+            with f:
+                for row in csv.DictReader(f):
+                    try:
+                        gid = int(row["groupID"])
+                        cid = int(row["categoryID"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    self.group_category[gid] = cid
+                    self.group_name[gid] = row.get("groupName") or ""
+        f = _open_sde(sde_dir, "invTypeMaterials")
+        if f:
+            with f:
+                for row in csv.DictReader(f):
+                    try:
+                        tid = int(row["typeID"])
+                        mid = int(row["materialTypeID"])
+                        q = int(float(row["quantity"]))
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    self.materials.setdefault(tid, []).append((mid, q))
+        f = _open_sde(sde_dir, "dgmTypeAttributes")
+        if f:
+            with f:
+                for line in f:
+                    # fast path: only attribute 790 (reprocessingSkillType)
+                    if ",790," not in line:
+                        continue
+                    parts = line.strip().split(",")
+                    if len(parts) < 4 or parts[1] != "790":
+                        continue
+                    val = parts[2] if parts[2] not in ("", "None") else parts[3]
+                    try:
+                        self.reprocess_skill[int(parts[0])] = int(float(val))
+                    except ValueError:
+                        continue
+        yp = os.path.join(sde_dir, "ship_volumes.yaml")
+        if os.path.exists(yp):
+            with open(yp, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.split("#", 1)[0].strip()
+                    if not line or ":" not in line:
+                        continue
+                    k, v = line.rsplit(":", 1)
+                    k = k.strip().strip("'\"")
+                    try:
+                        self.ship_volumes[k] = float(v.strip().strip("'\""))
+                    except ValueError:
+                        continue
         # sorted system names (longest first) for structure prefix matching
         self._sys_names_sorted = sorted(self.system_by_name.keys(), key=len, reverse=True)
 
@@ -335,6 +409,7 @@ class State:
         self.lock = threading.RLock()
         self.books = {}  # market -> {order_id: order}
         self.stations = {}  # location_id -> {"name", "type", "system_id", "region_id"}
+        self.configs = {}  # api key -> config
 
     def all_orders(self):
         merged = {}
@@ -611,6 +686,404 @@ def handle_hub_compare(state, ttoken):
 
 
 # --------------------------------------------------------------------------
+# Reprocessing
+# --------------------------------------------------------------------------
+
+class ValueApiError(Exception):
+    """Error rendered as {"code", "path", "message"}."""
+
+    def __init__(self, status, code, path=None, message=None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.path = path
+        self.message = message
+
+    def payload(self):
+        out = {"code": self.code}
+        if self.path is not None:
+            out["path"] = self.path
+        if self.message is not None:
+            out["message"] = self.message
+        return out
+
+
+STRUCTURE_SM = {"npc_station": 0.0, "citadel": 0.0, "athanor": 0.02, "tatara": 0.055}
+RIG_RM = {None: 0.0, "t1": 1.0, "t2": 3.0}
+SECURITY_SEC = {"highsec": 0.0, "lowsec": 0.06, "nullsec": 0.12}
+IMPLANT_IM = {None: 0.0, "RX-801": 0.01, "RX-802": 0.02, "RX-804": 0.04}
+GAS_GROUPS = {711, 4168}
+ORE_CATEGORY = 25
+SHIP_CATEGORY = 6
+DEFAULT_EFF = {"ore": 0.9063, "gas": 0.95, "scrap": 0.55}
+MARKET_KEYS = {k: (k, loc) for k, _n, loc in HUBS}
+SCRAP_SKILL = "Scrapmetal Processing"
+EPS = 1e-9
+
+
+def _enum_error(path, value, allowed):
+    shown = ", ".join("null" if a is None else '"%s"' % a for a in allowed)
+    return ValueApiError(404, "INVALID_VALUE", path,
+                         "Invalid value %s for '%s'; expected one of: %s"
+                         % (json.dumps(value), path, shown))
+
+
+def parse_config(body):
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise ValueApiError(404, "INVALID_VALUE", "", "Request body must be a JSON object")
+    structure = body.get("structure")
+    if structure is None:
+        structure = {}
+    if not isinstance(structure, dict):
+        raise ValueApiError(404, "INVALID_VALUE", "structure", "structure must be an object or null")
+    stype = structure.get("type")
+    if stype is None:
+        stype = "npc_station"
+    if not isinstance(stype, str) or stype not in STRUCTURE_SM:
+        raise _enum_error("structure.type", stype, list(STRUCTURE_SM))
+    rig = structure.get("rig")
+    if rig is not None and (not isinstance(rig, str) or rig not in RIG_RM):
+        raise _enum_error("structure.rig", rig, list(RIG_RM))
+    if stype == "npc_station" and rig is not None:
+        raise ValueApiError(404, "INVALID_VALUE", "structure.rig",
+                            "npc_station cannot specify a rig; rig must be null")
+    sec = structure.get("security")
+    if sec is None:
+        sec = "highsec"
+    if not isinstance(sec, str) or sec not in SECURITY_SEC:
+        raise _enum_error("structure.security", sec, list(SECURITY_SEC))
+    skills = body.get("skills")
+    if skills is None:
+        skills = {}
+    if not isinstance(skills, dict):
+        raise ValueApiError(404, "INVALID_VALUE", "skills", "skills must be an object mapping names to levels")
+    clean_skills = {}
+    for name, lvl in skills.items():
+        if lvl is None:
+            lvl = 0
+        if isinstance(lvl, bool) or not isinstance(lvl, (int, float)) or \
+                (isinstance(lvl, float) and lvl != int(lvl)) or not 0 <= lvl <= 5:
+            raise ValueApiError(404, "INVALID_VALUE", "skills.%s" % name,
+                                "Skill level for '%s' must be an integer between 0 and 5, got %s"
+                                % (name, json.dumps(lvl)))
+        clean_skills[name] = int(lvl)
+    implant = body.get("implant")
+    if implant is not None and (not isinstance(implant, str) or implant not in IMPLANT_IM):
+        raise _enum_error("implant", implant, list(IMPLANT_IM))
+    return {
+        "structure": {"type": stype, "rig": rig, "security": sec},
+        "skills": clean_skills,
+        "implant": implant,
+    }
+
+
+def _skill_level(skills, name):
+    if name is None:
+        return 0
+    if name in skills:
+        return skills[name]
+    low = name.lower()
+    for k, v in skills.items():
+        if k.lower() == low:
+            return v
+    return 0
+
+
+class YieldModel:
+    """Computes the efficiency multiplier for each type."""
+
+    def __init__(self, sde, efficiency=None, config=None):
+        self.sde = sde
+        self.eff = efficiency or dict(DEFAULT_EFF)
+        self.config = config
+        self.used = {"ore": [], "gas": [], "scrap": []}
+        if config is not None:
+            st = config["structure"]
+            sk = config["skills"]
+            self._base = ((50.0 + RIG_RM[st["rig"]])
+                          * (1.0 + SECURITY_SEC[st["security"]])
+                          * (1.0 + STRUCTURE_SM[st["type"]])
+                          * (1.0 + _skill_level(sk, "Reprocessing") * 0.03)
+                          * (1.0 + _skill_level(sk, "Reprocessing Efficiency") * 0.02)
+                          * (1.0 + IMPLANT_IM[config["implant"]]))
+            self._scrap = round(50.0 + min(5, _skill_level(sk, SCRAP_SKILL)), 2) / 100.0
+
+    def kind(self, tid):
+        gid = self.sde.type_group.get(tid, 0)
+        if gid in GAS_GROUPS:
+            return "gas"
+        if self.sde.group_category.get(gid) == ORE_CATEGORY:
+            return "ore"
+        return "scrap"
+
+    def _config_yield(self, kind, tid):
+        if kind == "scrap":
+            return self._scrap
+        op = 0
+        if tid is not None:
+            skill_tid = self.sde.reprocess_skill.get(tid)
+            if skill_tid is not None:
+                op = _skill_level(self.config["skills"], self.sde.types.get(skill_tid))
+        return round(self._base * (1.0 + op * 0.02), 2) / 100.0
+
+    def multiplier(self, tid):
+        kind = self.kind(tid)
+        if self.config is None:
+            m = self.eff[kind]
+        else:
+            m = self._config_yield(kind, tid)
+        self.used[kind].append(m)
+        return m
+
+    def reported(self):
+        out = {}
+        for kind in ("ore", "gas", "scrap"):
+            if self.config is None:
+                out[kind] = self.eff[kind]
+            elif self.used[kind]:
+                out[kind] = round(min(self.used[kind]), 4)
+            else:
+                out[kind] = round(self._config_yield(kind, None), 4)
+        return out
+
+
+def item_volume(sde, tid):
+    gid = sde.type_group.get(tid, 0)
+    if sde.group_category.get(gid) == SHIP_CATEGORY:
+        gname = sde.group_name.get(gid)
+        if gname in sde.ship_volumes:
+            return sde.ship_volumes[gname]
+    return sde.type_volume.get(tid, 0.0)
+
+
+def reprocess_one(sde, model, tid, qty):
+    """Returns (leftover_qty, {material_id: qty})."""
+    mats = sde.materials.get(tid)
+    portion = sde.type_portion.get(tid, 1)
+    if not mats or qty < portion:
+        return qty, {}
+    n = qty // portion
+    left = qty - n * portion
+    base = {}
+    for mid, q in mats:
+        base[mid] = base.get(mid, 0) + q * n
+    mult = model.multiplier(tid)
+    out = {}
+    for mid, total in base.items():
+        v = int(math.floor(total * mult + EPS))
+        if v > 0:
+            out[mid] = v
+    return left, out
+
+
+def run_reprocess(sde, model, items, drill_down):
+    pool = {}
+    for tid, q in items.items():
+        pool[tid] = pool.get(tid, 0) + q
+    if not drill_down:
+        products = {}
+        for tid, q in pool.items():
+            left, out = reprocess_one(sde, model, tid, q)
+            if left:
+                products[tid] = products.get(tid, 0) + left
+            for mid, v in out.items():
+                products[mid] = products.get(mid, 0) + v
+        return products
+
+    reach_memo = {}
+
+    def reach(t, stack=()):
+        if t in reach_memo:
+            return reach_memo[t]
+        res = set()
+        for mid, _q in sde.materials.get(t, ()):
+            if mid in stack:
+                continue
+            res.add(mid)
+            res |= reach(mid, stack + (t,))
+        reach_memo[t] = res
+        return res
+
+    stuck = set()
+    for _ in range(10000):
+        cand = [t for t, q in pool.items()
+                if q > 0 and t not in stuck and sde.materials.get(t)
+                and q >= sde.type_portion.get(t, 1)]
+        if not cand:
+            break
+        ready = [t for t in cand if not any(t in reach(c) for c in cand if c != t)]
+        if not ready:
+            ready = cand
+        for t in ready:
+            q = pool.pop(t)
+            left, out = reprocess_one(sde, model, t, q)
+            if left:
+                pool[t] = pool.get(t, 0) + left
+            if not out:
+                stuck.add(t)
+            for mid, v in out.items():
+                pool[mid] = pool.get(mid, 0) + v
+    return {t: q for t, q in pool.items() if q > 0}
+
+
+def hub_orders(state, market_key):
+    """Orders at the hub station for the given market (or None)."""
+    _k, loc = MARKET_KEYS[market_key]
+    all_orders = state.all_orders()
+    at = [o for o in all_orders if o["location_id"] == loc]
+    if not at:
+        book = state.books.get(market_key)
+        if book:
+            at = list(book.values())
+    return at or None
+
+
+def handle_config(state, body):
+    data = _json_body(body, allow_empty=True)
+    cfg = parse_config(data)
+    key = secrets.token_hex(16)
+    with state.lock:
+        state.configs[key] = cfg
+    return 201, {"key": key}
+
+
+def _json_body(body, allow_empty=False):
+    if not body or not body.strip():
+        if allow_empty:
+            return None
+        raise ValueApiError(400, "INVALID_VALUE", "", "Request body is empty")
+    try:
+        return json.loads(body.decode("utf-8-sig"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise ValueApiError(400, "INVALID_VALUE", "", "Request body is not valid JSON: %s" % e)
+
+
+def _r2(v):
+    return None if v is None else round(v, 2)
+
+
+def handle_reprocess(state, headers, body):
+    api_key = headers.get("x-api-key")
+    config = None
+    if api_key is not None and api_key.strip() != "":
+        with state.lock:
+            config = state.configs.get(api_key.strip())
+        if config is None:
+            return 401, {"code": "BAD_API_KEY"}
+
+    data = _json_body(body)
+    if not isinstance(data, dict):
+        raise ValueApiError(400, "INVALID_VALUE", "", "Request body must be a JSON object")
+    items = data.get("items")
+    if not isinstance(items, dict) or not items:
+        raise ValueApiError(400, "INVALID_VALUE", "items",
+                            "items must be a non-empty object mapping item names to quantities")
+    for name, q in items.items():
+        if isinstance(q, bool) or not isinstance(q, (int, float)) or \
+                (isinstance(q, float) and q != int(q)) or q <= 0:
+            raise ValueApiError(400, "INVALID_VALUE", "items.%s" % name,
+                                "Quantity for '%s' must be a positive integer, got %s"
+                                % (name, json.dumps(q)))
+    eff_in = data.get("efficiency")
+    if eff_in is None:
+        eff_in = {}
+    if not isinstance(eff_in, dict):
+        raise ValueApiError(400, "INVALID_VALUE", "efficiency", "efficiency must be an object")
+    eff = dict(DEFAULT_EFF)
+    for k in ("ore", "gas", "scrap"):
+        v = eff_in.get(k)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+            raise ValueApiError(400, "INVALID_VALUE", "efficiency.%s" % k,
+                                "efficiency.%s must be a number between 0 and 1, got %s"
+                                % (k, json.dumps(v)))
+        eff[k] = float(v)
+    drill = data.get("drill_down", False)
+    if drill is None:
+        drill = False
+    if not isinstance(drill, bool):
+        raise ValueApiError(400, "INVALID_VALUE", "drill_down", "drill_down must be a boolean")
+    if "market" in data:
+        market = data.get("market")
+    else:
+        market = "jita"
+    if market is not None:
+        if not isinstance(market, str) or market.strip().lower() not in MARKET_KEYS:
+            raise _enum_error("market", market, ["Jita", "Amarr", "Dodixie", "Rens", "Hek", None])
+        market = market.strip().lower()
+
+    sde = state.sde
+    resolved = {}
+    unknown = []
+    for name, q in items.items():
+        tid = sde.type_exact.get(name)
+        if tid is None:
+            tid = sde.type_by_name.get(name.strip().lower())
+        if tid is None:
+            unknown.append(name)
+            continue
+        resolved[tid] = resolved.get(tid, 0) + int(q)
+    if unknown:
+        raise ApiError(404, "UNKNOWN_ITEMS", sorted(unknown))
+
+    model = YieldModel(sde, efficiency=eff, config=config)
+    products = run_reprocess(sde, model, resolved, drill)
+
+    prices = None
+    if market is not None:
+        with state.lock:
+            orders = hub_orders(state, market)
+        if orders:
+            by_type = {}
+            for o in orders:
+                by_type.setdefault(o["type_id"], []).append(o)
+            prices = {}
+
+            def unit(tid):
+                if tid not in prices:
+                    lst = by_type.get(tid)
+                    prices[tid] = type_stats(lst) if lst else None
+                return prices[tid]
+
+    def summary(qtys):
+        vol = sum(q * item_volume(sde, t) for t, q in qtys.items())
+        out = {"volume": round(vol, 2)}
+        for f in ("buy", "sell", "buy_5pct", "sell_5pct"):
+            if prices is None:
+                out[f] = None
+                continue
+            total = 0.0
+            for t, q in qtys.items():
+                st = unit(t)
+                if st and st[f] is not None:
+                    total += q * st[f]
+            out[f] = round(total, 2)
+        return out
+
+    prod_out = {}
+    for t in sorted(products, key=lambda t: sde.types.get(t, "")):
+        q = products[t]
+        entry = {"quantity": q, "volume": round(q * item_volume(sde, t), 2)}
+        for f in ("buy", "sell"):
+            if prices is None:
+                entry[f] = None
+            else:
+                st = unit(t)
+                entry[f] = _r2(q * st[f]) if st and st[f] is not None else None
+        prod_out[sde.types.get(t, str(t))] = entry
+
+    return 201, {
+        "inputs": summary(resolved),
+        "outputs": summary(products),
+        "yields": model.reported(),
+        "products": prod_out,
+    }
+
+
+# --------------------------------------------------------------------------
 # HTTP plumbing
 # --------------------------------------------------------------------------
 
@@ -669,9 +1142,15 @@ def make_handler(state):
                         if len(parts) == 3:
                             return self._send(*handle_region(state, rid, query))
                         return self._send(*handle_region_type(state, rid, parts[3]))
+                    if method == "POST" and route == "config" and len(parts) == 2:
+                        return self._send(*handle_config(state, body))
+                    if method == "POST" and route == "reprocess" and len(parts) == 2:
+                        return self._send(*handle_reprocess(state, headers, body))
                     if method == "GET" and route == "hub-compare" and len(parts) == 3:
                         return self._send(*handle_hub_compare(state, parts[2]))
                 self._send(404, {"error": "NOT_FOUND", "details": "No route for %s %s" % (method, parsed.path)})
+            except ValueApiError as e:
+                self._send(e.status, e.payload())
             except ApiError as e:
                 self._send(e.status, {"error": e.error, "details": e.details})
             except Exception as e:  # pragma: no cover
