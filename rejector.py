@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""rejector: run prompt tasks against an OpenAI-compatible chat completions API."""
+"""rejector: run prompt tasks against an OpenAI-compatible chat/completions API."""
 
 import argparse
 import copy
@@ -8,6 +8,7 @@ import math
 import os
 import random
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -22,7 +23,10 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
-SCHEMES = ("greedy", "sample", "rejection")
+SCHEMES = ("greedy", "sample", "rejection", "agentic")
+API_TYPES = ("chat", "completions")
+CHAT_TEMPLATES = ("chatml", "llama3", "mistral", "zephyr")
+HANDLER_TYPES = ("echo", "static_map", "script")
 EVAL_TYPES = ("exact_match", "contains", "regex", "script", "llm_judge")
 EXTRACTS = ("last_number", "last_line", "full", "letter", "first_number")
 ICL_STRATEGIES = ("fixed", "random", "round_robin")
@@ -169,6 +173,11 @@ def build_task(name, task, P, args, config_dir="."):
         raise ConfigError(f"{P}.generation.temperature must be a number, got {temperature!r}")
     if scheme == "greedy":
         temperature = 0.0
+    elif scheme == "agentic":
+        if temperature is None:
+            temperature = 0.0
+        if temperature < 0:
+            raise ConfigError(f"temperature must be >= 0 for scheme 'agentic' ({P}), got {temperature!r}")
     else:
         if temperature is None:
             temperature = 1.0
@@ -207,7 +216,109 @@ def build_task(name, task, P, args, config_dir="."):
     if ma is None:
         ma = 3 * ns
     cfg["max_attempts"] = ma
+
+    api_type = args.api_type if getattr(args, "api_type", None) is not None else task.get("api_type", "chat")
+    if api_type is None:
+        api_type = "chat"
+    if api_type not in API_TYPES:
+        raise ConfigError(f"{P}.api_type must be one of {', '.join(API_TYPES)}, got {api_type!r}")
+    cfg["api_type"] = api_type
+    ct = args.chat_template if getattr(args, "chat_template", None) is not None else task.get("chat_template")
+    if ct is None:
+        ct = "chatml"
+    if ct not in CHAT_TEMPLATES:
+        raise ConfigError(f"{P}.chat_template must be one of {', '.join(CHAT_TEMPLATES)}, got {ct!r}")
+    cfg["chat_template"] = ct
+
+    mi = gen.get("max_iterations", 10)
+    if mi is None:
+        mi = 10
+    if not _is_int(mi) or mi < 1:
+        raise ConfigError(f"{P}.generation.max_iterations must be a positive integer, got {mi!r}")
+    cfg["max_iterations"] = mi
+    cfg["tools"] = build_tools(task.get("tools"), P)
     return cfg
+
+
+def build_tools(tools, P):
+    T = f"{P}.tools"
+    if tools is None:
+        return []
+    if not isinstance(tools, list):
+        raise ConfigError(f"{T} must be a list")
+    out = []
+    seen = set()
+    for i, t in enumerate(tools):
+        W = f"{T}[{i}]"
+        if not isinstance(t, dict):
+            raise ConfigError(f"{W} must be a mapping")
+        name = t.get("name")
+        if not isinstance(name, str) or not name:
+            raise ConfigError(f"{W}.name is required and must be a non-empty string")
+        if name in seen:
+            raise ConfigError(f"{W}: duplicate tool name {name!r}")
+        seen.add(name)
+        desc = t.get("description", "")
+        if desc is None:
+            desc = ""
+        if not isinstance(desc, str):
+            raise ConfigError(f"{W}.description must be a string")
+        params = t.get("parameters")
+        if params is None:
+            params = {"type": "object", "properties": {}}
+        if not isinstance(params, dict):
+            raise ConfigError(f"{W}.parameters must be a mapping")
+        req = params.get("required") or []
+        if not isinstance(req, list):
+            raise ConfigError(f"{W}.parameters.required must be a list")
+        props = params.get("properties") or {}
+        if not isinstance(props, dict):
+            raise ConfigError(f"{W}.parameters.properties must be a mapping")
+        h = t.get("handler")
+        if not isinstance(h, dict):
+            raise ConfigError(f"{W}.handler is required and must be a mapping")
+        ht = h.get("type")
+        if ht not in HANDLER_TYPES:
+            raise ConfigError(f"{W}.handler.type must be one of {', '.join(HANDLER_TYPES)}, got {ht!r}")
+        handler = {"type": ht}
+        key_field = None
+        if req:
+            key_field = str(req[0])
+        elif props:
+            key_field = str(next(iter(props)))
+        if ht == "static_map":
+            mapping = h.get("mapping")
+            if mapping is None:
+                mapping = {}
+            if not isinstance(mapping, dict):
+                raise ConfigError(f"{W}.handler.mapping must be a mapping")
+            default = h.get("default", "NOT_FOUND")
+            if default is None:
+                default = "NOT_FOUND"
+            handler["mapping"] = {_stringify(k): _stringify(v) for k, v in mapping.items()}
+            handler["default"] = _stringify(default)
+            handler["key_field"] = key_field
+        elif ht == "script":
+            cmd = h.get("command")
+            if not isinstance(cmd, str) or not cmd.strip():
+                raise ConfigError(f"{W}.handler.command is required for handler type 'script'")
+            try:
+                argv = shlex.split(cmd)
+            except ValueError as e:
+                raise ConfigError(f"{W}.handler.command cannot be parsed: {e}")
+            af = h.get("arg_field")
+            if af is None:
+                af = key_field
+            if not isinstance(af, str) or not af:
+                raise ConfigError(f"{W}.handler.arg_field is required for handler type 'script'")
+            handler["argv"] = argv
+            handler["arg_field"] = af
+            to = h.get("timeout", SCRIPT_TIMEOUT)
+            if not _is_num(to) or to <= 0:
+                raise ConfigError(f"{W}.handler.timeout must be a positive number")
+            handler["timeout"] = to
+        out.append({"name": name, "description": desc, "parameters": params, "handler": handler})
+    return out
 
 
 def _check_example(ex, where):
@@ -608,13 +719,13 @@ class Transport:
     """Shared per-server connection limiter."""
 
     def __init__(self, api_url, max_inflight, stats):
-        self.url = api_url + "/v1/chat/completions"
+        self.base = api_url
         self.sem = threading.BoundedSemaphore(max_inflight)
         self.stats = stats
 
-    def post(self, body, counter):
+    def post(self, body, counter, path="/v1/chat/completions"):
         data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(self.url, data=data, method="POST",
+        req = urllib.request.Request(self.base + path, data=data, method="POST",
                                      headers={"Content-Type": "application/json"})
         with self.sem:
             t0 = time.monotonic()
@@ -659,45 +770,368 @@ class Client:
 
     def complete(self, messages, model=None, temperature=None, max_tokens=None):
         """One logical attempt with retries. Returns (ok, text, meta)."""
+        ok, text, _calls, meta = self.request(messages, model, temperature, max_tokens)
+        if ok and text is None:
+            text = ""
+        return ok, text, meta
+
+    def request(self, messages, model=None, temperature=None, max_tokens=None, tools=None):
+        """One API request (with 5xx retries).
+
+        Returns (ok, text, tool_calls, meta). tool_calls is a list of
+        {"id", "name", "arguments"(raw), "raw"} dicts, or [] when none.
+        """
         model = self.cfg["model"] if model is None else model
-        body = {
-            "model": model,
-            "messages": messages,
-            "temperature": self.cfg["temperature"] if temperature is None else temperature,
-            "max_tokens": self.cfg["max_tokens"] if max_tokens is None else max_tokens,
-        }
+        temperature = self.cfg["temperature"] if temperature is None else temperature
+        max_tokens = self.cfg["max_tokens"] if max_tokens is None else max_tokens
+        completions = self.cfg.get("api_type") == "completions"
+        if completions:
+            body = {
+                "model": model,
+                "prompt": render_chat_template(self.cfg.get("chat_template") or "chatml", messages, tools),
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            path = "/v1/completions"
+        else:
+            body = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            if tools:
+                body["tools"] = [{"type": "function",
+                                  "function": {"name": t["name"], "description": t["description"],
+                                               "parameters": t["parameters"]}} for t in tools]
+            path = "/v1/chat/completions"
         meta = None
         for _ in range(MAX_HTTP_TRIES):
-            status, payload, err, latency = self.transport.post(body, self.counter)
+            status, payload, err, latency = self.transport.post(body, self.counter, path)
             meta = {"model": model, "prompt_tokens": 0, "completion_tokens": 0,
                     "total_tokens": 0, "latency_ms": latency, "finish_reason": None}
             if status is not None and 200 <= status < 300:
                 try:
                     obj = json.loads(payload.decode("utf-8"))
                     choice = obj["choices"][0]
-                    text = choice.get("message", {}).get("content")
-                    if text is None:
-                        text = ""
+                    calls = []
+                    if completions:
+                        text = choice.get("text")
+                        if text is None:
+                            text = ""
+                        if tools is not None:
+                            calls = parse_text_tool_calls(text)
+                    else:
+                        msg = choice.get("message") or {}
+                        text = msg.get("content")
+                        for k, tc in enumerate(msg.get("tool_calls") or []):
+                            fn = (tc or {}).get("function") or {}
+                            calls.append({"id": tc.get("id") or f"call_{k}",
+                                          "name": fn.get("name"),
+                                          "arguments": fn.get("arguments"),
+                                          "raw": tc})
                     usage = obj.get("usage") or {}
                     meta["prompt_tokens"] = int(usage.get("prompt_tokens") or 0)
                     meta["completion_tokens"] = int(usage.get("completion_tokens") or 0)
                     meta["total_tokens"] = int(usage.get("total_tokens")
                                                or meta["prompt_tokens"] + meta["completion_tokens"])
                     meta["finish_reason"] = choice.get("finish_reason")
-                    return True, text, meta
+                    return True, text, calls, meta
                 except Exception:
-                    return False, None, meta
+                    return False, None, [], meta
             if status is not None and status < 500:
-                return False, None, meta  # 4xx: not retryable
+                return False, None, [], meta  # 4xx: not retryable
             # 5xx or connection-level failure: retry
-        return False, None, meta
+        return False, None, [], meta
+
+
+# ---------------------------------------------------------------- templates
+
+
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def parse_text_tool_calls(text):
+    calls = []
+    for k, m in enumerate(TOOL_CALL_RE.finditer(text or "")):
+        body = m.group(1)
+        name, arguments = None, None
+        try:
+            obj = json.loads(body)
+            if isinstance(obj, dict):
+                name = obj.get("name")
+                arguments = obj.get("arguments", obj.get("parameters", {}))
+            else:
+                arguments = body
+        except (json.JSONDecodeError, ValueError):
+            arguments = body
+        calls.append({"id": f"call_{k}", "name": name, "arguments": arguments, "raw": None})
+    return calls
+
+
+def tools_prompt(tools):
+    lines = ["# Tools", "",
+             "You may call one or more functions to assist with the user query.",
+             "You are provided with function signatures within <tools></tools> XML tags:",
+             "<tools>"]
+    for t in tools:
+        lines.append(json.dumps({"type": "function",
+                                 "function": {"name": t["name"], "description": t["description"],
+                                              "parameters": t["parameters"]}}, ensure_ascii=False))
+    lines += ["</tools>", "",
+              "For each function call, return a json object with function name and arguments "
+              "within <tool_call></tool_call> XML tags:",
+              "<tool_call>",
+              '{"name": <function-name>, "arguments": <args-json-object>}',
+              "</tool_call>",
+              "When you have the final answer, respond with plain text and no <tool_call> block."]
+    return "\n".join(lines)
+
+
+def _msg_text(m):
+    c = m.get("content")
+    if c is None:
+        c = ""
+    if not isinstance(c, str):
+        c = _stringify(c)
+    if m.get("role") == "assistant" and m.get("tool_calls") and "<tool_call>" not in c:
+        blocks = []
+        for tc in m["tool_calls"]:
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            blocks.append("<tool_call>\n" + json.dumps({"name": fn.get("name"), "arguments": args},
+                                                        ensure_ascii=False) + "\n</tool_call>")
+        c = (c + "\n" if c else "") + "\n".join(blocks)
+    return c
+
+
+def render_chat_template(name, messages, tools=None):
+    """Render a message list into a prompt string using a built-in template."""
+    msgs = [dict(m) for m in messages]
+    if tools:
+        tp = tools_prompt(tools)
+        if msgs and msgs[0].get("role") == "system":
+            msgs[0]["content"] = (_msg_text(msgs[0]) + "\n\n" + tp) if _msg_text(msgs[0]) else tp
+        else:
+            msgs.insert(0, {"role": "system", "content": tp})
+    if name == "chatml":
+        out = "".join(f"<|im_start|>{m['role']}\n{_msg_text(m)}<|im_end|>\n" for m in msgs)
+        return out + "<|im_start|>assistant\n"
+    if name == "llama3":
+        out = "<|begin_of_text|>"
+        for m in msgs:
+            out += f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{_msg_text(m)}<|eot_id|>"
+        return out + "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    if name == "zephyr":
+        out = "".join(f"<|{m['role']}|>\n{_msg_text(m)}</s>\n" for m in msgs)
+        return out + "<|assistant|>\n"
+    if name == "mistral":
+        system = None
+        if msgs and msgs[0].get("role") == "system":
+            system = _msg_text(msgs[0])
+            msgs = msgs[1:]
+        out = ""
+        first_user = True
+        for m in msgs:
+            role, text = m.get("role"), _msg_text(m)
+            if role == "user" or role == "system":
+                if first_user and system is not None:
+                    text = f"{system}\n\n{text}"
+                first_user = False
+                out += f"[INST] {text} [/INST]"
+            elif role == "assistant":
+                out += f" {text}</s>"
+            elif role == "tool":
+                out += f"[TOOL_RESULTS] {text} [/TOOL_RESULTS]"
+            else:
+                out += f"[INST] {text} [/INST]"
+        if first_user and system is not None:
+            out = f"[INST] {system} [/INST]" + out
+        return out
+    raise ValueError(f"unknown chat template {name!r}")
+
+
+# ---------------------------------------------------------------- tools
+
+
+def run_tool_script(handler, value):
+    argv = list(handler["argv"]) + [value]
+    timeout = handler.get("timeout", SCRIPT_TIMEOUT)
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as e:
+        return f"ERROR: {e}"
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        return f"ERROR: timeout after {timeout} seconds"
+    out = out.decode("utf-8", errors="replace")
+    err = err.decode("utf-8", errors="replace")
+    if proc.returncode != 0:
+        msg = err.strip() or f"command exited with status {proc.returncode}"
+        return f"ERROR: {msg}"
+    return out.strip()
+
+
+def execute_tool(tools_by_name, name, args):
+    tool = tools_by_name.get(name)
+    if tool is None:
+        return f"ERROR: unknown tool {name!r}"
+    h = tool["handler"]
+    try:
+        if h["type"] == "echo":
+            return json.dumps(args, ensure_ascii=False)
+        if h["type"] == "static_map":
+            kf = h["key_field"]
+            if isinstance(args, dict):
+                if kf is not None and kf in args:
+                    key = args[kf]
+                elif kf is None and args:
+                    key = next(iter(args.values()))
+                else:
+                    return h["default"]
+            else:
+                key = args
+            return h["mapping"].get(_stringify(key), h["default"])
+        # script
+        if isinstance(args, dict):
+            if h["arg_field"] not in args:
+                return f"ERROR: missing argument {h['arg_field']!r}"
+            value = args[h["arg_field"]]
+        else:
+            value = args
+        return run_tool_script(h, _stringify(value) if value is not None else "")
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+
+def run_agentic(client, cfg, messages):
+    """Run one agentic loop. Returns a dict describing it."""
+    tools = cfg.get("tools") or []
+    tools_by_name = {t["name"]: t for t in tools}
+    completions = cfg.get("api_type") == "completions"
+    convo = copy.deepcopy(messages)
+    t0 = time.monotonic()
+    details, tool_calls = [], []
+    text, finish, api_ok = None, "max_iterations", True
+    iterations = 0
+    for it in range(1, cfg["max_iterations"] + 1):
+        ok, rtext, calls, meta = client.request(convo, tools=tools)
+        iterations = it
+        if meta is None:
+            meta = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                    "latency_ms": 0, "finish_reason": None}
+        details.append({"prompt_tokens": meta["prompt_tokens"],
+                        "completion_tokens": meta["completion_tokens"],
+                        "total_tokens": meta["total_tokens"],
+                        "latency_ms": meta["latency_ms"],
+                        "finish_reason": meta["finish_reason"]})
+        if not ok:
+            api_ok, finish = False, "error"
+            break
+        if not calls:
+            text = rtext if rtext is not None else ""
+            finish = "stop"
+            break
+        # execute every call, then extend the conversation
+        results = []
+        for c in calls:
+            raw = c["arguments"]
+            if isinstance(raw, str):
+                try:
+                    args = json.loads(raw) if raw.strip() else {}
+                except (json.JSONDecodeError, ValueError):
+                    args = raw
+            elif raw is None:
+                args = {}
+            else:
+                args = raw
+            if isinstance(raw, str) and not isinstance(args, (dict, list)) and args is raw:
+                res = "ERROR: invalid JSON arguments"
+            else:
+                res = execute_tool(tools_by_name, c["name"], args)
+            tool_calls.append({"iteration": it, "tool": c["name"], "args": args, "result": res})
+            results.append((c, res))
+        if completions:
+            convo.append({"role": "assistant", "content": rtext or ""})
+            for c, res in results:
+                convo.append({"role": "tool", "content": res})
+        else:
+            raw_calls = []
+            for c, _ in results:
+                rc = copy.deepcopy(c["raw"]) if isinstance(c["raw"], dict) else {}
+                rc.setdefault("id", c["id"])
+                rc.setdefault("type", "function")
+                fn = rc.setdefault("function", {})
+                fn.setdefault("name", c["name"])
+                if not isinstance(fn.get("arguments"), str):
+                    fn["arguments"] = json.dumps(fn.get("arguments") if fn.get("arguments") is not None else {})
+                raw_calls.append(rc)
+            convo.append({"role": "assistant", "content": rtext, "tool_calls": raw_calls})
+            for c, res in results:
+                convo.append({"role": "tool", "tool_call_id": c["id"], "content": res})
+    latency = int(round((time.monotonic() - t0) * 1000))
+    agg = {
+        "model": cfg["model"],
+        "total_prompt_tokens": sum(d["prompt_tokens"] for d in details),
+        "total_completion_tokens": sum(d["completion_tokens"] for d in details),
+        "total_tokens": sum(d["total_tokens"] for d in details),
+        "latency_ms": latency,
+        "finish_reason": finish,
+        "iterations_detail": details,
+    }
+    return {"text": text, "iterations": iterations, "tool_calls": tool_calls,
+            "meta": agg, "api_ok": api_ok}
 
 
 # ---------------------------------------------------------------- processing
 
 
+def process_row_agentic(client, cfg, row, messages, idx):
+    ev = cfg["evaluation"]
+    is_judge = ev is not None and ev["type"] == "llm_judge"
+    loop = run_agentic(client, cfg, messages)
+    meta = loop["meta"]
+    text = loop["text"]
+    judge_score = None
+    if text is None:
+        passed, extracted = (False if ev is not None else None), None
+    elif ev is None:
+        passed, extracted = None, None
+    elif ev["type"] == "script":
+        passed, extracted = evaluate_script(ev, text, row, idx)
+    elif is_judge:
+        passed, extracted, judge_score, jmeta = evaluate_judge(client, cfg, ev, text, row, idx)
+        meta["judge_meta"] = jmeta
+    else:
+        passed, extracted = evaluate_local(ev, text, row)
+    r = {"passed": passed, "extracted_answer": extracted, "attempts": 1}
+    if is_judge:
+        r["judge_score"] = judge_score
+    r["iterations"] = loop["iterations"]
+    r["tool_calls"] = loop["tool_calls"]
+    output = {cfg["output_field"]: text} if text is not None else None
+    return {"output": output, "result": r, "metas": [meta], "api_ok": loop["api_ok"]}
+
+
 def process_row(client, cfg, row, messages, idx):
     ev = cfg["evaluation"]
+    if cfg["scheme"] == "agentic":
+        return process_row_agentic(client, cfg, row, messages, idx)
     scheme = cfg["scheme"]
     is_judge = ev is not None and ev["type"] == "llm_judge"
     attempts = cfg["n"] if scheme == "rejection" else 1
@@ -753,11 +1187,24 @@ def _evaluate(client, cfg, text, row, idx, meta):
 def _one_attempt(client, cfg, row, idx, messages, setup_name):
     """Return (text_or_None, passed, meta)."""
     ev = cfg["evaluation"]
-    try:
-        ok, text, meta = client.complete(messages)
-    except Exception as e:
-        print(f"warning: task {cfg.get('name')!r} row {idx}: {type(e).__name__}: {e}", file=sys.stderr)
-        ok, text, meta = False, None, None
+    if cfg["scheme"] == "agentic":
+        try:
+            loop = run_agentic(client, cfg, messages)
+            ok, text, meta = loop["text"] is not None, loop["text"], loop["meta"]
+            meta["iterations"] = loop["iterations"]
+            meta["tool_calls"] = loop["tool_calls"]
+        except Exception as e:
+            print(f"warning: task {cfg.get('name')!r} row {idx}: {type(e).__name__}: {e}", file=sys.stderr)
+            ok, text = False, None
+            meta = {"model": cfg["model"], "total_prompt_tokens": 0, "total_completion_tokens": 0,
+                    "total_tokens": 0, "latency_ms": 0, "finish_reason": "error",
+                    "iterations_detail": [], "iterations": 0, "tool_calls": []}
+    else:
+        try:
+            ok, text, meta = client.complete(messages)
+        except Exception as e:
+            print(f"warning: task {cfg.get('name')!r} row {idx}: {type(e).__name__}: {e}", file=sys.stderr)
+            ok, text, meta = False, None, None
     if meta is None:
         meta = {"model": cfg["model"], "prompt_tokens": 0, "completion_tokens": 0,
                 "total_tokens": 0, "latency_ms": 0, "finish_reason": None}
@@ -791,7 +1238,7 @@ def process_row_multi(client, cfg, row, prepared, idx):
             target, max_att = N, len(setups)
         else:
             target, max_att = 1, 1
-    elif scheme == "sample":
+    elif scheme in ("sample", "agentic"):
         target, max_att = N, N
     else:  # rejection
         target, max_att = N, cfg["max_attempts"]
@@ -861,6 +1308,9 @@ def _safe_process(client, cfg, row, messages, idx):
              "extracted_answer": None, "attempts": 1}
         if cfg["evaluation"] is not None and cfg["evaluation"]["type"] == "llm_judge":
             r["judge_score"] = None
+        if cfg["scheme"] == "agentic":
+            r["iterations"] = 0
+            r["tool_calls"] = []
         return {"output": None, "result": r, "metas": [], "api_ok": False}
 
 
@@ -1023,8 +1473,8 @@ def run(args):
             for row, res in zip(job["rows"], results[j]):
                 metas = res["metas"]
                 for m in metas:
-                    tp += m["prompt_tokens"]
-                    tc += m["completion_tokens"]
+                    tp += m.get("total_prompt_tokens", m.get("prompt_tokens", 0))
+                    tc += m.get("total_completion_tokens", m.get("completion_tokens", 0))
                     jm = m.get("judge_meta")
                     if jm:
                         tp += jm["prompt_tokens"]
@@ -1116,6 +1566,8 @@ def main(argv=None):
     r.add_argument("--max-attempts", dest="max_attempts", type=int)
     r.add_argument("--icl-strategy", dest="icl_strategy", choices=ICL_STRATEGIES)
     r.add_argument("--icl-k", dest="icl_k", type=int)
+    r.add_argument("--api-type", dest="api_type", choices=API_TYPES)
+    r.add_argument("--chat-template", dest="chat_template", choices=CHAT_TEMPLATES)
     args = p.parse_args(argv)
     if args.command != "run":
         p.error("a command is required: run")
