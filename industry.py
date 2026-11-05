@@ -599,58 +599,86 @@ class Planner:
             return None
         return min(norm, key=lambda s: (0 if s[1] == INVENTION else 1, s[0]))
 
+    def invention_cost(self, bp, n_bps, decryptor, relic, skill):
+        """Return (attempts, materials{tid: qty}, me, te, bp_runs)."""
+        sde = self.sde
+        src = self.invention_source(bp, relic)
+        if src is None:
+            return None
+        s_id, s_act, s_runs = src
+        _dn, mult, druns, dme, dte = self.decryptors[decryptor]
+        q = relic_quality(sde.types.get(s_id, {}).get("typeName", "")) \
+            if s_id not in sde.bp_products else None
+        if q is not None:
+            _qn, base_f, base_runs = RELIC_QUALITIES[q]
+            base = Fraction(str(base_f))
+        else:
+            raw = self.inv.probs.get((s_id, s_act, bp))
+            base = Fraction(str(raw)) if raw not in (None, "", "None") else Fraction(0)
+            base_runs = s_runs
+        skill_ids = self.inv.skills.get((s_id, s_act), [])
+        tn = lambda i: sde.types[i]["typeName"] if i in sde.types else ""
+        n_enc = sum(1 for s in skill_ids if "Encryption" in tn(s))
+        n_sci = len(skill_ids) - n_enc
+        p = base * (1 + n_sci * Fraction(skill, 30) + n_enc * Fraction(skill, 40)) \
+            * (1 + Fraction(mult, 100))
+        p = min(Fraction(1), max(Fraction(0), p))
+        if p <= 0:
+            raise ValueError("invention probability is zero")
+        bp_runs = max(1, base_runs + druns)
+        if callable(n_bps):
+            n_bps = n_bps(bp_runs)
+        attempts = math.ceil(Fraction(n_bps) / p) if n_bps > 0 else 0
+        mats = {}
+        for mid, mq in sde.materials.get((s_id, s_act), []):
+            mats[mid] = mats.get(mid, 0) + mq * attempts
+        if q is not None:
+            mats[s_id] = mats.get(s_id, 0) + attempts
+        if decryptor != "None":
+            did = sde.name_to_id.get(decryptor)
+            if did is not None:
+                mats[did] = mats.get(did, 0) + attempts
+        return attempts, mats, BASE_ME + dme, BASE_TE + dte, bp_runs
+
+    def is_inventable(self, tid):
+        rec = self.component_recipe(tid)
+        if rec is None or rec[1] != MANUFACTURING:
+            return False
+        if self.sde.tech_level(tid) not in ("Tech II", "Tech III"):
+            return False
+        return self.invention_source(rec[0]) is not None
+
     def plan(self, spec, config):
         sde = self.sde
         bp, act, prod, qty = spec["recipe"]
         runs, jobs = spec["runs"], spec["jobs"]
-        buy = {}
+        stocks = dict(config.get("stocks") or {})
+        targets = dict(config.get("targets") or {})
+        skill = config["invention_skill"]
+        consumed = {}   # every material consumed by jobs / invention
+        produced = {}   # every unit produced by jobs (excluding top product)
+        built = set()   # items whose demand is satisfied by building
 
-        def add(tid, n):
+        def consume(tid, n):
             if n:
-                buy[tid] = buy.get(tid, 0) + n
+                consumed[tid] = consumed.get(tid, 0) + n
 
         if spec["kind"] in ("invent", "re"):
             relic = spec.get("relic")
-            src = self.invention_source(bp, relic)
-            if src is None:
+            if runs <= 0:
+                raise ValueError("runs must be positive")
+
+            def top_bps(bp_runs):
+                if runs <= bp_runs:
+                    return ceil_div(jobs, bp_runs // runs)
+                return jobs * ceil_div(runs, bp_runs)
+            res = self.invention_cost(bp, top_bps, spec["decryptor"], relic, skill)
+            if res is None:
                 raise ValueError(f"'{spec['name']}' cannot be invented"
                                  + (" from that relic" if relic else ""))
-            s_id, s_act, s_runs = src
-            _dn, mult, druns, dme, dte = self.decryptors[spec["decryptor"]]
-            q = relic_quality(sde.types.get(s_id, {}).get("typeName", "")) \
-                if s_id not in sde.bp_products else None
-            if q is not None:
-                _qn, base_f, base_runs = RELIC_QUALITIES[q]
-                base = Fraction(str(base_f))
-            else:
-                raw = self.inv.probs.get((s_id, s_act, bp))
-                base = Fraction(str(raw)) if raw not in (None, "", "None") else Fraction(0)
-                base_runs = s_runs
-            skill_ids = self.inv.skills.get((s_id, s_act), [])
-            tn = lambda i: sde.types[i]["typeName"] if i in sde.types else ""
-            n_enc = sum(1 for s in skill_ids if "Encryption" in tn(s))
-            n_sci = len(skill_ids) - n_enc
-            lvl = config["invention_skill"]
-            p = base * (1 + n_sci * Fraction(lvl, 30) + n_enc * Fraction(lvl, 40)) \
-                * (1 + Fraction(mult, 100))
-            p = min(Fraction(1), max(Fraction(0), p))
-            if p <= 0:
-                raise ValueError("invention probability is zero")
-            bp_runs = max(1, base_runs + druns)
-            me, te = BASE_ME + dme, BASE_TE + dte
-            if runs <= bp_runs:
-                n_bps = ceil_div(jobs, bp_runs // runs)
-            else:
-                n_bps = jobs * ceil_div(runs, bp_runs)
-            attempts = math.ceil(Fraction(n_bps) / p)
-            for mid, mq in sde.materials.get((s_id, s_act), []):
-                add(mid, mq * attempts)
-            if q is not None:
-                add(s_id, attempts)
-            if spec["decryptor"] != "None":
-                did = sde.name_to_id.get(spec["decryptor"])
-                if did is not None:
-                    add(did, attempts)
+            _att, mats, me, te, _br = res
+            for mid, mq in mats.items():
+                consume(mid, mq)
         else:
             me, te = spec["me"], spec["te"]
         if act != MANUFACTURING:
@@ -658,66 +686,87 @@ class Planner:
         te_bonus = config["te_bonus"]
         split_days = config["split_days"]
         build_all = config.get("build_all", False)
-        need = {}
-        produced = {}
         job_rows = {}
+
+        def eligible(tid):
+            if tid in targets:
+                return self.component_recipe(tid) is not None
+            return build_all and self.component_recipe(tid) is not None
 
         def bp_name(b):
             return sde.types[b]["typeName"] if b in sde.types else str(b)
 
-        def run_jobs(b, a, job_runs, j_me, j_te):
-            secs = Fraction(sde.times.get((b, a), 0)) * Fraction(100 - j_te, 100) \
+        def job_secs(b, a, j_te):
+            return Fraction(sde.times.get((b, a), 0)) * Fraction(100 - j_te, 100) \
                 * Fraction(100 - te_bonus, 100)
+
+        def run_jobs(b, a, job_runs, j_me, j_te):
+            secs = job_secs(b, a, j_te)
             for r in job_runs:
                 days = round(float(secs * r / 86400), 2)
                 key = (bp_name(b), r, days)
                 job_rows[key] = job_rows.get(key, 0) + 1
                 for mid, mq in sde.materials.get((b, a), []):
-                    amt = max(r, ceil_div(mq * r * (100 - j_me), 100))
-                    if build_all and self.component_recipe(mid) is not None:
-                        need[mid] = need.get(mid, 0) + amt
-                    else:
-                        add(mid, amt)
-            return secs
+                    consume(mid, max(r, ceil_div(mq * r * (100 - j_me), 100)))
 
-        secs_run = Fraction(sde.times.get((bp, act), 0)) * Fraction(100 - te, 100) \
-            * Fraction(100 - te_bonus, 100)
         top_runs = []
+        secs_run = job_secs(bp, act, te)
         for _ in range(jobs):
             top_runs.extend(split_runs(runs, secs_run, split_days))
         run_jobs(bp, act, top_runs, me, te)
-        produced[prod] = produced.get(prod, 0)
 
-        if build_all:
-            cme, cte = config["component_me"], config["component_te"]
-            for tid in self.topo_order(bp, act):
-                total = need.get(tid, 0)
-                if total <= 0:
-                    continue
-                cb, ca, _cp, cq = self.component_recipe(tid)
-                n = ceil_div(total, max(1, cq))
-                produced[tid] = n * cq - total
-                if ca != MANUFACTURING:
-                    j_me, j_te = 0, 0
-                elif self.is_t1_capital(tid):
-                    j_me, j_te = 0, 0
-                else:
-                    j_me, j_te = cme, cte
-                s = Fraction(sde.times.get((cb, ca), 0)) * Fraction(100 - j_te, 100) \
-                    * Fraction(100 - te_bonus, 100)
-                run_jobs(cb, ca, split_runs(n, s, split_days), j_me, j_te)
+        cme, cte = config["component_me"], config["component_te"]
+        for tid in self.topo_order(bp, act, eligible, list(targets)):
+            total = consumed.get(tid, 0) + targets.get(tid, 0) - stocks.get(tid, 0)
+            built.add(tid)
+            if total <= 0:
+                continue
+            cb, ca, _cp, cq = self.component_recipe(tid)
+            n = ceil_div(total, max(1, cq))
+            produced[tid] = produced.get(tid, 0) + n * cq
+            if tid in targets and self.is_inventable(tid):
+                res = self.invention_cost(cb, lambda br: ceil_div(n, br),
+                                          "None", None, skill)
+                _att, mats, j_me, j_te, bp_runs = res
+                for mid, mq in mats.items():
+                    consume(mid, mq)
+                s = job_secs(cb, ca, j_te)
+                job_runs = []
+                left = n
+                while left > 0:
+                    r = min(bp_runs, left)
+                    job_runs.extend(split_runs(r, s, split_days))
+                    left -= r
+                run_jobs(cb, ca, job_runs, j_me, j_te)
+                continue
+            if ca != MANUFACTURING or self.is_t1_capital(tid):
+                j_me, j_te = 0, 0
+            else:
+                j_me, j_te = cme, cte
+            run_jobs(cb, ca, split_runs(n, job_secs(cb, ca, j_te), split_days),
+                     j_me, j_te)
 
         mat_rows = []
-        ids = set(buy) | {t for t, e in produced.items() if e > 0 and t != prod}
+        ids = set(consumed) | set(produced) | set(targets)
+        if prod not in targets:
+            ids.discard(prod)
         for tid in ids:
-            n = buy.get(tid, 0)
-            end = produced.get(tid, 0) if tid != prod else 0
-            if n <= 0 and end <= 0:
+            start = stocks.get(tid, 0)
+            used = consumed.get(tid, 0)
+            made = produced.get(tid, 0)
+            if tid in built:
+                n = 0
+            else:
+                n = max(0, used + targets.get(tid, 0) - start)
+            end = start + made + n - used
+            if n <= 0 and end <= start and not (start > 0 and used > 0):
+                continue
+            if n <= 0 and made <= 0 and used <= 0:
                 continue
             name = sde.types[tid]["typeName"] if tid in sde.types else str(tid)
             vol = Decimal(sde.volume(tid)) if tid in sde.types else Decimal(0)
             bv = float(round(vol * n, 2))
-            mat_rows.append((name, n, bv, 0, end))
+            mat_rows.append((name, n, bv, start, end))
         mat_rows.sort(key=lambda r: r[0])
         rows = [(k[0], k[1], k[2], c) for k, c in job_rows.items()]
         rows.sort(key=lambda r: (r[0], r[1], r[3], r[2]))
@@ -742,8 +791,9 @@ class Planner:
             return False
         return self.sde.tech_level(tid) == "Tech I"
 
-    def topo_order(self, bp, act):
-        """Buildable components reachable from (bp, act), consumers first."""
+    def topo_order(self, bp, act, eligible, extra=()):
+        """Eligible items reachable from (bp, act) and extra roots,
+        consumers first."""
         order, state = [], {}
 
         def visit(tid):
@@ -752,13 +802,16 @@ class Planner:
             state[tid] = 1
             rec = self.component_recipe(tid)
             for mid, _q in self.sde.materials.get((rec[0], rec[1]), []):
-                if self.component_recipe(mid) is not None:
+                if eligible(mid):
                     visit(mid)
             order.append(tid)
 
         for mid, _q in self.sde.materials.get((bp, act), []):
-            if self.component_recipe(mid) is not None:
+            if eligible(mid):
                 visit(mid)
+        for tid in extra:
+            if eligible(tid):
+                visit(tid)
         order.reverse()
         return order
 
@@ -787,6 +840,46 @@ def split_runs(n, secs_per_run, split_days):
     return [b + 1] * x + [b] * (t - x)
 
 
+def parse_quantity(tok):
+    t = tok.replace(",", "").replace("_", "")
+    if t.isdigit():
+        return int(t)
+    return None
+
+
+def parse_item_list(path, sde):
+    """Parse lines of '{Item Name} {Quantity} [anything...]'."""
+    items = {}
+    lower = {}
+    for n, tid in sde.name_to_id.items():
+        lower.setdefault(n.lower(), tid)
+    with open(path, encoding="utf-8-sig") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            tokens = line.split()
+            found = None
+            # Prefer the longest known item name followed by a quantity.
+            for i in range(len(tokens) - 1, 0, -1):
+                q = parse_quantity(tokens[i])
+                if q is None:
+                    continue
+                name = " ".join(tokens[:i])
+                tid = sde.name_to_id.get(name)
+                if tid is None:
+                    tid = lower.get(name.lower())
+                if tid is not None:
+                    found = (tid, q)
+                    break
+            if found is None:
+                raise ValueError(f"{path}:{lineno}: could not parse item line "
+                                 f"'{line}'")
+            tid, q = found
+            items[tid] = items.get(tid, 0) + q
+    return items
+
+
 def cmd_plan(args):
     try:
         config = load_config(args.config)
@@ -795,6 +888,14 @@ def cmd_plan(args):
         return 1
     config["build_all"] = getattr(args, "build_all", False)
     sde = SDE(args.sde)
+    try:
+        if getattr(args, "stocks", None):
+            config["stocks"] = parse_item_list(args.stocks, sde)
+        if getattr(args, "targets", None):
+            config["targets"] = parse_item_list(args.targets, sde)
+    except (OSError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
     planner = Planner(sde)
     try:
         spec = planner.parse(args.build)
@@ -868,6 +969,8 @@ def main(argv=None):
     pl.add_argument("--sde", required=True)
     pl.add_argument("--output", required=True)
     pl.add_argument("--build-all", dest="build_all", action="store_true")
+    pl.add_argument("--stocks", default=None)
+    pl.add_argument("--targets", default=None)
     args = p.parse_args(argv)
     if args.command == "plan":
         args.build = " ".join(args.build)
