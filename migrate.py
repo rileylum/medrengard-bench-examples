@@ -1433,6 +1433,7 @@ class Inheritance:
     def __init__(self, patterns):
         self.patterns = patterns
         self.cache = {}
+        self.keep_directive = False
 
     def _pattern_for(self, fmt):
         return self.patterns.get(fmt)
@@ -1445,9 +1446,10 @@ class Inheritance:
         if parts is None or not is_mapping(cfg.data):
             return False
         start = os.path.realpath(cfg.path)
-        return self._resolve_into(cfg, parts, [start], [cfg.rel])
+        return self._resolve_into(cfg, parts, [start], [cfg.rel],
+                                  keep=self.keep_directive)
 
-    def _resolve_into(self, cfg, parts, chain, names):
+    def _resolve_into(self, cfg, parts, chain, names, keep=False):
         ref = _get_directive(cfg.data, parts)
         if ref is _MISSING:
             return False
@@ -1479,12 +1481,413 @@ class Inheritance:
             if _get_directive(pcfg.data, pparts) is not _MISSING:
                 _remove_directive(pcfg.data, pparts)
         parent_data = to_plain(pcfg.data)
-        _remove_directive(cfg.data, parts)
+        if not keep:
+            _remove_directive(cfg.data, parts)
         added = _merge_parent(cfg, cfg.data, parent_data)
         if cfg.fmt == "toml" and any(not isinstance(parent_data[k], (dict, list))
                                      for k in added):
             cfg.toml_fix_spacing = True
         return True
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 4: file relocation
+# ---------------------------------------------------------------------------
+
+FILE_RULE_TYPES = ("path_rename", "content_rename", "relocate_files")
+
+
+class RelocationError(Exception):
+    pass
+
+
+def is_file_rule(rule):
+    if not isinstance(rule, dict):
+        return False
+    if rule.get("scope") == "file":
+        return True
+    return rule.get("type") in FILE_RULE_TYPES and "scope" not in rule
+
+
+def expand_braces(pattern):
+    """Expand {a,b} alternatives. Raises ValueError on unbalanced braces
+    or brackets."""
+    # bracket sanity check
+    i = 0
+    n = len(pattern)
+    depth = 0
+    while i < n:
+        c = pattern[i]
+        if c == "[":
+            j = i + 1
+            if j < n and pattern[j] in "!^":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:
+                raise ValueError("unclosed bracket")
+            i = j + 1
+            continue
+        if c == "]":
+            raise ValueError("unmatched bracket")
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("unmatched brace")
+        i += 1
+    if depth != 0:
+        raise ValueError("unclosed brace")
+    return _expand(pattern)
+
+
+def _expand(pattern):
+    start = pattern.find("{")
+    if start == -1:
+        return [pattern]
+    depth = 0
+    parts = []
+    last = start + 1
+    for i in range(start, len(pattern)):
+        c = pattern[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                parts.append(pattern[last:i])
+                end = i
+                break
+        elif c == "," and depth == 1:
+            parts.append(pattern[last:i])
+            last = i + 1
+    prefix = pattern[:start]
+    suffix = pattern[end + 1:]
+    out = []
+    for alt in parts:
+        out.extend(_expand(prefix + alt + suffix))
+    return out
+
+
+def file_glob_match(pattern, relpath):
+    try:
+        alts = expand_braces(str(pattern))
+    except ValueError:
+        return False
+    return any(glob_match(p, relpath) for p in alts)
+
+
+_VAR_TOKEN_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+def compile_path_pattern(pattern):
+    """Compile a checkpoint-2 style path pattern into a regex.
+
+    Returns (regex, wildcard_count)."""
+    pattern = str(pattern)
+    while pattern.startswith("./"):
+        pattern = pattern[2:]
+    out = []
+    seen = set()
+    wild = 0
+    i = 0
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "$":
+            m = _VAR_TOKEN_RE.match(pattern, i)
+            if m:
+                name = m.group(1) or m.group(2)
+                if name in seen:
+                    out.append("(?P=v_%s)" % name)
+                else:
+                    seen.add(name)
+                    out.append("(?P<v_%s>[^/]+)" % name)
+                i = m.end()
+                continue
+            out.append(re.escape(c))
+            i += 1
+            continue
+        if c == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                j = i + 2
+                while j < n and pattern[j] == "*":
+                    j += 1
+                at_start = i == 0 or pattern[i - 1] == "/"
+                if at_start and j < n and pattern[j] == "/":
+                    out.append("(?P<w%d>(?:.*/)?)" % wild)
+                    j += 1
+                else:
+                    out.append("(?P<w%d>.*)" % wild)
+                wild += 1
+                i = j
+                continue
+            out.append("(?P<w%d>[^/]*)" % wild)
+            wild += 1
+            i += 1
+            continue
+        if c == "?":
+            out.append("[^/]")
+            i += 1
+            continue
+        out.append(re.escape(c))
+        i += 1
+    return re.compile("(?s:" + "".join(out) + r")\Z"), wild
+
+
+def match_path_pattern(compiled, relpath):
+    regex, wild = compiled
+    m = regex.match(relpath)
+    if m is None:
+        return None
+    gd = m.groupdict()
+    variables = {k[2:]: v for k, v in gd.items() if k.startswith("v_")}
+    wildcards = [gd["w%d" % i] for i in range(wild)]
+    return variables, wildcards
+
+
+def render_path_template(template, variables, wildcards=None):
+    template = str(template)
+    wildcards = list(wildcards or [])
+    out = []
+    i = 0
+    n = len(template)
+    while i < n:
+        c = template[i]
+        if c == "$":
+            m = _VAR_TOKEN_RE.match(template, i)
+            if m:
+                name = m.group(1) or m.group(2)
+                if name in variables:
+                    out.append(stringify(variables[name]))
+                else:
+                    out.append(m.group(0))
+                i = m.end()
+                continue
+        if c == "*" and wildcards:
+            j = i
+            while j < n and template[j] == "*":
+                j += 1
+            out.append(wildcards.pop(0))
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def norm_rel(path):
+    path = str(path).replace("\\", "/")
+    if path == "":
+        return None
+    trailing = path.endswith("/")
+    p = os.path.normpath(path).replace(os.sep, "/")
+    if p.startswith("/") or p == ".." or p.startswith("../") or p == ".":
+        return None
+    if trailing:
+        return None
+    return p
+
+
+def validate_file_rule(name, rule):
+    rtype = rule.get("type")
+    if rtype == "path_rename":
+        req = ("path_pattern", "new_path")
+    elif rtype == "content_rename":
+        req = ("file_pattern", "variables", "new_path")
+    elif rtype == "relocate_files":
+        req = ("source_pattern", "destination")
+    else:
+        return None
+    for f in req:
+        if f not in rule:
+            return "invalid rule '%s': missing required field '%s'" % (name, f)
+        if f == "variables":
+            if not isinstance(rule[f], dict):
+                return ("invalid rule '%s': field 'variables' must be an "
+                        "object mapping names to key paths" % name)
+            for vname, path in rule[f].items():
+                if not isinstance(path, str):
+                    return ("invalid rule '%s': variable '%s' must be a "
+                            "string key path" % (name, vname))
+        elif not isinstance(rule[f], str):
+            return "invalid rule '%s': field '%s' must be a string" % (name, f)
+    if rtype == "content_rename":
+        pat = rule["file_pattern"]
+        try:
+            expand_braces(pat)
+        except ValueError:
+            return "invalid file pattern in rule '%s': %s" % (name, pat)
+    return None
+
+
+def _plan_moves(rule, files):
+    """Return [(src, dst)] for one rule. `files` maps rel -> cfg."""
+    rtype = rule.get("type")
+    moves = []
+    if rtype == "path_rename":
+        compiled = compile_path_pattern(rule["path_pattern"])
+        for rel in sorted(files):
+            res = match_path_pattern(compiled, rel)
+            if res is None:
+                continue
+            variables, wildcards = res
+            dst = norm_rel(render_path_template(rule["new_path"], variables, wildcards))
+            if dst is None or dst == rel:
+                continue
+            moves.append((rel, dst))
+    elif rtype == "relocate_files":
+        compiled = compile_path_pattern(rule["source_pattern"])
+        dest = str(rule["destination"])
+        for rel in sorted(files):
+            res = match_path_pattern(compiled, rel)
+            if res is None:
+                continue
+            variables, wildcards = res
+            rendered = render_path_template(dest, variables, wildcards)
+            base = rel.rsplit("/", 1)[-1]
+            last = rendered.rstrip("/").rsplit("/", 1)[-1]
+            if rendered.endswith("/") or rendered.strip() in ("", "."):
+                target = rendered + base if rendered.strip() not in ("", ".") else base
+            elif os.path.splitext(last)[1].lower() in EXTENSIONS:
+                target = rendered
+            else:
+                target = rendered + "/" + base
+            dst = norm_rel(target)
+            if dst is None or dst == rel:
+                continue
+            moves.append((rel, dst))
+    elif rtype == "content_rename":
+        pattern = rule["file_pattern"]
+        variables = rule.get("variables") or {}
+        for rel in sorted(files):
+            if not file_glob_match(pattern, rel):
+                continue
+            cfg = files[rel]
+            values = {}
+            ok = True
+            for vname, path in variables.items():
+                try:
+                    found, val = lookup_value(cfg.data, path)
+                except Exception:
+                    found = False
+                if not found or is_mapping(val) or is_sequence(val):
+                    ok = False
+                    break
+                values[vname] = val
+            if not ok:
+                continue
+            new = render_path_template(rule["new_path"], values)
+            d = rel.rsplit("/", 1)[0] if "/" in rel else ""
+            dst = norm_rel((d + "/" + new) if d else new)
+            if dst is None or dst == rel:
+                continue
+            moves.append((rel, dst))
+    return moves
+
+
+def plan_relocations(rules, rule_names, configs, target):
+    """Simulate all file relocation rules.
+
+    Returns (events, final) where events is a list of (from, to) and final
+    maps cfg index -> final rel path. Raises RelocationError on collision."""
+    files = {cfg.rel: cfg for cfg in configs}
+    originals = set(files)
+    events = []
+    for name in rule_names:
+        rule = rules[name]
+        if not is_file_rule(rule):
+            continue
+        moves = _plan_moves(rule, files)
+        if not moves:
+            continue
+        sources = set(s for s, _ in moves)
+        dests = set()
+        for src, dst in moves:
+            if dst in dests:
+                raise RelocationError(dst)
+            dests.add(dst)
+            if dst in files and dst not in sources:
+                raise RelocationError(dst)
+            if dst not in originals and os.path.lexists(os.path.join(target, dst)):
+                raise RelocationError(dst)
+            # a file cannot live below another file / a file cannot replace
+            # a directory holding tracked files
+            prefix = dst + "/"
+            for other in files:
+                if other.startswith(prefix) and other not in sources:
+                    raise RelocationError(dst)
+            parts = dst.split("/")
+            for k in range(1, len(parts)):
+                anc = "/".join(parts[:k])
+                if (anc in files and anc not in sources) or (
+                        anc not in originals
+                        and os.path.isfile(os.path.join(target, anc))):
+                    raise RelocationError(dst)
+        moved = {src: files.pop(src) for src, _ in moves}
+        for src, dst in moves:
+            files[dst] = moved[src]
+            events.append((src, dst))
+    final = {}
+    for rel, cfg in files.items():
+        final[id(cfg)] = rel
+    return events, final
+
+
+def compute_reference_updates(configs, final, patterns):
+    """Update inheritance directives after relocation.
+
+    Returns list of cfgs whose directive changed."""
+    orig_to_final = {cfg.rel: final[id(cfg)] for cfg in configs}
+    updated = []
+    for cfg in configs:
+        parts = patterns.get(cfg.fmt)
+        if parts is None or not is_mapping(cfg.data):
+            continue
+        ref = _get_directive(cfg.data, parts)
+        if ref is _MISSING:
+            continue
+        ref_plain = to_plain(ref)
+        if not isinstance(ref_plain, str) or ref_plain == "":
+            continue
+        if ref_plain.startswith("/"):
+            continue
+        orig_dir = os.path.dirname(cfg.rel)
+        referenced = os.path.normpath(os.path.join(orig_dir, ref_plain)).replace(os.sep, "/")
+        if referenced == ".." or referenced.startswith("../") or referenced == ".":
+            continue
+        new_loc = orig_to_final.get(referenced, referenced)
+        new_rel = final[id(cfg)]
+        if new_loc == referenced and new_rel == cfg.rel:
+            continue
+        new_dir = os.path.dirname(new_rel)
+        new_ref = os.path.relpath(new_loc, new_dir or ".").replace(os.sep, "/")
+        if new_ref == ref_plain:
+            continue
+        node = cfg.data
+        for p in parts[:-1]:
+            node = node[p]
+        node[parts[-1]] = new_ref
+        updated.append(cfg)
+    return updated
+
+
+def collect_parent_refs(configs, patterns):
+    """Return set of rel paths referenced by inheritance directives."""
+    refs = set()
+    for cfg in configs:
+        parts = patterns.get(cfg.fmt)
+        if parts is None or not is_mapping(cfg.data):
+            continue
+        ref = to_plain(_get_directive(cfg.data, parts))
+        if not isinstance(ref, str) or ref == "":
+            continue
+        p = os.path.normpath(os.path.join(os.path.dirname(cfg.rel), ref)).replace(os.sep, "/")
+        refs.add(p)
+    return refs
 
 
 # ---------------------------------------------------------------------------
@@ -1556,9 +1959,21 @@ def main(argv):
         error("invalid rules file: %s" % rules_path)
 
     for name in sorted(rules.keys()):
-        msg = validate_rule(name, rules[name])
+        rule = rules[name]
+        if is_file_rule(rule):
+            msg = validate_file_rule(name, rule)
+            if msg is not None:
+                error(msg)
+            continue
+        msg = validate_rule(name, rule)
         if msg is not None:
             error("invalid rule '%s': %s" % (name, msg))
+
+    rule_names = sorted(rules.keys())
+    file_rule_names = [n for n in rule_names if is_file_rule(rules[n])]
+    content_rule_names = [n for n in rule_names
+                          if isinstance(rules[n], dict) and not is_file_rule(rules[n])]
+    has_file_rules = bool(file_rule_names)
 
     inheritance = None
     if inheritance_path is not None:
@@ -1566,6 +1981,8 @@ def main(argv):
         if patterns is None:
             error("invalid inheritance config: %s" % inheritance_path)
         inheritance = Inheritance(patterns)
+        # Keep directives so references can be updated after relocation.
+        inheritance.keep_directive = has_file_rules
 
     if not os.path.isdir(target):
         error("target directory not found: %s" % target)
@@ -1578,8 +1995,12 @@ def main(argv):
         except (ParseError, OSError):
             error("failed to parse %s" % label)
 
+    parent_refs = set()
+    if inheritance is not None and has_file_rules:
+        parent_refs = collect_parent_refs(configs, inheritance.patterns)
+
     inherited = set()
-    if inheritance is not None:
+    if inheritance is not None and not (has_file_rules and not content_rule_names):
         for idx, cfg in enumerate(configs):
             try:
                 if inheritance.resolve(cfg):
@@ -1587,30 +2008,98 @@ def main(argv):
             except InheritanceError as exc:
                 error(str(exc))
 
-    rule_names = sorted(rules.keys())
+    dirty = set()
+    content_events = []
     for idx, cfg in enumerate(configs):
         applied = []
-        for name in rule_names:
-            rule = rules[name]
-            if not isinstance(rule, dict):
-                continue
-            handler = RULE_HANDLERS.get(rule.get("type"))
-            if handler is None:
-                continue
-            try:
-                ok = handler(cfg, rule)
-            except Exception:
-                ok = False
-            if ok:
-                applied.append(name)
+        if not (has_file_rules and cfg.rel in parent_refs):
+            for name in content_rule_names:
+                rule = rules[name]
+                handler = RULE_HANDLERS.get(rule.get("type"))
+                if handler is None:
+                    continue
+                try:
+                    ok = handler(cfg, rule)
+                except Exception:
+                    ok = False
+                if ok:
+                    applied.append(name)
         if applied or idx in inherited:
-            cfg.save()
-            sys.stdout.write(json.dumps({
+            dirty.add(id(cfg))
+            content_events.append({
                 "event": "file_updated",
                 "file": cfg.rel,
                 "rules_applied": applied,
-            }) + "\n")
-            sys.stdout.flush()
+            })
+
+    if not has_file_rules:
+        for idx, cfg in enumerate(configs):
+            if id(cfg) in dirty:
+                cfg.save()
+        emit(content_events)
+        return
+
+    try:
+        moves, final = plan_relocations(rules, file_rule_names, configs, target)
+    except RelocationError as exc:
+        error("destination already exists: %s" % exc.args[0])
+
+    ref_updated = []
+    if inheritance is not None and moves:
+        ref_updated = compute_reference_updates(configs, final, inheritance.patterns)
+    for cfg in ref_updated:
+        dirty.add(id(cfg))
+
+    # Gather new content for every file that moves or changed.
+    pending = []
+    for cfg in configs:
+        new_rel = final[id(cfg)]
+        moved = new_rel != cfg.rel
+        if not moved and id(cfg) not in dirty:
+            continue
+        if id(cfg) in dirty:
+            data = cfg.dump().encode("utf-8")
+        else:
+            with open(cfg.path, "rb") as fh:
+                data = fh.read()
+        pending.append((cfg, new_rel, moved, data))
+    for cfg, new_rel, moved, data in pending:
+        if moved:
+            os.remove(cfg.path)
+    for cfg, new_rel, moved, data in pending:
+        dest = os.path.join(target, *new_rel.split("/"))
+        d = os.path.dirname(dest)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(dest, "wb") as fh:
+            fh.write(data)
+    # prune directories emptied by moves
+    root = os.path.abspath(target)
+    for cfg, new_rel, moved, data in pending:
+        if not moved:
+            continue
+        d = os.path.dirname(os.path.abspath(cfg.path))
+        while d != root and d.startswith(root + os.sep):
+            try:
+                if os.listdir(d):
+                    break
+                os.rmdir(d)
+            except OSError:
+                break
+            d = os.path.dirname(d)
+
+    emit(content_events)
+    emit([{"event": "file_relocated", "from": s, "to": t} for s, t in moves])
+    emit(sorted(({"event": "file_updated", "file": final[id(cfg)],
+                  "rules_applied": [],
+                  "reason": "inheritance_reference_update"}
+                 for cfg in ref_updated), key=lambda e: e["file"]))
+
+
+def emit(events):
+    for ev in events:
+        sys.stdout.write(json.dumps(ev) + "\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
