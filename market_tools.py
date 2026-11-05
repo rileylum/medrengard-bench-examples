@@ -7,6 +7,7 @@ Requires numpy + scipy (HiGHS MILP) for POST /v1/compress.
 from __future__ import annotations
 
 import argparse
+import bisect
 import bz2
 import csv
 import gzip
@@ -142,6 +143,17 @@ class SDE:
         self.type_by_name = {k: v[1] for k, v in names_rank.items()}
         self.type_by_lname = {k: v[1] for k, v in lnames_rank.items()}
         self._load_reprocessing(sde_dir)
+        self.jumps: dict[int, set[int]] = {}
+        f = _open_sde(sde_dir, "mapSolarSystemJumps")
+        if f:
+            with f:
+                for row in csv.DictReader(f):
+                    try:
+                        a, b = int(row["fromSolarSystemID"]), int(row["toSolarSystemID"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    self.jumps.setdefault(a, set()).add(b)
+                    self.jumps.setdefault(b, set()).add(a)
         f = _open_sde(sde_dir, "mapRegions")
         if f:
             with f:
@@ -555,7 +567,13 @@ def parse_config(body) -> dict:
         skills[name] = lvl
     imp_raw = body.get("implant")
     implant = _enum(imp_raw, [i for i in IMPLANT_IM if i is not None], "implant", None) if imp_raw is not None else None
-    return {"type": stype, "rig": rig, "security": sec, "skills": skills, "implant": implant}
+    tax = body.get("sales_tax")
+    if tax is not None:
+        if isinstance(tax, bool) or not isinstance(tax, (int, float)) or tax < 0 or tax != tax:
+            raise _invalid("sales_tax", f"sales_tax must be a non-negative number, got {tax!r}")
+        tax = _norm_tax(float(tax))
+    return {"type": stype, "rig": rig, "security": sec, "skills": skills, "implant": implant,
+            "sales_tax": tax}
 
 
 def _skill(skills: dict, name: str) -> int:
@@ -661,6 +679,590 @@ def reprocess(sde: SDE, items: dict[int, int], model: YieldModel, drill_down: bo
 
 def sde_mq(sde, tid: int, mid: int) -> int:
     return sum(q for m, q in sde.materials.get(tid, []) if m == mid)
+
+
+# --------------------------------------------------------------------------- profit helpers
+
+VOLUME_COLUMNS = ["date", "region_id", "type_id", "average", "highest", "lowest", "count", "volume"]
+DEFAULT_SALES_TAX = 0.04
+HISTORY_DAYS = 30
+DEFAULT_SCRAP_EFFICIENCY = DEFAULT_EFFICIENCY["scrap"]
+
+
+def _norm_tax(t: float) -> float:
+    """Accept either a fraction (0.04) or a percentage (4) for tax values."""
+    return t / 100.0 if t > 1 else t
+
+
+def _cents_tick(c: int) -> int:
+    """Tick size (in cents) so that a price keeps at most 4 significant digits."""
+    digits = len(str(max(c, 1)))
+    return 10 ** max(0, digits - 4)
+
+
+def undercut_price(p: float) -> float:
+    """Largest price with <= 4 significant digits strictly below p."""
+    c = int(round(p * 100))
+    v = c - 1
+    if v < 1:
+        return round(max(c, 1) / 100.0, 2)
+    t = _cents_tick(v)
+    v = (v // t) * t
+    return round(v / 100.0, 2)
+
+
+def outbid_price(p: float) -> float:
+    """Smallest price with <= 4 significant digits strictly above p."""
+    c = int(round(p * 100))
+    v = c + 1
+    t = _cents_tick(v)
+    v = -((-v) // t) * t
+    return round(v / 100.0, 2)
+
+
+def _parse_date(value: str, lineno: int):
+    v = value.strip()
+    try:
+        return datetime.fromisoformat(v[:10]).date() if len(v) >= 10 else datetime.fromisoformat(v).date()
+    except ValueError:
+        raise ApiError(400, "INVALID_FORMAT", f"Row {lineno}: column 'date' must be an ISO date, got {value!r}")
+
+
+def parse_volumes(body: bytes):
+    rows = _read_csv(_decompress(body), VOLUME_COLUMNS)
+    out = []
+    for lineno, r in rows:
+        _parse_float(r["highest"], "highest", lineno)
+        _parse_float(r["lowest"], "lowest", lineno)
+        _parse_float(r["count"], "count", lineno)
+        out.append((
+            _parse_date(r["date"], lineno),
+            _parse_int(r["region_id"], "region_id", lineno),
+            _parse_int(r["type_id"], "type_id", lineno),
+            _parse_float(r["average"], "average", lineno),
+            _parse_float(r["volume"], "volume", lineno),
+        ))
+    return out
+
+
+class _Book:
+    """Cumulative view of an order ladder: value of the first x units."""
+
+    def __init__(self, orders, best_first_desc: bool):
+        srt = sorted((o for o in orders if o.volume_remain > 0),
+                     key=lambda o: ((-o.price) if best_first_desc else o.price, o.order_id))
+        self.orders = srt
+        self.cum = []
+        self.cval = []
+        acc = 0
+        val = 0.0
+        for o in srt:
+            acc += o.volume_remain
+            val += o.volume_remain * o.price
+            self.cum.append(acc)
+            self.cval.append(val)
+        self.depth = acc
+
+    def value(self, x: int) -> float:
+        if x <= 0 or not self.cum:
+            return 0.0
+        x = min(x, self.depth)
+        i = bisect.bisect_left(self.cum, x)
+        prev_c = self.cum[i - 1] if i > 0 else 0
+        prev_v = self.cval[i - 1] if i > 0 else 0.0
+        return prev_v + (x - prev_c) * self.orders[i].price
+
+    def price_at(self, x: int):
+        """Price of the x-th unit (1-based)."""
+        if x <= 0 or not self.cum:
+            return None
+        i = bisect.bisect_left(self.cum, min(x, self.depth))
+        return self.orders[i].price
+
+
+def _num(body: dict, key: str, default, lo=None, integer=False, path=None):
+    v = body.get(key)
+    if v is None:
+        return default
+    if isinstance(v, str):
+        try:
+            v = float(v.strip())
+        except ValueError:
+            raise _bad_request(path or key, f"{key} must be a number, got {v!r}")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+        raise _bad_request(path or key, f"{key} must be a number, got {v!r}")
+    if lo is not None and v < lo:
+        raise _bad_request(path or key, f"{key} must be >= {lo}, got {v!r}")
+    if integer:
+        if float(v) != int(v):
+            raise _bad_request(path or key, f"{key} must be an integer, got {v!r}")
+        return int(v)
+    return float(v)
+
+
+def _hub_key(raw, default="jita", path="hub"):
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return default
+    if isinstance(raw, str) and raw.strip().lower() in MARKETS:
+        return MARKETS[raw.strip().lower()]
+    raise _bad_request(path, f"{path} must be one of Jita, Amarr, Dodixie, Rens, Hek, got {raw!r}")
+
+
+def _bool(raw, default, path):
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        v = raw.strip().lower()
+        if v in ("true", "1", "yes", "y", "t"):
+            return True
+        if v in ("false", "0", "no", "n", "f", ""):
+            return False
+    raise _bad_request(path, f"{path} must be a boolean, got {raw!r}")
+
+
+class ProfitMixin:
+    """Profit-finding endpoints: volumes, reprocess profit, hauling, station trading."""
+
+    # ---- volume history
+    def ingest_volumes(self, rows) -> int:
+        with self.lock:
+            for d, reg, tid, avg, vol in rows:
+                self.history.setdefault((reg, tid), {})[d] = (avg, vol)
+                if self.hist_min is None or d < self.hist_min:
+                    self.hist_min = d
+                if self.hist_max is None or d > self.hist_max:
+                    self.hist_max = d
+            self.hist_version += 1
+        return len(rows)
+
+    def history_stats(self, region_id: int, type_id: int):
+        """(avg daily volume, avg daily value) over the history window, zero-filling missing days."""
+        h = self.history.get((region_id, type_id))
+        if not h or self.hist_min is None:
+            return 0.0, 0.0
+        # history covers the past 30 days; missing days count as zero volume
+        days = max((self.hist_max - self.hist_min).days + 1, HISTORY_DAYS)
+        tv = sum(v for _a, v in h.values())
+        tval = sum(a * v for a, v in h.values())
+        return tv / days, tval / days
+
+    # ---- shared
+    def _cfg_from_key(self, api_key):
+        if api_key is None or api_key.strip() == "":
+            return None
+        with self.lock:
+            cfg = self.api_keys.get(api_key.strip())
+        if cfg is None:
+            raise JsonError(401, {"code": "BAD_API_KEY"})
+        return cfg
+
+    def _tax(self, cfg, raw, path="sales_tax"):
+        if cfg is not None:
+            if cfg.get("sales_tax") is not None:
+                return cfg["sales_tax"]
+            for k, v in cfg.get("skills", {}).items():
+                if k.lower() == "accounting":
+                    return 0.075 * (1 - 0.11 * v)
+        if raw is None:
+            return DEFAULT_SALES_TAX
+        if isinstance(raw, str):
+            try:
+                raw = float(raw.strip())
+            except ValueError:
+                raise _bad_request(path, f"{path} must be a number, got {raw!r}")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0 or raw != raw:
+            raise _bad_request(path, f"{path} must be a non-negative number, got {raw!r}")
+        t = _norm_tax(float(raw))
+        if t >= 1:
+            raise _bad_request(path, f"{path} must be below 100%")
+        return t
+
+    def effective_ts(self):
+        if self.effective_timestamp is not None:
+            return self.effective_timestamp
+        self._rebuild()
+        return max((o.issued for o in self._merged.values()), default=0.0)
+
+    def _hub_region(self, key):
+        hid = self.hub_ids[key]
+        sysid = self.sde.station_system.get(hid)
+        return self.sde.system_region.get(sysid) if sysid is not None else None, sysid
+
+    def _hub_by_type(self, key):
+        orders = self._hub_order_list([key])
+        by_type: dict[int, tuple[list, list]] = {}
+        for o in orders:
+            b, s_ = by_type.setdefault(o.type_id, ([], []))
+            (b if o.is_buy else s_).append(o)
+        return by_type
+
+    @staticmethod
+    def _count_recent(orders, eff, window_min):
+        return sum(1 for o in orders if (eff - o.issued) / 60.0 <= window_min)
+
+    # ---- POST /v1/profit/reprocess
+    def profit_reprocess(self, body, api_key):
+        cfg = self._cfg_from_key(api_key)
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            raise _bad_request("", "Request body must be a JSON object")
+        k = _num(body, "k", 5, lo=0, integer=True)
+        hub = _hub_key(body.get("hub"))
+        sort_by = body.get("sort_by", "profit")
+        if sort_by is None:
+            sort_by = "profit"
+        if not isinstance(sort_by, str) or sort_by.strip().lower() not in ("roi", "profit"):
+            raise _bad_request("sort_by", f"sort_by must be 'roi' or 'profit', got {sort_by!r}")
+        sort_by = sort_by.strip().lower()
+        tax = self._tax(cfg, body.get("sales_tax"))
+        if cfg is not None:
+            eff = config_scrap_yield(cfg)
+        else:
+            eff = _num(body, "scrap_efficiency", DEFAULT_SCRAP_EFFICIENCY, lo=0)
+            if eff > 1:
+                eff = eff / 100.0
+        sde = self.sde
+        with self.lock:
+            by_type = self._hub_by_type(hub)
+        buy_books: dict[int, _Book] = {}
+
+        def mbook(mid):
+            b = buy_books.get(mid)
+            if b is None:
+                b = _Book(by_type.get(mid, ([], []))[0], True)
+                buy_books[mid] = b
+            return b
+
+        cands = []
+        for tid, (_b, sells) in by_type.items():
+            if tid not in sde.materials or tid not in sde.type_names:
+                continue
+            if sde.reprocess_class(tid) != "scrap":
+                continue
+            sb = _Book(sells, False)
+            portion = sde.type_portion.get(tid, 1)
+            if sb.depth < portion:
+                continue
+            mats = sde.materials[tid]
+            if not any(mid in by_type and by_type[mid][0] for mid, _q in mats):
+                continue
+            cands.append((tid, sb, portion, mats))
+
+        def evaluate(tid, sb, portion, mats, used):
+            def at(n):
+                units = n * portion
+                cost = sb.value(units)
+                rev = 0.0
+                for mid, mq in mats:
+                    out = int(math.floor(mq * n * eff + 1e-9))
+                    if out > 0:
+                        bk = mbook(mid)
+                        start = used.get(mid, 0)
+                        rev += bk.value(start + out) - bk.value(start)
+                return cost, rev, rev * (1 - tax) - cost * (1 + tax)
+
+            nmax = sb.depth // portion
+            if nmax <= 0:
+                return None
+            c1, r1, p1 = at(1)
+            if p1 <= 0:
+                return None
+            # largest n with positive marginal profit (marginals are non-increasing up to rounding)
+            lo, hi = 1, nmax
+            prev = {}
+
+            def marg(n):
+                if n not in prev:
+                    prev[n] = at(n)[2] - at(n - 1)[2] if n > 1 else p1
+                return prev[n]
+
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if marg(mid) > 0:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            best_n = lo
+            best = at(lo)
+            # small local refinement against rounding noise
+            for n in range(max(1, lo - 3), min(nmax, lo + 3) + 1):
+                r = at(n)
+                if r[2] > best[2] + 1e-9:
+                    best_n, best = n, r
+            cost, rev, profit = best
+            if profit <= 0:
+                return None
+            return {"tid": tid, "n": best_n, "units": best_n * portion, "cost": cost, "value": rev,
+                    "profit": profit, "roi": profit / cost if cost > 0 else 0.0,
+                    "max_price": sb.price_at(best_n * portion)}
+
+        def key(r):
+            return (-r[sort_by], sde.type_names[r["tid"]])
+
+        prelim = []
+        for c in cands:
+            r = evaluate(*c, {})
+            if r is not None:
+                prelim.append((r, c))
+        prelim.sort(key=lambda rc: key(rc[0]))
+        used: dict[int, int] = {}
+        chosen = []
+        for _r, c in prelim:
+            if len(chosen) >= k:
+                break
+            r = evaluate(*c, used)
+            if r is None:
+                continue
+            for mid, mq in c[3]:
+                out = int(math.floor(mq * r["n"] * eff + 1e-9))
+                if out > 0:
+                    used[mid] = used.get(mid, 0) + out
+            chosen.append(r)
+        chosen.sort(key=key)
+        items = [{
+            "item": sde.type_names[r["tid"]],
+            "quantity": r["units"],
+            "cost": round(r["cost"], 2),
+            "value": round(r["value"], 2),
+            "profit": round(r["profit"], 2),
+            "roi": round(r["roi"], 4),
+            "max_price": r2(r["max_price"]),
+        } for r in chosen]
+        return {
+            "cost": round(sum(r["cost"] for r in chosen), 2),
+            "revenue": round(sum(r["value"] for r in chosen), 2),
+            "profit": round(sum(r["profit"] for r in chosen), 2),
+            "items": items,
+        }
+
+    # ---- GET /v1/profit/haul
+    def profit_haul(self, params: dict, api_key):
+        cfg = self._cfg_from_key(api_key)
+
+        def p(name):
+            return params[name][-1] if name in params and params[name] else None
+
+        q = {n: p(n) for n in ("hub", "capacity", "shipping", "max_jumps", "margin", "include_hubs",
+                               "daily_value", "optimize", "sales_tax")}
+        hub = _hub_key(q["hub"])
+        capacity = _num(q, "capacity", float("inf"), lo=0)
+        shipping = _num(q, "shipping", 350.0, lo=0)
+        max_jumps = _num(q, "max_jumps", 5, lo=0, integer=True)
+        margin = _num(q, "margin", 20.0)
+        include_hubs = _bool(q["include_hubs"], False, "include_hubs")
+        daily_value = _num(q, "daily_value", 1e9, lo=0)
+        optimize = (q["optimize"] or "profit").strip().lower()
+        if optimize not in ("m3", "roi", "profit"):
+            raise _bad_request("optimize", f"optimize must be one of m3, roi, profit, got {q['optimize']!r}")
+        tax = self._tax(cfg, q["sales_tax"])
+        sde = self.sde
+        region, hub_sys = self._hub_region(hub)
+        hid = self.hub_ids[hub]
+
+        reach = set()
+        if hub_sys is not None:
+            reach = {hub_sys}
+            frontier = [hub_sys]
+            for _ in range(max_jumps):
+                nxt = []
+                for s_ in frontier:
+                    for t in sde.jumps.get(s_, ()):
+                        if t not in reach:
+                            reach.add(t)
+                            nxt.append(t)
+                frontier = nxt
+        other_hubs = {v for kk, v in self.hub_ids.items() if kk != hub}
+
+        with self.lock:
+            self._rebuild()
+            merged = list(self._merged.values())
+            eff_ts = self.effective_ts()
+            dest = self._hub_by_type(hub)
+        sources: dict[int, list] = {}
+        for o in merged:
+            if o.is_buy or o.volume_remain <= 0 or o.location_id == hid:
+                continue
+            if not include_hubs and o.location_id in other_hubs:
+                continue
+            sysid = o.system_id if o.system_id in sde.system_region else self.system_of_location(o.location_id)
+            if sysid not in reach:
+                continue
+            sources.setdefault(o.type_id, []).append(o)
+
+        lots = []
+        item_info = {}
+        for tid, srcs in sources.items():
+            if tid not in sde.type_names:
+                continue
+            dbuys, dsells = dest.get(tid, ([], []))
+            dbuys = [o for o in dbuys if o.volume_remain > 0]
+            dsells_live = [o for o in dsells if o.volume_remain > 0]
+            cand = []
+            if dsells_live:
+                cand.append(undercut_price(min(o.price for o in dsells_live)))
+            if dbuys:
+                cand.append(max(o.price for o in dbuys))
+            if not cand:
+                continue
+            sell_price = max(cand)
+            if region is not None:
+                _vol, val = self.history_stats(region, tid)
+            else:
+                val = 0.0
+            if val < daily_value:
+                continue
+            vol = sde.volume(tid)
+            net_sell = sell_price * (1 - tax)
+            for o in srcs:
+                gross = net_sell - o.price * (1 + tax)
+                mg = gross / sell_price * 100.0 if sell_price > 0 else 0.0
+                unit = gross - shipping * vol
+                if mg < margin or unit <= 0:
+                    continue
+                if optimize == "m3":
+                    score = unit / vol if vol > 0 else float("inf")
+                elif optimize == "roi":
+                    score = unit / (o.price * (1 + tax) + shipping * vol)
+                else:
+                    score = unit * o.volume_remain
+                lots.append((-score, o.price, sde.type_names[tid], o.order_id, o, unit))
+            item_info[tid] = (sell_price, vol)
+        lots.sort(key=lambda x: x[:4])
+
+        cap = capacity
+        bought: dict[int, list] = {}
+        for _s, _p, _n, _oid, o, _unit in lots:
+            sp, vol = item_info[o.type_id]
+            if vol > 0:
+                if cap == float("inf"):
+                    n = o.volume_remain
+                else:
+                    n = min(o.volume_remain, int(math.floor(cap / vol + 1e-9)))
+            else:
+                n = o.volume_remain
+            if n <= 0:
+                continue
+            cap -= n * vol
+            bought.setdefault(o.type_id, []).append((o, n))
+
+        purchases: dict[str, dict[str, list]] = {}
+        sales = {}
+        total_cost = total_rev = total_vol = 0.0
+        for tid, lst in bought.items():
+            name = sde.type_names[tid]
+            sp, vol = item_info[tid]
+            units = 0
+            for o, n in lst:
+                st = self.station_name(o.location_id)
+                ent = purchases.setdefault(st, {}).setdefault(name, [0, 0.0])
+                ent[0] += n
+                ent[1] += n * o.price
+                units += n
+                total_cost += n * o.price
+            rev = units * sp
+            total_rev += rev
+            total_vol += units * vol
+            dsells = dest.get(tid, ([], []))[1]
+            sales[name] = {
+                "sell_price": round(sp, 2),
+                "total": units,
+                "volume": round(units * vol, 2),
+                "revenue": round(rev, 2),
+                "competition": {
+                    "5_minutes": self._count_recent(dsells, eff_ts, 5),
+                    "1_hour": self._count_recent(dsells, eff_ts, 60),
+                    "1_day": self._count_recent(dsells, eff_ts, 1440),
+                },
+            }
+        profit = total_rev * (1 - tax) - total_cost * (1 + tax) - total_vol * shipping
+        return {
+            "cost": round(total_cost, 2),
+            "revenue": round(total_rev, 2),
+            "profit": round(profit, 2),
+            "purchases": {
+                st: [{"item": n, "quantity": v[0], "total": round(v[1], 2)} for n, v in sorted(items.items())]
+                for st, items in sorted(purchases.items())
+            },
+            "sales": dict(sorted(sales.items())),
+        }
+
+    # ---- POST /v1/profit/trade
+    def profit_trade(self, body, api_key):
+        cfg = self._cfg_from_key(api_key)
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            raise _bad_request("", "Request body must be a JSON object")
+        hub = _hub_key(body.get("hub"))
+        margin = _num(body, "margin", 20.0)
+        sort_raw = body.get("sorting_by", body.get("sort_by"))
+        sorting = (sort_raw if sort_raw is not None else "ppu")
+        if not isinstance(sorting, str) or sorting.strip().lower() not in ("ppu", "margin", "daily"):
+            raise _bad_request("sorting_by", f"sorting_by must be one of ppu, margin, daily, got {sort_raw!r}")
+        sorting = sorting.strip().lower()
+        k = _num(body, "k", 5, lo=0, integer=True)
+        daily_traded = _num(body, "daily_traded", 100e6, lo=0)
+        daily_volume = _num(body, "daily_volume", 5.0, lo=0)
+        window = _num(body, "competition_window", 1440.0, lo=0)
+        max_bc = _num(body, "buy_competition", 3, lo=0, integer=True)
+        max_sc = _num(body, "sell_competition", 3, lo=0, integer=True)
+        tax = self._tax(cfg, body.get("sales_tax"))
+        sde = self.sde
+        region, _sys = self._hub_region(hub)
+        with self.lock:
+            by_type = self._hub_by_type(hub)
+            eff_ts = self.effective_ts()
+        rows = []
+        for tid, (buys, sells) in by_type.items():
+            name = sde.type_names.get(tid)
+            if not name:
+                continue
+            buys = [o for o in buys if o.volume_remain > 0]
+            sells = [o for o in sells if o.volume_remain > 0]
+            if not buys or not sells:
+                continue
+            avg_vol, avg_val = self.history_stats(region, tid) if region is not None else (0.0, 0.0)
+            if avg_val < daily_traded or avg_vol < daily_volume:
+                continue
+            bc = self._count_recent(buys, eff_ts, window)
+            sc = self._count_recent(sells, eff_ts, window)
+            if bc > max_bc or sc > max_sc:
+                continue
+            bp = outbid_price(max(o.price for o in buys))
+            sp = undercut_price(min(o.price for o in sells))
+            ppu = sp - bp
+            if ppu <= 0 or sp <= 0:
+                continue
+            mg = ppu / sp * 100.0
+            if mg < margin:
+                continue
+            daily = avg_vol * 0.10 * ppu * (1 - tax)
+            rows.append({
+                "name": name, "margin": mg, "value": avg_val, "volume": avg_vol, "ppu": ppu,
+                "buy_competition": bc, "sell_competition": sc, "buy_price": bp, "sell_price": sp,
+                "daily_profit": daily,
+            })
+        skey = {"ppu": "ppu", "margin": "margin", "daily": "daily_profit"}[sorting]
+        rows.sort(key=lambda r: (-r[skey], r["name"]))
+        out = {}
+        for r in rows[:k]:
+            out[r["name"]] = {
+                "margin": round(r["margin"], 2),
+                "value": round(r["value"], 2),
+                "volume": round(r["volume"], 2),
+                "ppu": round(r["ppu"], 2),
+                "buy_competition": r["buy_competition"],
+                "sell_competition": r["sell_competition"],
+                "buy_price": round(r["buy_price"], 2),
+                "sell_price": round(r["sell_price"], 2),
+                "daily_profit": round(r["daily_profit"], 2),
+            }
+        return out
 
 
 # --------------------------------------------------------------------------- state
@@ -775,7 +1377,7 @@ class _PortionEvaluator:
         return {t: n for t, n in portions.items() if n > 0}
 
 
-class State:
+class State(ProfitMixin):
     def __init__(self, sde: SDE):
         self.sde = sde
         self.lock = threading.RLock()
@@ -786,6 +1388,11 @@ class State:
         self._merged: dict[int, Order] = {}
         self._by_region: dict[int, list[Order]] = {}
         self.api_keys: dict[str, dict] = {}
+        self.effective_timestamp = None
+        self.history: dict[tuple[int, int], dict] = {}
+        self.hist_min = None
+        self.hist_max = None
+        self.hist_version = 0
 
         self.hub_ids: dict[str, int] = {}
         for key, name in HUBS:
@@ -1611,6 +2218,9 @@ def make_handler(state: State):
                         except ValueError:
                             raise ApiError(400, "INVALID_FORMAT", f"location_id must be an integer, got {loc!r}")
                     orders = parse_orders(body)
+                    if orders:
+                        with state.lock:
+                            state.effective_timestamp = max(o.issued for o in orders)
                     count = state.ingest_prices(orders, market, mode, loc_id)
                     return self._send(200, {"status": "PRICES_UPDATED", "count": count})
                 if method == "POST" and parts == ["v1", "stations"]:
@@ -1645,6 +2255,17 @@ def make_handler(state: State):
                 if method == "POST" and parts == ["v1", "compress"]:
                     body = self._json_body(lambda m: _bad_request("", m))
                     return self._send(200, state.compress(body))
+                if method == "POST" and parts == ["v1", "volumes"]:
+                    count = state.ingest_volumes(parse_volumes(self._body()))
+                    return self._send(200, {"status": "VOLUME_UPDATED", "count": count})
+                if method == "POST" and parts == ["v1", "profit", "reprocess"]:
+                    body = self._json_body(lambda m: _bad_request("", m))
+                    return self._send(200, state.profit_reprocess(body, self.headers.get("X-API-Key")))
+                if method == "GET" and parts == ["v1", "profit", "haul"]:
+                    return self._send(200, state.profit_haul(params, self.headers.get("X-API-Key")))
+                if method == "POST" and parts == ["v1", "profit", "trade"]:
+                    body = self._json_body(lambda m: _bad_request("", m))
+                    return self._send(200, state.profit_trade(body, self.headers.get("X-API-Key")))
                 if method == "POST":
                     self._body()
                 return self._send(404, {"error": "NOT_FOUND", "details": f"No route for {method} {url.path}"})
