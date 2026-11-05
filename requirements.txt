@@ -1,0 +1,1 @@
+# No third-party dependencies; only the Python standard library is used.
