@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """mvault - local vaults for media-platform metadata with tracked-field history."""
 import argparse
+import copy
 import json
 import os
 import shutil
@@ -104,22 +105,67 @@ def backup_path(name):
 def write_catalog(name, catalog, backup=True):
     path = catalog_path(name)
     if backup and os.path.exists(path):
-        shutil.copyfile(path, backup_path(name))
+        try:
+            shutil.copyfile(path, backup_path(name))
+        except OSError as exc:
+            raise MVaultError("cannot write backup '%s': %s" % (backup_path(name), exc))
     data = json.dumps(catalog, indent=2, ensure_ascii=False) + "\n"
-    fd, tmp = tempfile.mkstemp(prefix=".catalog.", suffix=".tmp", dir=name)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".catalog.", suffix=".tmp", dir=name)
+    except OSError as exc:
+        raise MVaultError("cannot write catalog for vault '%s': %s" % (name, exc))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
         os.replace(tmp, path)
-    except BaseException:
+    except BaseException as exc:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        if isinstance(exc, OSError):
+            raise MVaultError("cannot write catalog for vault '%s': %s" % (name, exc))
         raise
 
 
-def load_catalog(name):
+SUPPORTED_VERSIONS = (1, 2, 3)
+CURRENT_VERSION = 3
+V1_SOURCE_PREFIX = "https://media.example.com/channel/"
+
+HISTORY_VALUE_CHECKS = {
+    "title": is_str,
+    "description": is_str,
+    "views": is_int,
+    "likes": is_int_or_null,
+    "preview": is_str,
+    "removed": lambda v: isinstance(v, bool),
+}
+
+
+def v1_source_url(source_id):
+    return V1_SOURCE_PREFIX + source_id
+
+
+def epoch_key_to_iso(key):
+    """Convert a UNIX-epoch-seconds string key to YYYY-MM-DDTHH:MM:SS (UTC)."""
+    if not isinstance(key, str):
+        raise ValueError("epoch key is not a string")
+    s = key.strip()
+    if not s:
+        raise ValueError("empty epoch key")
+    try:
+        secs = int(s)
+    except ValueError:
+        f = float(s)  # may raise ValueError
+        if f != f or f in (float("inf"), float("-inf")):
+            raise ValueError("invalid epoch key")
+        secs = int(f)
+    dt = datetime(1970, 1, 1) + timedelta(seconds=secs)
+    return fmt_dt(dt)
+
+
+def read_raw_catalog(name):
+    """Read catalog.json; return (catalog_dict, version). No modification."""
     if not os.path.isdir(name):
         raise MVaultError("vault '%s' does not exist" % name)
     path = catalog_path(name)
@@ -132,22 +178,145 @@ def load_catalog(name):
         raise MVaultError("invalid vault '%s': cannot read catalog.json (%s)" % (name, exc))
     if not isinstance(catalog, dict):
         raise MVaultError("invalid vault '%s': catalog is not an object" % name)
-    if not is_int(catalog.get("version")) or catalog.get("version") != 3:
-        raise MVaultError("invalid vault '%s': unsupported catalog version" % name)
+    if "version" not in catalog:
+        raise MVaultError("invalid vault '%s': catalog version is missing" % name)
+    version = catalog["version"]
+    if not is_int(version):
+        raise MVaultError(
+            "invalid vault '%s': catalog version must be an integer (got %s)"
+            % (name, json.dumps(version)))
+    if version > CURRENT_VERSION:
+        raise MVaultError(
+            "invalid vault '%s': unsupported catalog version %d (newer than supported "
+            "version %d)" % (name, version, CURRENT_VERSION))
+    if version not in SUPPORTED_VERSIONS:
+        raise MVaultError(
+            "invalid vault '%s': unsupported catalog version %d" % (name, version))
+    return catalog, version
+
+
+def _check_entry(name, where, e, version, idx):
+    label = "%s entry #%d" % (where, idx)
+    if not isinstance(e, dict):
+        raise MVaultError("invalid vault '%s': malformed %s (not an object)" % (name, label))
+    if not is_str(e.get("id")):
+        raise MVaultError("invalid vault '%s': malformed %s (invalid 'id')" % (name, label))
+    if version in (1, 2):
+        if "published" in e and not is_str(e["published"]):
+            raise MVaultError(
+                "invalid vault '%s': malformed %s (invalid 'published')" % (name, label))
+        for f in ("width", "height"):
+            if f in e and not is_int(e[f]):
+                raise MVaultError(
+                    "invalid vault '%s': malformed %s (invalid '%s')" % (name, label, f))
+    fields = SOURCE_TRACKED if version in (1, 2) else TRACKED
+    for field in fields:
+        if field not in e:
+            continue
+        h = e[field]
+        if not isinstance(h, dict):
+            raise MVaultError(
+                "invalid vault '%s': malformed %s (history '%s' is not an object)"
+                % (name, label, field))
+        if version == 3:
+            continue
+        check = HISTORY_VALUE_CHECKS[field]
+        for k, v in h.items():
+            try:
+                if version == 1:
+                    epoch_key_to_iso(k)
+                else:
+                    parse_dt(k)
+            except (ValueError, TypeError, OverflowError):
+                raise MVaultError(
+                    "invalid vault '%s': malformed %s (invalid history key %s in '%s')"
+                    % (name, label, json.dumps(k), field))
+            if not check(v):
+                raise MVaultError(
+                    "invalid vault '%s': malformed %s (invalid value in history '%s')"
+                    % (name, label, field))
+    if version == 3 and "annotations" in e and not isinstance(e["annotations"], list):
+        raise MVaultError(
+            "invalid vault '%s': malformed %s ('annotations' is not an array)" % (name, label))
+
+
+def validate_catalog(name, catalog, version):
+    if version == 1:
+        if not is_str(catalog.get("source_id")):
+            raise MVaultError("invalid vault '%s': missing or invalid 'source_id'" % name)
+        entries = catalog.get("entries")
+        if not isinstance(entries, list):
+            raise MVaultError("invalid vault '%s': 'entries' is not an array" % name)
+        for i, e in enumerate(entries):
+            _check_entry(name, "entries", e, 1, i)
+        return
     if not is_str(catalog.get("source")):
         raise MVaultError("invalid vault '%s': missing source URL" % name)
     for cat in CATEGORIES:
         entries = catalog.get(cat)
         if not isinstance(entries, list):
             raise MVaultError("invalid vault '%s': '%s' is not an array" % (name, cat))
-        for e in entries:
-            if not isinstance(e, dict) or not is_str(e.get("id")):
-                raise MVaultError("invalid vault '%s': malformed entry in '%s'" % (name, cat))
-            for field in TRACKED:
-                if field in e and not isinstance(e[field], dict):
-                    raise MVaultError(
-                        "invalid vault '%s': malformed history '%s' in '%s'" % (name, field, cat))
-    return catalog
+        for i, e in enumerate(entries):
+            _check_entry(name, cat, e, version, i)
+
+
+def migration_timestamp():
+    return fmt_dt(datetime.now().replace(microsecond=0))
+
+
+def _migrate_entry(e, version, ts):
+    out = {}
+    for k, v in e.items():
+        if version == 1 and k in SOURCE_TRACKED and isinstance(v, dict):
+            out[k] = {epoch_key_to_iso(hk): hv
+                      for hk, hv in sorted(v.items(), key=lambda kv: int(float(kv[0])))}
+        else:
+            out[k] = copy.deepcopy(v)
+    out["removed"] = {ts: False}
+    out["annotations"] = []
+    return out
+
+
+def migrate_to_v3(catalog, version, ts=None):
+    """Return a new v3 catalog built from a validated v1/v2/v3 catalog."""
+    if version == CURRENT_VERSION:
+        return catalog
+    if ts is None:
+        ts = migration_timestamp()
+    new = {"version": CURRENT_VERSION}
+    if version == 1:
+        new["source"] = v1_source_url(catalog["source_id"])
+        new["episodes"] = [_migrate_entry(e, 1, ts) for e in catalog["entries"]]
+        new["streams"] = []
+        new["clips"] = []
+        skip = ("version", "source_id", "entries")
+    else:
+        new["source"] = catalog["source"]
+        for cat in CATEGORIES:
+            new[cat] = [_migrate_entry(e, 2, ts) for e in catalog[cat]]
+        skip = ("version", "source") + CATEGORIES
+    for k, v in catalog.items():
+        if k not in skip and k not in new:
+            new[k] = copy.deepcopy(v)
+    return new
+
+
+def load_vault(name):
+    """Load any supported catalog version; return (v3_catalog, original_version).
+
+    Never modifies anything on disk.
+    """
+    raw, version = read_raw_catalog(name)
+    validate_catalog(name, raw, version)
+    try:
+        catalog = migrate_to_v3(raw, version)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MVaultError("invalid vault '%s': malformed entry data (%s)" % (name, exc))
+    return catalog, version
+
+
+def load_catalog(name):
+    return load_vault(name)[0]
 
 
 # ---------------------------------------------------------------- source
@@ -323,7 +492,7 @@ def cmd_init(args):
 
 def cmd_sync(args):
     name = args.name
-    catalog = load_catalog(name)
+    catalog, _version = load_vault(name)
     source = fetch_source(catalog["source"])
     ts = compute_sync_timestamp(catalog)
     sync_catalog(catalog, source, ts)
@@ -332,12 +501,25 @@ def cmd_sync(args):
     return 0
 
 
+def cmd_migrate(args):
+    name = args.name
+    catalog, version = load_vault(name)
+    if version == CURRENT_VERSION:
+        print("Vault '%s' is already at version %d; nothing to migrate"
+              % (name, CURRENT_VERSION))
+        return 0
+    write_catalog(name, catalog, backup=True)
+    print("Migrated vault '%s' from version %d to version %d"
+          % (name, version, CURRENT_VERSION))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="mvault.py",
         description="Create local vaults for media-platform metadata and record "
                     "tracked-field history by sync timestamp.")
-    sub = parser.add_subparsers(dest="command", metavar="{init,sync}",
+    sub = parser.add_subparsers(dest="command", metavar="{init,sync,migrate}",
                                 title="subcommands")
     p_init = sub.add_parser("init", help="create a new vault with an empty catalog")
     p_init.add_argument("name", help="vault directory name")
@@ -346,6 +528,9 @@ def build_parser():
     p_sync = sub.add_parser("sync", help="sync a vault with its source URL")
     p_sync.add_argument("name", help="vault directory name")
     p_sync.set_defaults(func=cmd_sync)
+    p_mig = sub.add_parser("migrate", help="convert a legacy (v1/v2) vault catalog to v3")
+    p_mig.add_argument("name", help="vault directory name")
+    p_mig.set_defaults(func=cmd_migrate)
     return parser
 
 
