@@ -459,37 +459,123 @@ def build_tar(entries: list[tuple[str, bytes]]) -> bytes:
     return buf.getvalue()
 
 
+PACK_NAME_RE = re.compile(r"^pack-(\d+)\.tar$")
+
+
+def load_existing_packs(dest_root: str | None, job_id: str) -> dict[int, dict]:
+    """Read pack-N.tar files of a job from the destination."""
+    packs: dict[int, dict] = {}
+    if dest_root is None:
+        return packs
+    job_dir = os.path.join(dest_root, job_id)
+    if not os.path.isdir(job_dir):
+        return packs
+    try:
+        names = os.listdir(job_dir)
+    except OSError:
+        return packs
+    for name in names:
+        m = PACK_NAME_RE.match(name)
+        if not m:
+            continue
+        full = os.path.join(job_dir, name)
+        if not os.path.isfile(full):
+            continue
+        try:
+            with open(full, "rb") as f:
+                raw = f.read()
+            members: list[tuple[str, str, int]] = []
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tar:
+                for info in tar:
+                    if not info.isfile():
+                        continue
+                    fobj = tar.extractfile(info)
+                    data = fobj.read() if fobj is not None else b""
+                    members.append((info.name, sha256_tag(data), len(data)))
+        except (OSError, tarfile.TarError, EOFError):
+            continue
+        idx = int(m.group(1))
+        if idx in packs:
+            continue
+        packs[idx] = {
+            "name": name,
+            "checksum": sha256_tag(raw),
+            "members": members,
+            "hashes": {n: h for n, h, _ in members},
+            "size": sum(sz for _, _, sz in members),
+        }
+    return dict(sorted(packs.items()))
+
+
 class Packer:
-    def __init__(self, job_id: str, limit: int, timestamp: str):
+    def __init__(self, job_id: str, limit: int, timestamp: str,
+                 existing: dict[int, dict] | None = None):
         self.job_id = job_id
         self.limit = limit
         self.timestamp = timestamp
+        self.existing = existing or {}
         self.index = 0
-        self.entries: list[tuple[str, bytes]] = []
+        self.entries: list[tuple[str, bytes, str]] = []
         self.size = 0
         self.packs = 0
+        self.skipped = 0
+
+    def fits(self, size: int) -> bool:
+        return not self.entries or self.size + size <= self.limit
 
     def add(self, path: str, data: bytes) -> None:
-        if self.entries and self.size + len(data) > self.limit:
+        if not self.fits(len(data)):
             self.finalize()
         if not self.entries:
             self.index += 1
-        self.entries.append((path, data))
+        digest = sha256_tag(data)
+        self.entries.append((path, data, digest))
         self.size += len(data)
-        emit({"event": "FILE_PACKED", "job_id": self.job_id, "pack_id": self.index,
-              "path": path, "size": len(data)})
+        old = self.existing.get(self.index)
+        if old is not None and old["hashes"].get(path) == digest:
+            self.skipped += 1
+            emit({"event": "PACK_SKIP_UNCHANGED", "job_id": self.job_id,
+                  "pack_id": self.index, "path": path, "size": len(data),
+                  "hash": digest})
+        else:
+            emit({"event": "FILE_PACKED", "job_id": self.job_id, "pack_id": self.index,
+                  "path": path, "size": len(data)})
+
+    def unchanged(self) -> bool:
+        old = self.existing.get(self.index)
+        if old is None or not self.entries:
+            return False
+        return [(p, h) for p, _, h in self.entries] == \
+            [(n, h) for n, h, _ in old["members"]]
 
     def finalize(self) -> None:
         if not self.entries:
             return
-        tar_bytes = build_tar(self.entries)
-        emit({"event": "PACK_CREATED", "job_id": self.job_id,
-              "name": f"pack-{self.index}.tar", "size": self.size,
-              "timestamp": self.timestamp, "checksum": sha256_tag(tar_bytes),
-              "tar_size": len(tar_bytes)})
+        name = f"pack-{self.index}.tar"
+        old = self.existing.get(self.index)
+        if self.unchanged():
+            emit({"event": "PACK_UNCHANGED", "job_id": self.job_id,
+                  "name": name, "checksum": old["checksum"]})
+        else:
+            tar_bytes = build_tar([(p, d) for p, d, _ in self.entries])
+            ev = {"event": "PACK_UPDATED" if old is not None else "PACK_CREATED",
+                  "job_id": self.job_id, "name": name, "size": self.size,
+                  "timestamp": self.timestamp, "checksum": sha256_tag(tar_bytes),
+                  "tar_size": len(tar_bytes)}
+            if old is not None:
+                ev["old_size"] = old["size"]
+                ev["old_checksum"] = old["checksum"]
+            emit(ev)
         self.packs += 1
         self.entries = []
         self.size = 0
+
+
+def file_size(root: str, rel: str) -> int:
+    try:
+        return os.path.getsize(os.path.join(root, rel))
+    except OSError:
+        return 0
 
 
 # --------------------------------------------------------------------------
@@ -536,14 +622,29 @@ def run(args) -> int:
             emit({"event": "STRATEGY_SELECTED", "job_id": job_id, "kind": skind})
         packer = None
         if skind == "pack":
-            packer = Packer(job_id, strategy["max_pack_bytes"], format_local(local_t))
+            existing = load_existing_packs(
+                resolve_destination(job.get("destination"), args.backup), job_id)
+            for pack in existing.values():
+                emit({"event": "PACK_LOADED", "job_id": job_id, "name": pack["name"],
+                      "files_total": len(pack["members"]),
+                      "checksum": pack["checksum"]})
+            packer = Packer(job_id, strategy["max_pack_bytes"], format_local(local_t),
+                            existing)
         total_size = 0
         root = resolve_source(job["source"], args.mount)
         if root not in file_cache:
             file_cache[root] = list_files(root)
         selected = excluded = 0
-        for path in file_cache[root]:
-            pat = first_match(path, job["exclude"])
+        paths = file_cache[root]
+        matches = [first_match(path, job["exclude"]) for path in paths]
+        next_selected: list[str | None] = [None] * len(paths)
+        nxt = None
+        for i in range(len(paths) - 1, -1, -1):
+            next_selected[i] = nxt
+            if matches[i] is None:
+                nxt = paths[i]
+        for i, path in enumerate(paths):
+            pat = matches[i]
             if pat is None:
                 selected += 1
                 emit({"event": "FILE_SELECTED", "job_id": job_id, "path": path})
@@ -559,6 +660,12 @@ def run(args) -> int:
                     total_size += len(data)
                     if skind == "pack":
                         packer.add(path, data)
+                        # Close an unchanged pack as soon as it is complete,
+                        # i.e. the next selected file would not fit into it.
+                        nsel = next_selected[i]
+                        if packer.unchanged() and (
+                                nsel is None or not packer.fits(file_size(root, nsel))):
+                            packer.finalize()
                     elif skind in ("full", "verify"):
                         emit({"event": "FILE_BACKED_UP" if skind == "full"
                               else "FILE_VERIFIED", "job_id": job_id, "path": path,
@@ -572,6 +679,7 @@ def run(args) -> int:
         if packer is not None:
             packer.finalize()
             done["packs"] = packer.packs
+            skipped_unchanged += packer.skipped
         if skind:
             done["total_size"] = total_size
             done["files_skipped_unchanged"] = skipped_unchanged
