@@ -976,6 +976,346 @@ VAULT_COMMANDS = {
 }
 
 
+# ---------------------------------------------------------------- one-shot ops
+
+ONESHOT_FILES = {"task": "tasks.json", "snapshot": "snapshots.json", "recovery": "recoveries.json"}
+SCOPE_KEYS = ("stores", "blueprints", "tallies", "definitions", "procedures")
+
+
+def oneshot_name(doc, errors):
+    metadata = doc.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        errors.append(err("metadata", "metadata must be a mapping", "invalid"))
+        metadata = {}
+    metadata = metadata or {}
+    raw_name = metadata.get("name")
+    if raw_name is None or raw_name == "":
+        errors.append(err("metadata.name", "name is required", "required"))
+        return raw_name, None
+    if not isinstance(raw_name, str) or not NAME_RE.match(raw_name):
+        errors.append(err("metadata.name",
+                          "name must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$", "invalid"))
+        return raw_name, None
+    return raw_name, raw_name
+
+
+def check_mesh_ref(spec_in, spec, meshes, errors):
+    mref = spec_in.get("meshRef")
+    if mref is None or mref == "":
+        errors.append(err("spec.meshRef", "meshRef is required and must reference an existing mesh",
+                          "invalid"))
+        return None
+    if not isinstance(mref, str):
+        errors.append(err("spec.meshRef", "meshRef must be a string", "invalid"))
+        return None
+    spec["meshRef"] = mref
+    if mref not in meshes:
+        errors.append(err("spec.meshRef", "mesh %r does not exist" % mref, "invalid"))
+        return None
+    return mref
+
+
+def validate_scope(spec_in, spec, errors):
+    scope = spec_in.get("scope")
+    if scope is None:
+        return
+    if not isinstance(scope, dict):
+        errors.append(err("spec.scope", "scope must be a mapping", "invalid"))
+        return
+    out_scope = {}
+    for k, v in scope.items():
+        p = "spec.scope.%s" % k
+        if k not in SCOPE_KEYS:
+            errors.append(err(p, "unknown scope key %r; allowed: %s" % (k, ", ".join(SCOPE_KEYS)),
+                              "invalid"))
+            continue
+        if v is None:
+            continue
+        if not isinstance(v, list) or not all(isinstance(x, str) and x != "" for x in v):
+            errors.append(err(p, "%s must be an array of non-empty strings" % k, "invalid"))
+            continue
+        out_scope[k] = list(v)
+    spec["scope"] = out_scope
+
+
+def validate_oneshot_resources(spec_in, spec, errors):
+    res_in = spec_in.get("resources")
+    if res_in is None:
+        res_in = {}
+    if not isinstance(res_in, dict):
+        errors.append(err("spec.resources", "resources must be a mapping", "invalid"))
+        res_in = {}
+    resources = {}
+    mem = validate_resource("memory", res_in.get("memory"), MEM_RE, MEM_MULT, errors,
+                            default={"limit": "1Gi", "request": "1Gi"})
+    if mem is not None:
+        resources["memory"] = mem
+    cpu = validate_resource("cpu", res_in.get("cpu"), CPU_RE, CPU_MULT, errors)
+    if cpu is not None:
+        resources["cpu"] = cpu
+    spec["resources"] = resources
+
+
+def validate_task_spec(spec_in, spec, errors):
+    present = []
+    empty = False
+    for f in ("inline", "bundleRef"):
+        v = spec_in.get(f)
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            errors.append(err("spec." + f, "%s must be a string" % f, "invalid"))
+            continue
+        if v.strip() == "":
+            empty = True
+            continue
+        present.append(f)
+        spec[f] = v
+    if len(present) != 1 or empty:
+        errors.append(err("spec", "exactly one of 'spec.inline' or 'spec.bundleRef' must be set",
+                          "invalid"))
+
+
+def validate_snapshot_spec(spec_in, spec, errors):
+    sto = spec_in.get("storage")
+    if sto is not None:
+        if not isinstance(sto, dict):
+            errors.append(err("spec.storage", "storage must be a mapping", "invalid"))
+        else:
+            storage = {}
+            size = sto.get("size")
+            if size is not None:
+                if parse_quantity(size, MEM_RE, MEM_MULT) is None:
+                    errors.append(err("spec.storage.size",
+                                      "invalid storage size quantity: %r" % (size,), "invalid"))
+                else:
+                    storage["size"] = as_qstr(size)
+            cn = sto.get("className")
+            if cn is not None:
+                if not isinstance(cn, str) or cn == "":
+                    errors.append(err("spec.storage.className",
+                                      "className must be a non-empty string", "invalid"))
+                else:
+                    storage["className"] = cn
+            spec["storage"] = storage
+    validate_scope(spec_in, spec, errors)
+    validate_oneshot_resources(spec_in, spec, errors)
+
+
+def validate_recovery_spec(spec_in, spec, errors, snapshots):
+    sref = spec_in.get("snapshotRef")
+    if sref is None or sref == "":
+        errors.append(err("spec.snapshotRef",
+                          "snapshotRef is required and must reference an existing snapshot",
+                          "invalid"))
+    elif not isinstance(sref, str):
+        errors.append(err("spec.snapshotRef", "snapshotRef must be a string", "invalid"))
+    else:
+        spec["snapshotRef"] = sref
+        snap = snapshots.get(sref)
+        if snap is None:
+            errors.append(err("spec.snapshotRef", "snapshot %r does not exist" % sref, "invalid"))
+        else:
+            smesh = snap.get("spec", {}).get("meshRef")
+            rmesh = spec_in.get("meshRef")
+            if isinstance(rmesh, str) and rmesh != "" and smesh != rmesh:
+                errors.append(err("spec.snapshotRef",
+                                  "snapshot '%s' belongs to mesh '%s', not '%s'"
+                                  % (sref, smesh, rmesh), "invalid"))
+    validate_scope(spec_in, spec, errors)
+    validate_oneshot_resources(spec_in, spec, errors)
+
+
+def validate_oneshot(kind, doc, meshes, snapshots):
+    errors = []
+    raw_name, name = oneshot_name(doc, errors)
+    spec_in = doc.get("spec")
+    if spec_in is None:
+        spec_in = {}
+    if not isinstance(spec_in, dict):
+        errors.append(err("spec", "spec must be a mapping", "invalid"))
+        spec_in = {}
+    spec = {}
+    check_mesh_ref(spec_in, spec, meshes, errors)
+    if kind == "task":
+        validate_task_spec(spec_in, spec, errors)
+    elif kind == "snapshot":
+        validate_snapshot_spec(spec_in, spec, errors)
+    else:
+        validate_recovery_spec(spec_in, spec, errors, snapshots)
+    return {"metadata": {"name": raw_name}, "spec": spec}, name, errors
+
+
+def render_oneshot(resource):
+    r = json.loads(json.dumps(resource))
+    st = r.get("status", {})
+    status = {"state": st.get("state", "Initializing")}
+    if status["state"] in ("Failed", "Unknown") and st.get("detail"):
+        status["detail"] = st["detail"]
+    if status["state"] == "Succeeded" and st.get("storageRef"):
+        status["storageRef"] = st["storageRef"]
+    return {"metadata": r.get("metadata", {}), "spec": r.get("spec", {}), "status": status}
+
+
+def make_oneshot_commands(kind):
+    fname = ONESHOT_FILES[kind]
+
+    def lookup(args):
+        name = get_name(args)
+        if not name:
+            return None, None, fail([err("metadata.name", "name is required", "required")])
+        store = load_store(fname)
+        if name not in store:
+            return None, None, fail([err("metadata.name", "%s %r not found" % (kind, name),
+                                         "not_found")])
+        return name, store, None
+
+    def create(args):
+        doc, code = read_doc(args)
+        if code is not None:
+            return code
+        meshes = load_store()
+        snapshots = load_store(ONESHOT_FILES["snapshot"])
+        store = load_store(fname)
+        resource, name, errors = validate_oneshot(kind, doc, meshes, snapshots)
+        if name is not None and name in store:
+            errors.append(err("metadata.name", "%s %r already exists" % (kind, name), "duplicate"))
+        if errors:
+            return fail(errors)
+        resource["status"] = {"state": "Initializing"}
+        store[name] = resource
+        save_store(store, fname)
+        out(render_oneshot(resource))
+        return 0
+
+    def update(args):
+        doc, code = read_doc(args)
+        if code is not None:
+            return code
+        errors = []
+        raw_name, name = oneshot_name(doc, errors)
+        if errors:
+            return fail(errors)
+        store = load_store(fname)
+        if name not in store:
+            return fail([err("metadata.name", "%s %r not found" % (kind, name), "not_found")])
+        stored = store[name]
+        patch = doc.get("spec")
+        if patch is None:
+            patch = {}
+        if not isinstance(patch, dict):
+            return fail([err("spec", "spec must be a mapping", "invalid")])
+        diffs = []
+        spec_diff(stored.get("spec", {}), patch, "spec", diffs)
+        if diffs:
+            return fail([err(p, "field '%s' is immutable after creation" % p, "immutable")
+                         for p in diffs])
+        out(render_oneshot(stored))
+        return 0
+
+    def list_(args):
+        store = load_store(fname)
+        items = []
+        for n in sorted(store.keys()):
+            r = render_oneshot(store[n])
+            items.append({"name": n, "status": r["status"]})
+        out(items)
+        return 0
+
+    def describe(args):
+        name, store, code = lookup(args)
+        if code is not None:
+            return code
+        out(render_oneshot(store[name]))
+        return 0
+
+    def delete(args):
+        name, store, code = lookup(args)
+        if code is not None:
+            return code
+        if kind == "snapshot":
+            recs = load_store(ONESHOT_FILES["recovery"])
+            deps = sorted(r for r, v in recs.items()
+                          if v.get("spec", {}).get("snapshotRef") == name)
+            if deps:
+                return fail([err("metadata.name",
+                                 "snapshot %r cannot be deleted: referenced by recovery(s) %s"
+                                 % (name, ", ".join(deps)), "conflict")])
+        del store[name]
+        save_store(store, fname)
+        out({"message": "%s %s deleted" % (kind, name), "metadata": {"name": name}})
+        return 0
+
+    def run(args):
+        name, store, code = lookup(args)
+        if code is not None:
+            return code
+        r = store[name]
+        st = r.get("status", {})
+        cur = st.get("state", "Initializing")
+        if cur != "Initializing":
+            return fail([err("status.state",
+                             "resource is in state '%s', expected 'Initializing'" % cur,
+                             "invalid")])
+        # Running -> terminal
+        r["status"] = {"state": "Running"}
+        r["status"] = execute_oneshot(kind, name, r)
+        store[name] = r
+        save_store(store, fname)
+        out(render_oneshot(r))
+        return 0
+
+    return {"create": create, "list": list_, "describe": describe, "get": describe,
+            "delete": delete, "update": update, "run": run}
+
+
+def _norm(v):
+    if is_int(v):
+        return str(v)
+    return v
+
+
+def spec_diff(stored, patch, path, diffs):
+    for k, v in patch.items():
+        p = "%s.%s" % (path, k)
+        if v is None:
+            continue
+        if k not in stored:
+            diffs.append(p)
+        elif isinstance(v, dict) and isinstance(stored[k], dict):
+            spec_diff(stored[k], v, p, diffs)
+        elif isinstance(v, list) and isinstance(stored[k], list):
+            if [_norm(x) for x in v] != [_norm(x) for x in stored[k]]:
+                diffs.append(p)
+        elif _norm(v) != _norm(stored[k]):
+            diffs.append(p)
+
+
+def execute_oneshot(kind, name, r):
+    spec = r.get("spec", {})
+    mref = spec.get("meshRef")
+    if kind == "task":
+        inline = spec.get("inline")
+        if inline is not None:
+            for i, line in enumerate(inline.splitlines()):
+                cmd = line.strip()
+                if cmd.startswith("FAIL:"):
+                    reason = cmd[len("FAIL:"):].strip()
+                    return {"state": "Failed",
+                            "detail": "command %d failed: %s" % (i, reason)}
+        return {"state": "Succeeded"}
+    meshes = load_store()
+    mesh = meshes.get(mref)
+    if mesh is None:
+        return {"state": "Failed", "detail": "mesh '%s' not found" % mref}
+    if mesh.get("status", {}).get("stable", True) is False:
+        return {"state": "Unknown",
+                "detail": "mesh '%s' is not stable; outcome could not be determined" % mref}
+    if kind == "snapshot":
+        return {"state": "Succeeded", "storageRef": "snapshots/%s/%s" % (mref, name)}
+    return {"state": "Succeeded"}
+
+
 COMMANDS = {
     "create": cmd_create,
     "list": cmd_list,
@@ -987,9 +1327,12 @@ COMMANDS = {
 
 
 def main(argv):
-    table = {"mesh": COMMANDS, "vault": VAULT_COMMANDS}.get(argv[0] if argv else None)
+    table = {"mesh": COMMANDS, "vault": VAULT_COMMANDS,
+             "task": make_oneshot_commands("task"),
+             "snapshot": make_oneshot_commands("snapshot"),
+             "recovery": make_oneshot_commands("recovery")}.get(argv[0] if argv else None)
     if table is None or len(argv) < 2 or argv[1] not in table:
-        return fail([err("", "usage: meshctl.py <mesh|vault> <create|list|describe|delete|update> [arguments]",
+        return fail([err("", "usage: meshctl.py <mesh|vault|task|snapshot|recovery> <create|list|describe|delete|update|run> [arguments]",
                          "invalid")])
     return table[argv[1]](argv[2:])
 
