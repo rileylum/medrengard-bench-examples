@@ -944,7 +944,8 @@ def get_cell(ws, row, col):
     return ws.cell(row=row, column=col)
 
 
-RULE_KINDS = ("literal", "expression", "computed")
+RULE_KINDS = ("literal", "expression", "computed", "reference", "reference_expr",
+              "result", "boolean")
 
 
 class RuleContext(object):
@@ -1089,6 +1090,157 @@ def grade_computed(ctx):
                          % (ctx.where, alt, e))
             continue
         if _compare_computed(alt_val, actual, ctx.tol):
+            return True
+    return False
+
+
+def _sub_cell_value(ctx):
+    """Submission graded-cell value: cached display value, or evaluated formula if none."""
+    cached = (ctx.sub_ws.cell(row=ctx.row, column=ctx.col).value
+              if ctx.sub_ws is not None else None)
+    if cached is not None or ctx.sub_formula() is None:
+        return cached
+    return _eval_sub_cell(ctx)
+
+
+def _eval_sub_cell(ctx):
+    formula = ctx.sub_formula()
+    name = _scan_unsupported(formula[1:])
+    if name is not None:
+        raise UnsupportedFunction(name)
+    try:
+        return ctx.sub_eval.evaluate_cell(ctx.sheet, ctx.row, ctx.col)
+    except RecursionError:
+        raise MalformedFormula("formula nesting too deep")
+
+
+def _eval_key_formula_on_sub(ctx, formula):
+    """Evaluate an answer-key formula with references resolved against the submission."""
+    name = _scan_unsupported(formula[1:])
+    if name is not None:
+        raise UnsupportedFunction(name)
+    try:
+        return ctx.sub_eval.eval_formula(formula, ctx.sheet)
+    except RecursionError:
+        raise MalformedFormula("formula nesting too deep")
+
+
+def _grade_reference(ctx, kind, require_sub_formula):
+    expected_f = ctx.key_formula(ctx.row, ctx.col)
+    if expected_f is None:
+        ctx.rep.warn("%s: answer key cell has no formula for '%s' rule; rule scored 0"
+                     % (ctx.where, kind))
+        return None
+    has_sub_formula = ctx.sub_formula() is not None
+    if require_sub_formula and not has_sub_formula:
+        return False
+    try:
+        if has_sub_formula:
+            actual = _eval_sub_cell(ctx)
+        else:
+            actual = (ctx.sub_ws.cell(row=ctx.row, column=ctx.col).value
+                      if ctx.sub_ws is not None else None)
+    except FormulaError as e:
+        _formula_failure(ctx, e, "submission")
+        return None
+    try:
+        expected = _eval_key_formula_on_sub(ctx, expected_f)
+    except FormulaError as e:
+        _formula_failure(ctx, e, "answer key")
+        return None
+    if _compare_computed(expected, actual, ctx.tol):
+        return True
+    for alt, ar, ac in ctx.alt_cells():
+        f = ctx.key_formula(ar, ac)
+        if f is None:
+            ctx.rep.warn("%s: alternate cell %s has no formula; alternate skipped"
+                         % (ctx.where, alt))
+            continue
+        try:
+            alt_val = _eval_key_formula_on_sub(ctx, f)
+        except FormulaError as e:
+            ctx.rep.warn("%s: alternate cell %s formula could not be evaluated (%s); "
+                         "alternate skipped" % (ctx.where, alt, e))
+            continue
+        if _compare_computed(alt_val, actual, ctx.tol):
+            return True
+    return False
+
+
+def grade_reference(ctx):
+    return _grade_reference(ctx, "reference", False)
+
+
+def grade_reference_expr(ctx):
+    return _grade_reference(ctx, "reference_expr", True)
+
+
+def is_truthy(v):
+    if isinstance(v, bool):
+        return v
+    if is_number(v):
+        return v != 0
+    if isinstance(v, str):
+        return v.lower() in ("true", "yes")
+    return False
+
+
+def grade_boolean(ctx):
+    try:
+        v = _sub_cell_value(ctx)
+    except FormulaError as e:
+        _formula_failure(ctx, e, "submission")
+        return None
+    return is_truthy(v)
+
+
+def _key_cell_exists(ctx, row, col):
+    if ctx.key_ws is None:
+        return False
+    return (row, col) in getattr(ctx.key_ws, "_cells", {})
+
+
+def _result_compare(expected, actual, tol):
+    if isinstance(expected, XLError) or isinstance(actual, XLError):
+        return False
+    return compare(expected, actual, tol)
+
+
+def grade_result(ctx, target):
+    try:
+        tcoord, tr, tc = parse_coord(target)
+    except ValueError:
+        ctx.rep.warn("%s: rule.target %r is not a valid cell in the answer key; rule scored 0"
+                     % (ctx.where, target))
+        return None
+    if not _key_cell_exists(ctx, tr, tc):
+        ctx.rep.warn("%s: rule.target %s does not exist in the answer key; rule scored 0"
+                     % (ctx.where, tcoord))
+        return None
+    try:
+        actual = _sub_cell_value(ctx)
+    except FormulaError as e:
+        _formula_failure(ctx, e, "submission")
+        return None
+    try:
+        expected = _expected_value(ctx, tr, tc)
+    except (FormulaError, RecursionError) as e:
+        _formula_failure(ctx, e, "answer key")
+        return None
+    if _result_compare(expected, actual, ctx.tol):
+        return True
+    for alt, ar, ac in ctx.alt_cells():
+        if not _key_cell_exists(ctx, ar, ac):
+            ctx.rep.warn("%s: alternate cell %s does not exist in the answer key; "
+                         "alternate skipped" % (ctx.where, alt))
+            continue
+        try:
+            alt_val = _expected_value(ctx, ar, ac)
+        except (FormulaError, RecursionError) as e:
+            ctx.rep.warn("%s: alternate cell %s could not be evaluated (%s); alternate skipped"
+                         % (ctx.where, alt, e))
+            continue
+        if _result_compare(alt_val, actual, ctx.tol):
             return True
     return False
 
@@ -1309,6 +1461,9 @@ def grade(key_path, sub_path, rep, out):
             if kind not in RULE_KINDS:
                 rep.warn("%s.%s: unknown rule kind '%s'; rule skipped" % (sheet, coord, kind))
                 continue
+            if kind == "result" and rule.get("target") is None:
+                rep.warn("%s.%s: 'result' rule has no rule.target; rule skipped" % (sheet, coord))
+                continue
             label = "[concealed]" if concealed else coord
             key = coord_key(coord)
 
@@ -1343,8 +1498,16 @@ def grade(key_path, sub_path, rep, out):
                 ok = grade_literal(ctx)
             elif kind == "expression":
                 ok = grade_expression(ctx)
-            else:
+            elif kind == "computed":
                 ok = grade_computed(ctx)
+            elif kind == "reference":
+                ok = grade_reference(ctx)
+            elif kind == "reference_expr":
+                ok = grade_reference_expr(ctx)
+            elif kind == "result":
+                ok = grade_result(ctx, rule.get("target"))
+            else:
+                ok = grade_boolean(ctx)
             if ok is None:
                 # Formula-evaluation failure: scores 0 regardless of mode.
                 if mode == "penalty":
