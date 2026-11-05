@@ -3565,6 +3565,694 @@ class Context(object):
 
 
 # ---------------------------------------------------------------------------
+# Redis backend (embedded in-memory store or external RESP server)
+# ---------------------------------------------------------------------------
+
+import fnmatch
+import socket
+
+
+class RedisError(Exception):
+    pass
+
+
+_WRONGTYPE = 'WRONGTYPE Operation against a key holding the wrong kind of value'
+
+
+def _redis_glob(pattern, s):
+    """Redis-style glob matching (*, ?, [...], backslash escapes)."""
+    i = 0
+    out = []
+    while i < len(pattern):
+        c = pattern[i]
+        if c == '\\' and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
+        if c == '*':
+            out.append('.*')
+        elif c == '?':
+            out.append('.')
+        elif c == '[':
+            j = i + 1
+            neg = False
+            if j < len(pattern) and pattern[j] == '^':
+                neg = True
+                j += 1
+            buf = []
+            while j < len(pattern) and pattern[j] != ']':
+                if pattern[j] == '\\' and j + 1 < len(pattern):
+                    buf.append(re.escape(pattern[j + 1]))
+                    j += 2
+                    continue
+                if pattern[j] == '-' and buf and j + 1 < len(pattern) and pattern[j + 1] != ']':
+                    buf.append('-')
+                else:
+                    buf.append(re.escape(pattern[j]))
+                j += 1
+            if j >= len(pattern):
+                out.append(re.escape('['))
+            else:
+                out.append('[' + ('^' if neg else '') + ''.join(buf) + ']')
+                i = j
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.fullmatch(''.join(out), s, re.S) is not None
+
+
+def _rint(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise RedisError('ERR value is not an integer or out of range')
+
+
+class MemoryRedis(object):
+    """A small embedded Redis-compatible store."""
+
+    def __init__(self):
+        self.data = {}      # key -> (type, value)
+        self.expires = {}   # key -> absolute time
+        self.lock = threading.Lock()
+
+    # -- helpers ---------------------------------------------------------
+    def _alive(self, key):
+        exp = self.expires.get(key)
+        if exp is not None and time.time() >= exp:
+            self.data.pop(key, None)
+            self.expires.pop(key, None)
+        return key in self.data
+
+    def _get(self, key, typ):
+        if not self._alive(key):
+            return None
+        t, v = self.data[key]
+        if t != typ:
+            raise RedisError(_WRONGTYPE)
+        return v
+
+    def _del(self, key):
+        self.expires.pop(key, None)
+        return self.data.pop(key, None) is not None
+
+    def _cleanup(self, key):
+        if key in self.data:
+            t, v = self.data[key]
+            if t in ('list', 'hash') and not v:
+                self._del(key)
+
+    def do(self, cmd, args):
+        name = cmd.upper()
+        fn = getattr(self, 'c_' + name.lower(), None)
+        if fn is None or not name.isalpha():
+            raise RedisError("ERR unknown command '%s'" % cmd)
+        with self.lock:
+            return fn(args)
+
+    @staticmethod
+    def _arity(args, n, name, exact=False):
+        if (exact and len(args) != n) or len(args) < n:
+            raise RedisError("ERR wrong number of arguments for '%s' command" % name)
+
+    # -- strings ---------------------------------------------------------
+    def c_set(self, a):
+        self._arity(a, 2, 'set')
+        key, val = a[0], a[1]
+        nx = xx = keepttl = get = False
+        exp = None
+        i = 2
+        while i < len(a):
+            o = a[i].upper()
+            if o == 'NX':
+                nx = True
+            elif o == 'XX':
+                xx = True
+            elif o == 'KEEPTTL':
+                keepttl = True
+            elif o == 'GET':
+                get = True
+            elif o in ('EX', 'PX', 'EXAT', 'PXAT') and i + 1 < len(a):
+                n = _rint(a[i + 1])
+                if n <= 0:
+                    raise RedisError("ERR invalid expire time in 'set' command")
+                now = time.time()
+                exp = {'EX': now + n, 'PX': now + n / 1000.0,
+                       'EXAT': float(n), 'PXAT': n / 1000.0}[o]
+                i += 1
+            else:
+                raise RedisError('ERR syntax error')
+            i += 1
+        if nx and xx:
+            raise RedisError('ERR syntax error')
+        old = None
+        exists = self._alive(key)
+        if get and exists:
+            old = self._get(key, 'string')
+        if (nx and exists) or (xx and not exists):
+            return old if get else None
+        prev_exp = self.expires.get(key)
+        self._del(key)
+        self.data[key] = ('string', val)
+        if exp is not None:
+            self.expires[key] = exp
+        elif keepttl and prev_exp is not None:
+            self.expires[key] = prev_exp
+        return old if get else 'OK'
+
+    def c_setnx(self, a):
+        self._arity(a, 2, 'setnx', True)
+        if self._alive(a[0]):
+            return 0
+        self.data[a[0]] = ('string', a[1])
+        return 1
+
+    def c_get(self, a):
+        self._arity(a, 1, 'get', True)
+        return self._get(a[0], 'string')
+
+    def c_mget(self, a):
+        self._arity(a, 1, 'mget')
+        out = []
+        for k in a:
+            if self._alive(k) and self.data[k][0] == 'string':
+                out.append(self.data[k][1])
+            else:
+                out.append(None)
+        return out
+
+    def c_append(self, a):
+        self._arity(a, 2, 'append', True)
+        v = (self._get(a[0], 'string') or '') + a[1]
+        if not self._alive(a[0]):
+            self.data[a[0]] = ('string', v)
+        else:
+            self.data[a[0]] = ('string', v)
+        return len(v.encode('utf-8'))
+
+    def _incr(self, key, by):
+        v = self._get(key, 'string')
+        try:
+            n = int(v) if v is not None else 0
+            if v is not None and str(n) != v:
+                raise ValueError
+        except ValueError:
+            raise RedisError('ERR value is not an integer or out of range')
+        n += by
+        exp = self.expires.get(key)
+        self.data[key] = ('string', str(n))
+        if exp is not None:
+            self.expires[key] = exp
+        return n
+
+    def c_incr(self, a):
+        self._arity(a, 1, 'incr', True)
+        return self._incr(a[0], 1)
+
+    def c_decr(self, a):
+        self._arity(a, 1, 'decr', True)
+        return self._incr(a[0], -1)
+
+    def c_incrby(self, a):
+        self._arity(a, 2, 'incrby', True)
+        return self._incr(a[0], _rint(a[1]))
+
+    def c_decrby(self, a):
+        self._arity(a, 2, 'decrby', True)
+        return self._incr(a[0], -_rint(a[1]))
+
+    def c_strlen(self, a):
+        self._arity(a, 1, 'strlen', True)
+        return len((self._get(a[0], 'string') or '').encode('utf-8'))
+
+    # -- lists -----------------------------------------------------------
+    def _push(self, a, left, name, need_exist=False):
+        self._arity(a, 2, name)
+        lst = self._get(a[0], 'list')
+        if lst is None:
+            if need_exist:
+                return 0
+            lst = []
+            self.data[a[0]] = ('list', lst)
+        for v in a[1:]:
+            if left:
+                lst.insert(0, v)
+            else:
+                lst.append(v)
+        return len(lst)
+
+    def c_rpush(self, a):
+        return self._push(a, False, 'rpush')
+
+    def c_lpush(self, a):
+        return self._push(a, True, 'lpush')
+
+    def c_rpushx(self, a):
+        return self._push(a, False, 'rpushx', True)
+
+    def c_lpushx(self, a):
+        return self._push(a, True, 'lpushx', True)
+
+    def c_lrange(self, a):
+        self._arity(a, 3, 'lrange', True)
+        lst = self._get(a[0], 'list') or []
+        start, stop = _rint(a[1]), _rint(a[2])
+        n = len(lst)
+        if start < 0:
+            start = max(n + start, 0)
+        if stop < 0:
+            stop = n + stop
+        if stop >= n:
+            stop = n - 1
+        if start > stop or start >= n:
+            return []
+        return list(lst[start:stop + 1])
+
+    def _pop(self, a, left, name):
+        self._arity(a, 1, name)
+        if len(a) > 2:
+            raise RedisError('ERR syntax error')
+        lst = self._get(a[0], 'list')
+        if len(a) == 2:
+            cnt = _rint(a[1])
+            if cnt < 0:
+                raise RedisError('ERR value is out of range, must be positive')
+            if lst is None:
+                return None
+            out = []
+            for _ in range(min(cnt, len(lst))):
+                out.append(lst.pop(0) if left else lst.pop())
+            self._cleanup(a[0])
+            return out
+        if not lst:
+            return None
+        v = lst.pop(0) if left else lst.pop()
+        self._cleanup(a[0])
+        return v
+
+    def c_lpop(self, a):
+        return self._pop(a, True, 'lpop')
+
+    def c_rpop(self, a):
+        return self._pop(a, False, 'rpop')
+
+    def c_llen(self, a):
+        self._arity(a, 1, 'llen', True)
+        return len(self._get(a[0], 'list') or [])
+
+    def c_lindex(self, a):
+        self._arity(a, 2, 'lindex', True)
+        lst = self._get(a[0], 'list') or []
+        i = _rint(a[1])
+        if i < 0:
+            i += len(lst)
+        if 0 <= i < len(lst):
+            return lst[i]
+        return None
+
+    # -- hashes ----------------------------------------------------------
+    def c_hset(self, a):
+        if len(a) < 3 or len(a) % 2 == 0:
+            raise RedisError("ERR wrong number of arguments for 'hset' command")
+        h = self._get(a[0], 'hash')
+        if h is None:
+            h = {}
+            self.data[a[0]] = ('hash', h)
+        added = 0
+        for i in range(1, len(a), 2):
+            if a[i] not in h:
+                added += 1
+            h[a[i]] = a[i + 1]
+        return added
+
+    def c_hmset(self, a):
+        self.c_hset(a)
+        return 'OK'
+
+    def c_hsetnx(self, a):
+        self._arity(a, 3, 'hsetnx', True)
+        h = self._get(a[0], 'hash')
+        if h is None:
+            h = {}
+            self.data[a[0]] = ('hash', h)
+        if a[1] in h:
+            return 0
+        h[a[1]] = a[2]
+        return 1
+
+    def c_hget(self, a):
+        self._arity(a, 2, 'hget', True)
+        h = self._get(a[0], 'hash') or {}
+        return h.get(a[1])
+
+    def c_hmget(self, a):
+        self._arity(a, 2, 'hmget')
+        h = self._get(a[0], 'hash') or {}
+        return [h.get(f) for f in a[1:]]
+
+    def c_hgetall(self, a):
+        self._arity(a, 1, 'hgetall', True)
+        h = self._get(a[0], 'hash') or {}
+        out = []
+        for k in sorted(h):
+            out.append(k)
+            out.append(h[k])
+        return out
+
+    def c_hkeys(self, a):
+        self._arity(a, 1, 'hkeys', True)
+        return sorted(self._get(a[0], 'hash') or {})
+
+    def c_hvals(self, a):
+        self._arity(a, 1, 'hvals', True)
+        h = self._get(a[0], 'hash') or {}
+        return [h[k] for k in sorted(h)]
+
+    def c_hlen(self, a):
+        self._arity(a, 1, 'hlen', True)
+        return len(self._get(a[0], 'hash') or {})
+
+    def c_hexists(self, a):
+        self._arity(a, 2, 'hexists', True)
+        return 1 if a[1] in (self._get(a[0], 'hash') or {}) else 0
+
+    def c_hdel(self, a):
+        self._arity(a, 2, 'hdel')
+        h = self._get(a[0], 'hash')
+        if h is None:
+            return 0
+        n = 0
+        for f in a[1:]:
+            if f in h:
+                del h[f]
+                n += 1
+        self._cleanup(a[0])
+        return n
+
+    def c_hincrby(self, a):
+        self._arity(a, 3, 'hincrby', True)
+        h = self._get(a[0], 'hash')
+        if h is None:
+            h = {}
+            self.data[a[0]] = ('hash', h)
+        try:
+            n = int(h.get(a[1], '0'))
+        except ValueError:
+            raise RedisError('ERR hash value is not an integer')
+        n += _rint(a[2])
+        h[a[1]] = str(n)
+        return n
+
+    # -- keys ------------------------------------------------------------
+    def c_del(self, a):
+        self._arity(a, 1, 'del')
+        n = 0
+        for k in a:
+            if self._alive(k) and self._del(k):
+                n += 1
+        return n
+
+    c_unlink = c_del
+
+    def c_exists(self, a):
+        self._arity(a, 1, 'exists')
+        return sum(1 for k in a if self._alive(k))
+
+    def c_keys(self, a):
+        self._arity(a, 1, 'keys', True)
+        return sorted(k for k in list(self.data) if self._alive(k) and _redis_glob(a[0], k))
+
+    def c_type(self, a):
+        self._arity(a, 1, 'type', True)
+        if not self._alive(a[0]):
+            return 'none'
+        return self.data[a[0]][0]
+
+    def c_expire(self, a):
+        self._arity(a, 2, 'expire', True)
+        if not self._alive(a[0]):
+            return 0
+        n = _rint(a[1])
+        if n <= 0:
+            self._del(a[0])
+        else:
+            self.expires[a[0]] = time.time() + n
+        return 1
+
+    def c_persist(self, a):
+        self._arity(a, 1, 'persist', True)
+        if self._alive(a[0]) and a[0] in self.expires:
+            del self.expires[a[0]]
+            return 1
+        return 0
+
+    def c_ttl(self, a):
+        self._arity(a, 1, 'ttl', True)
+        if not self._alive(a[0]):
+            return -2
+        exp = self.expires.get(a[0])
+        if exp is None:
+            return -1
+        return int(math.ceil(exp - time.time()))
+
+    def c_flushall(self, a):
+        self.data.clear()
+        self.expires.clear()
+        return 'OK'
+
+    c_flushdb = c_flushall
+
+    def c_dbsize(self, a):
+        return sum(1 for k in list(self.data) if self._alive(k))
+
+    def c_ping(self, a):
+        return a[0] if a else 'PONG'
+
+    def c_echo(self, a):
+        self._arity(a, 1, 'echo', True)
+        return a[0]
+
+
+class RESPRedis(object):
+    """Minimal RESP client for an external Redis server."""
+
+    def __init__(self, url):
+        self.url = url
+        u = urllib.parse.urlsplit(url)
+        self.scheme = (u.scheme or 'redis').lower()
+        self.host = u.hostname or 'localhost'
+        self.port = u.port or 6379
+        self.username = urllib.parse.unquote(u.username) if u.username else None
+        self.password = urllib.parse.unquote(u.password) if u.password else None
+        q = urllib.parse.parse_qs(u.query)
+        if self.password is None and q.get('password'):
+            self.password = q['password'][0]
+        db = (u.path or '').strip('/')
+        if not db and q.get('db'):
+            db = q['db'][0]
+        self.db = int(db) if db.isdigit() else 0
+        self.sock = None
+        self.rfile = None
+        self.lock = threading.Lock()
+
+    def _connect(self):
+        s = socket.create_connection((self.host, self.port), timeout=5)
+        if self.scheme == 'rediss':
+            import ssl
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(s, server_hostname=self.host)
+        s.settimeout(10)
+        self.sock = s
+        self.rfile = s.makefile('rb')
+        if self.password is not None:
+            if self.username:
+                self._roundtrip(['AUTH', self.username, self.password])
+            else:
+                self._roundtrip(['AUTH', self.password])
+        if self.db:
+            self._roundtrip(['SELECT', str(self.db)])
+
+    def _close(self):
+        try:
+            if self.rfile:
+                self.rfile.close()
+            if self.sock:
+                self.sock.close()
+        except OSError:
+            pass
+        self.sock = self.rfile = None
+
+    @staticmethod
+    def _encode(parts):
+        out = [b'*%d\r\n' % len(parts)]
+        for p in parts:
+            b = p.encode('utf-8') if isinstance(p, str) else p
+            out.append(b'$%d\r\n' % len(b))
+            out.append(b)
+            out.append(b'\r\n')
+        return b''.join(out)
+
+    def _read(self):
+        line = self.rfile.readline()
+        if not line:
+            raise ConnectionError('connection closed by redis server')
+        t, rest = line[:1], line[1:].rstrip(b'\r\n')
+        if t == b'+':
+            return rest.decode('utf-8', 'replace')
+        if t == b'-':
+            return RedisError(rest.decode('utf-8', 'replace'))
+        if t == b':':
+            return int(rest)
+        if t == b'$':
+            n = int(rest)
+            if n < 0:
+                return None
+            data = self.rfile.read(n + 2)
+            return data[:n].decode('utf-8', 'replace')
+        if t == b'*':
+            n = int(rest)
+            if n < 0:
+                return None
+            return [self._read() for _ in range(n)]
+        raise ConnectionError('invalid redis reply')
+
+    def _roundtrip(self, parts):
+        self.sock.sendall(self._encode(parts))
+        r = self._read()
+        if isinstance(r, RedisError):
+            raise r
+        return r
+
+    def do(self, cmd, args):
+        with self.lock:
+            for attempt in (0, 1):
+                try:
+                    if self.sock is None:
+                        self._connect()
+                    return self._roundtrip([cmd] + list(args))
+                except RedisError:
+                    raise
+                except (OSError, ConnectionError, ValueError) as e:
+                    self._close()
+                    if attempt:
+                        raise RedisError('redis connection error: %s' % e)
+
+
+_redis = None
+_redis_lock = threading.Lock()
+
+
+def get_redis():
+    global _redis
+    with _redis_lock:
+        if _redis is None:
+            _redis = new_redis()
+        return _redis
+
+
+def new_redis():
+    typ = (os.environ.get('HM_REDIS_TYPE') or 'memory').strip().lower()
+    if typ == 'redis':
+        url = os.environ.get('HM_REDIS_URL') or 'redis://redis:6379'
+        log('info', 'using external redis', url=url)
+        return RESPRedis(url)
+    if typ != 'memory':
+        log('warn', 'unknown HM_REDIS_TYPE, falling back to memory', type=typ)
+    return MemoryRedis()
+
+
+def _redis_arg(v):
+    if v is None or v is MISSING:
+        return ''
+    if isinstance(v, bool):
+        return '1' if v else '0'
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v).decode('utf-8', 'replace')
+    if isinstance(v, str):
+        return v
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return go_float(v)
+    return fmtv(v)
+
+
+def _redis_result(v):
+    if v is None:
+        return ''
+    if isinstance(v, list):
+        return ';;'.join(_redis_result(x) for x in v)
+    if isinstance(v, bool):
+        return '1' if v else '0'
+    if isinstance(v, RedisError):
+        return ''
+    return str(v)
+
+
+def redis_do(command, *args):
+    """Template function: {{ redisDo "SET" "k" "v" }}."""
+    cmd = _redis_arg(command)
+    argv = [_redis_arg(a) for a in args]
+    try:
+        r = get_redis().do(cmd, argv)
+    except RedisError as e:
+        log('error', 'redisDo failed', command=cmd, args=argv, err=str(e))
+        return ''
+    except Exception as e:  # pragma: no cover - defensive
+        log('error', 'redisDo failed', command=cmd, args=argv, err=repr(e))
+        return ''
+    return _redis_result(r)
+
+
+FUNCS['redisDo'] = redis_do
+
+
+# ---------------------------------------------------------------------------
+# Outbound HTTP (send_http)
+# ---------------------------------------------------------------------------
+
+import http.client
+import ssl as _ssl
+
+
+def send_http_request(method, url, headers, body, timeout=10.0):
+    u = urllib.parse.urlsplit(url)
+    scheme = (u.scheme or 'http').lower()
+    if scheme not in ('http', 'https') or not u.hostname:
+        raise ValueError('invalid url %r' % url)
+    host = u.hostname
+    port = u.port
+    if scheme == 'https':
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout,
+                                           context=_ssl._create_unverified_context())
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    target = u.path or '/'
+    if u.query:
+        target += '?' + u.query
+    data = body.encode('utf-8') if body else b''
+    try:
+        conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
+        has_host = False
+        for k, v in headers:
+            if k.lower() == 'content-length':
+                continue
+            if k.lower() == 'host':
+                has_host = True
+            conn.putheader(k, v.replace('\r', ' ').replace('\n', ' '))
+        if not has_host:
+            conn.putheader('Host', u.netloc.rsplit('@', 1)[-1])
+        if data or method not in ('GET', 'HEAD', 'DELETE', 'OPTIONS', 'TRACE'):
+            conn.putheader('Content-Length', str(len(data)))
+        conn.endheaders(data if data else None)
+        resp = conn.getresponse()
+        rbody = resp.read()
+        return resp.status, rbody
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Mock loading
 # ---------------------------------------------------------------------------
 
@@ -3705,6 +4393,34 @@ def parse_mock(m, source, root=None):
                 except LoadError as e:
                     raise LoadError('%s: mock %s: %s' % (source, key, e))
                 actions.append(('sleep', {'duration': max(d, 0.0)}))
+            elif name == 'redis':
+                if spec is None:
+                    spec = []
+                if not isinstance(spec, list):
+                    spec = [spec]
+                items = [_scalar_str(x) for x in spec if x is not None]
+                actions.append(('redis', {'items': items}))
+            elif name == 'send_http':
+                if not isinstance(spec, dict):
+                    raise LoadError('%s: mock %s: send_http must be a mapping' % (source, key))
+                url = spec.get('url')
+                if url is None or _scalar_str(url) == '':
+                    raise LoadError('%s: mock %s: send_http.url is required' % (source, key))
+                smethod = spec.get('method')
+                if smethod is None or _scalar_str(smethod).strip() == '':
+                    raise LoadError('%s: mock %s: send_http.method is required' % (source, key))
+                headers = spec.get('headers') or {}
+                if not isinstance(headers, dict):
+                    raise LoadError('%s: mock %s: send_http.headers must be a mapping'
+                                    % (source, key))
+                headers = [(str(k), _scalar_str(v)) for k, v in headers.items()]
+                body = _scalar_str(spec.get('body'))
+                bff = spec.get('body_from_file')
+                if body == '' and bff is not None and _scalar_str(bff) != '':
+                    body = _read_body_file(root, _scalar_str(bff), source, key)
+                actions.append(('send_http', {'url': _scalar_str(url),
+                                              'method': _scalar_str(smethod).strip().upper(),
+                                              'headers': headers, 'body': body}))
             else:
                 log('warn', 'unsupported action ignored', key=key, action=str(name))
     return Behavior(key, kind, method, path, condition, actions, m)
@@ -3951,7 +4667,31 @@ class Handler(BaseHTTPRequestHandler):
                 status, res_body, sent = spec['status_code'], rbody, True
             elif typ == 'sleep':
                 time.sleep(spec['duration'])
+            elif typ == 'redis':
+                for item in spec['items']:
+                    try:
+                        render(item, ctx)
+                    except Exception as e:
+                        log('error', 'failed to render redis action', key=b.key, err=str(e))
+            elif typ == 'send_http':
+                do_send_http(b, spec, ctx)
         return status, res_body, sent
+
+
+def do_send_http(b, spec, ctx):
+    try:
+        url = render(spec['url'], ctx).strip()
+        headers = [(k, render(v, ctx)) for k, v in spec['headers']]
+        body = render(spec['body'], ctx)
+    except Exception as e:
+        log('error', 'failed to render template for send_http', key=b.key, err=str(e))
+        return
+    try:
+        st, rbody = send_http_request(spec['method'], url, headers, body)
+        log('info', 'send_http', key=b.key, url=url, method=spec['method'], req=body,
+            status=st, res=rbody.decode('utf-8', 'replace'))
+    except Exception as e:
+        log('error', 'send_http failed', key=b.key, url=url, method=spec['method'], err=str(e))
 
 
 def main():
@@ -3969,6 +4709,7 @@ def main():
         log('error', 'failed to load mocks', err=str(e))
         sys.exit(1)
     log('info', 'mocks loaded', count=len(behaviors), dir=tdir)
+    get_redis()
     try:
         server = MockServer((host, port), Handler, behaviors)
     except OSError as e:
