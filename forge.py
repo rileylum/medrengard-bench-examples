@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Forge: manage hardware blueprints and allocations with JSON output."""
+"""Forge: manage hardware blueprints, allocations and units with JSON output."""
 import json
 import os
 import sys
@@ -474,10 +474,167 @@ def cmd_alloc_delete(data_dir, args):
     return {"deleted": count}
 
 
+UNIT_FILE = "units.json"
+UNIT_SYSTEM_FIELDS = ("uuid", "status", "module_uuids", "created_at")
+
+
+def load_units(data_dir):
+    path = os.path.join(data_dir, UNIT_FILE)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    if not content.strip():
+        return []
+    data = json.loads(content)
+    return data if isinstance(data, list) else []
+
+
+def save_units(data_dir, units):
+    os.makedirs(data_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=data_dir, prefix=".un-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(units, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(data_dir, UNIT_FILE))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def unit_view(u):
+    out = dict(u)
+    mods = out.get("module_uuids")
+    out["module_uuids"] = sorted(mods) if isinstance(mods, list) else []
+    return out
+
+
+def unit_sort_key(u):
+    return (u.get("host", ""), u.get("category", ""), u.get("created_at", ""),
+            u.get("uuid", ""))
+
+
+def cmd_unit_create(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "unit create takes no arguments")
+    raw = sys.stdin.read()
+    try:
+        doc = json.loads(raw, parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as e:
+        raise ForgeError("validation_error", "invalid JSON input: %s" % e)
+    if not isinstance(doc, dict):
+        raise ForgeError("validation_error",
+                         "input must be a JSON object, got %s" % type_name(doc))
+    errors = []
+    for k in ("category", "manufacturer", "host"):
+        if k not in doc:
+            errors.append("%s: is required" % k)
+        elif not isinstance(doc[k], str):
+            errors.append("%s: must be a string, got %s" % (k, type_name(doc[k])))
+        elif doc[k] == "":
+            errors.append("%s: must be a non-empty string" % k)
+    if "capacity" not in doc:
+        errors.append("capacity: is required")
+    else:
+        c = doc["capacity"]
+        if isinstance(c, bool) or not isinstance(c, int):
+            errors.append("capacity: must be a non-negative integer, got %s" % type_name(c))
+        elif c < 0:
+            errors.append("capacity: must be a non-negative integer, got %d" % c)
+    if "parent_uuid" in doc:
+        p = doc["parent_uuid"]
+        if not isinstance(p, str):
+            errors.append("parent_uuid: must be a string, got %s" % type_name(p))
+        elif p == "":
+            errors.append("parent_uuid: must be a non-empty string")
+    for k in UNIT_SYSTEM_FIELDS:
+        if k in doc:
+            errors.append("%s: is system-assigned and must not be provided" % k)
+    if errors:
+        raise ForgeError("validation_error", "; ".join(errors))
+
+    units = load_units(data_dir)
+    parent = doc.get("parent_uuid")
+    if parent is not None and not any(u.get("uuid") == parent for u in units):
+        raise ForgeError("not_found", "parent unit '%s' not found" % parent)
+
+    unit = {
+        "uuid": str(uuidlib.uuid4()),
+        "category": doc["category"],
+        "manufacturer": doc["manufacturer"],
+        "host": doc["host"],
+        "status": "active",
+        "parent_uuid": parent,
+        "module_uuids": [],
+        "capacity": doc["capacity"],
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    units.append(unit)
+    save_units(data_dir, units)
+    return unit_view(unit)
+
+
+def _unit_field_matches(u, field, value):
+    if field not in u:
+        return False
+    v = u[field]
+    if v is None:
+        return value == "null"
+    if isinstance(v, bool):
+        return value == ("true" if v else "false")
+    if isinstance(v, int):
+        return str(v) == value
+    if isinstance(v, str):
+        return v == value
+    return False
+
+
+def cmd_unit_list(data_dir, args):
+    named = {"--category": "category", "--manufacturer": "manufacturer", "--host": "host"}
+    filters = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        for f in list(named) + ["--filter"]:
+            if a == f or a.startswith(f + "="):
+                val, i = _take_opt(args, i, f)
+                if f == "--filter":
+                    if "=" not in val:
+                        raise ForgeError("validation_error",
+                                         "invalid filter '%s': expected key=value" % val)
+                    k, v = val.split("=", 1)
+                    filters.append((k, v))
+                else:
+                    filters.append((named[f], val))
+                break
+        else:
+            raise ForgeError("validation_error", "unexpected argument '%s'" % a)
+    out = []
+    for u in load_units(data_dir):
+        view = unit_view(u)
+        if all(_unit_field_matches(view, k, v) for k, v in filters):
+            out.append(view)
+    return sorted(out, key=unit_sort_key)
+
+
+def cmd_unit_get(data_dir, args):
+    if len(args) != 1:
+        raise ForgeError("validation_error", "get requires exactly one argument: <uuid>")
+    ident = args[0]
+    for u in load_units(data_dir):
+        if u.get("uuid") == ident:
+            return unit_view(u)
+    raise ForgeError("not_found", "unit '%s' not found" % ident)
+
+
 GROUPS = {
     "blueprint": COMMANDS,
     "allocation": {"create": cmd_alloc_create, "list": cmd_alloc_list, "get": cmd_alloc_get,
                    "bind": cmd_alloc_bind, "delete": cmd_alloc_delete},
+    "unit": {"create": cmd_unit_create, "list": cmd_unit_list, "get": cmd_unit_get},
 }
 
 
@@ -503,7 +660,7 @@ def parse_argv(argv):
         raise ForgeError("validation_error", "--data-dir is required")
     if not rest or rest[0] not in GROUPS:
         raise ForgeError("validation_error",
-                         "usage: forge.py --data-dir <path> {blueprint|allocation} <command> [args]")
+                         "usage: forge.py --data-dir <path> {blueprint|allocation|unit} <command> [args]")
     group = rest[0]
     if len(rest) < 2:
         raise ForgeError("validation_error", "missing %s command" % group)
