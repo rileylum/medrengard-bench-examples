@@ -512,10 +512,15 @@ def plan(args, build, sde, types, by_name, product_bps, bp_products, times,
 
     if act != MANUFACTURING:
         me = 0
-    if getattr(args, "build_all", False):
+    stocks = load_item_list(getattr(args, "stocks", None), by_name)
+    targets = load_item_list(getattr(args, "targets", None), by_name)
+    if getattr(args, "build_all", False) or stocks or targets \
+            or getattr(args, "stocks", None) or getattr(args, "targets", None):
         return plan_build_all(args, types, product_bps, bp_products, times,
                               mats, is_pub, groups, cats, by_name, buy, act,
-                              bp, me, te, runs, njobs, tname)
+                              bp, me, te, runs, njobs, tname,
+                              stocks=stocks, targets=targets,
+                              build_all=getattr(args, "build_all", False))
     for mid, q in mats.get((bp, act), []):
         per_job = max(runs, math.ceil(Fraction(q) * runs * (1 - Fraction(me, 100))))
         add(mid, per_job * njobs)
@@ -562,13 +567,62 @@ CAPITAL_GROUPS = {"Carrier", "Dreadnought", "Force Auxiliary", "Freighter",
                   "Lancer Dreadnought", "Jump Freighter"}
 
 
+def parse_qty(tok):
+    t = tok.replace(",", "").replace("_", "")
+    if re.fullmatch(r"[+]?\d+", t):
+        return int(t)
+    if re.fullmatch(r"[+]?\d+\.\d*|[+]?\d*\.\d+", t):
+        return int(Decimal(t))
+    return None
+
+
+def load_item_list(path, by_name):
+    """Parse a '{Item Name} {Quantity} [anything]' file into {typeID: qty}."""
+    out = {}
+    if not path:
+        return out
+    with open(path, encoding="utf-8-sig") as f:
+        lines = f.read().splitlines()
+    lower = {}
+    for k in by_name:
+        lower.setdefault(k.lower(), k)
+    for line in lines:
+        toks = line.split()
+        if not toks or toks[0].startswith("#"):
+            continue
+        best = None
+        fallback = None
+        for i in range(1, len(toks)):
+            q = parse_qty(toks[i])
+            if q is None:
+                continue
+            nm = " ".join(toks[:i])
+            if fallback is None:
+                fallback = (nm, q)
+            key = nm if nm in by_name else lower.get(nm.lower())
+            if key is not None:
+                best = (key, q)  # keep longest matching name
+        if best is None:
+            if fallback is not None:
+                print(f"Warning: unknown item '{fallback[0]}' in {path}",
+                      file=sys.stderr)
+            continue
+        key, q = best
+        tid = sorted(by_name[key])[0]
+        out[tid] = out.get(tid, 0) + q
+    return out
+
+
 def plan_build_all(args, types, product_bps, bp_products, times, mats, is_pub,
                    groups, cats, by_name, buy, act, bp, me, te, runs, njobs,
-                   tname):
+                   tname, stocks=None, targets=None, build_all=True):
     cfg = load_full_config(args.config)
     te_bonus = cfg["te_bonus"]
     split_days = cfg["split_days"]
+    skill = cfg["skill"]
     sde = args.sde
+    stocks = dict(stocks or {})
+    targets = dict(targets or {})
 
     def recipe_for(tid):
         cands = [c for c in product_bps.get(tid, [])
@@ -597,30 +651,87 @@ def plan_build_all(args, types, product_bps, bp_products, times, mats, is_pub,
     produced = {}
     job_rows = {}
 
+    # materials already required by the top-level job (invention inputs)
+    for tid, q in buy.items():
+        demand[tid] = demand.get(tid, 0) + q
+    buy = {}
+
+    def consume(b, a, r, count, me_):
+        for mid, q in mats.get((b, a), []):
+            per_job = max(r, math.ceil(Fraction(q) * r
+                                       * (1 - Fraction(me_, 100))))
+            demand[mid] = demand.get(mid, 0) + per_job * count
+
     def run_jobs(b, a, n, me_, te_, count=1):
         dpr = day_per_run(b, a, te_)
         for r, c in split_runs(n, dpr, split_days):
             key = (tname(b), r, round(float(dpr * r), 2))
             job_rows[key] = job_rows.get(key, 0) + c * count
-            for mid, q in mats.get((b, a), []):
-                per_job = max(r, math.ceil(Fraction(q) * r
-                                           * (1 - Fraction(me_, 100))))
-                demand[mid] = demand.get(mid, 0) + per_job * c * count
+            consume(b, a, r, c * count, me_)
 
-    run_jobs(bp, act, runs, me, te, njobs)
-    top_products = {p for a_, p, _ in bp_products.get(bp, []) if a_ == act}
+    if build_all:
+        run_jobs(bp, act, runs, me, te, njobs)
+    else:
+        secs = Fraction(times.get((bp, act), 0)) * runs \
+            * (1 - Fraction(te, 100)) * (1 - Fraction(te_bonus, 100))
+        key = (tname(bp), runs, round(float(secs / 86400), 2))
+        job_rows[key] = job_rows.get(key, 0) + njobs
+        consume(bp, act, runs, njobs, me)
+    for a_, p_, q_ in bp_products.get(bp, []):
+        if a_ == act and (p_ in stocks or p_ in targets):
+            produced[p_] = produced.get(p_, 0) + q_ * runs * njobs
+
+    # invention data (only needed for inventable stock targets)
+    inv_cache = []
+
+    def inv_data():
+        if not inv_cache:
+            inv_cache.append(load_invention_data(sde))
+        return inv_cache[0]
+
+    def invention_for(tid, rc):
+        """Return (src_act, src_id, base_prob, bp_runs, is_relic) or None."""
+        a, b, _ = rc
+        if a != MANUFACTURING:
+            return None
+        inv_out, probs, imats, iskills = inv_data()
+        sources = inv_out.get(b)
+        if not sources:
+            return None
+        relic_srcs = [s for s in sources if relic_info(tname(s[1]))]
+        if relic_srcs and len(relic_srcs) == len(sources):
+            s = sorted(relic_srcs, key=lambda s: (
+                relic_info(tname(s[1]))[0], tname(s[1]).lower(), s[1]))[0]
+            ri = relic_info(tname(s[1]))
+            return (s[0], s[1], frac_of(ri[1]), ri[2], True)
+        s = sorted(sources, key=lambda s: (
+            0 if is_pub(s[1]) else 1, 0 if s[0] == 8 else 1, s[1]))[0]
+        return (s[0], s[1], frac_of(probs.get((s[1], s[0], b), 0)), s[2],
+                False)
+
+    def buildable_recipe(tid):
+        if build_all or tid in targets:
+            return recipe_for(tid)
+        return None
 
     # discover buildable graph
     recipes = {}
-    stack = [m for m, _ in mats.get((bp, act), [])]
+    stack = list(demand) + list(targets)
     while stack:
         tid = stack.pop()
         if tid in recipes:
             continue
-        rc = recipe_for(tid)
+        rc = buildable_recipe(tid)
         recipes[tid] = rc
-        if rc:
+        if rc and build_all:
             stack.extend(m for m, _ in mats.get((rc[1], rc[0]), []))
+    inv_info = {}
+    for t in targets:
+        rc = recipes.get(t)
+        if rc:
+            info = invention_for(t, rc)
+            if info:
+                inv_info[t] = info
     nodes = [t for t, rc in recipes.items() if rc]
     indeg = {t: 0 for t in nodes}
     for t in nodes:
@@ -649,27 +760,56 @@ def plan_build_all(args, types, product_bps, bp_products, times, mats, is_pub,
                     ready.append(m)
 
     for t in order:
-        need = demand.get(t, 0)
+        need = demand.get(t, 0) + targets.get(t, 0) - stocks.get(t, 0) \
+            - produced.get(t, 0)
         if need <= 0:
             continue
         a, b, qty = recipes[t]
         qty = max(1, qty)
         n = math.ceil(Fraction(need, qty))
+        if t in inv_info:
+            sact, ssrc, base, bp_runs, is_relic = inv_info[t]
+            _, _, imats, iskills = inv_data()
+            factor = Fraction(1)
+            for sid in iskills.get((ssrc, sact), []):
+                if "Encryption Methods" in tname(sid):
+                    factor += Fraction(skill, 40)
+                else:
+                    factor += Fraction(skill, 30)
+            p = max(Fraction(0), min(Fraction(1), base * factor))
+            bp_runs = max(1, bp_runs)
+            if p > 0:
+                n_bps = math.ceil(Fraction(n, bp_runs))
+                attempts = math.ceil(n_bps / p)
+                for mid, q in imats.get((ssrc, sact), []):
+                    demand[mid] = demand.get(mid, 0) + q * attempts
+                if is_relic:
+                    demand[ssrc] = demand.get(ssrc, 0) + attempts
+                produced[t] = produced.get(t, 0) + n * qty
+                full, rem = divmod(n, bp_runs)
+                if full:
+                    run_jobs(b, a, bp_runs, 2, 4, full)
+                if rem:
+                    run_jobs(b, a, rem, 2, 4)
+                continue
         if a != MANUFACTURING:
             cme, cte = 0, 0
+        elif t in targets:
+            cme, cte = cfg["comp_me"], cfg["comp_te"]
         elif is_t1_capital(t):
             cme, cte = 0, 0
         else:
             cme, cte = cfg["comp_me"], cfg["comp_te"]
-        produced[t] = n * qty
+        produced[t] = produced.get(t, 0) + n * qty
         run_jobs(b, a, n, cme, cte)
 
-    for tid, q in demand.items():
-        if tid in produced:
+    for tid in set(demand) | set(targets):
+        if recipes.get(tid) and tid in produced:
             continue
-        add_q = q
-        if add_q:
-            buy[tid] = buy.get(tid, 0) + add_q
+        q = demand.get(tid, 0) + targets.get(tid, 0) - stocks.get(tid, 0) \
+            - produced.get(tid, 0)
+        if q > 0:
+            buy[tid] = q
 
     ship_vols = load_ship_volumes(sde)
 
@@ -683,12 +823,16 @@ def plan_build_all(args, types, product_bps, bp_products, times, mats, is_pub,
         return t["volume"] if t["volume"] is not None else Decimal(0)
 
     rows = []
-    for tid in set(buy) | set(produced):
+    for tid in set(buy) | set(produced) | set(demand):
         q = buy.get(tid, 0)
-        end = produced.get(tid, 0) - demand.get(tid, 0) if tid in produced else 0
-        if q == 0 and end == 0:
+        start = stocks.get(tid, 0)
+        end = start + produced.get(tid, 0) + q - demand.get(tid, 0)
+        if q == 0 and start == 0 and end == 0:
             continue
-        rows.append((tname(tid), q, fmt_plain(unit_volume(tid) * q), 0, end))
+        if q == 0 and not produced.get(tid) and not demand.get(tid):
+            continue
+        rows.append((tname(tid), q, fmt_plain(unit_volume(tid) * q), start,
+                     end))
     rows.sort(key=lambda r: r[0])
     os.makedirs(args.output, exist_ok=True)
     with open(os.path.join(args.output, "materials.csv"), "w",
@@ -749,6 +893,8 @@ def main(argv=None):
     pl.add_argument("--sde", required=True)
     pl.add_argument("--output", required=True)
     pl.add_argument("--build-all", dest="build_all", action="store_true")
+    pl.add_argument("--stocks", default=None)
+    pl.add_argument("--targets", default=None)
     args = p.parse_args(argv)
     name = " ".join(args.name)
     sde = args.sde
