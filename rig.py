@@ -12,7 +12,7 @@ CONFIG_EXTS = (".yaml", ".yml", ".json")
 OS_NAMES = ("macos", "linux")
 PACKAGE_MANAGERS = ("brew", "apt", "yum")
 ACTION_TYPES = ("link", "copy", "run")
-SCHEMAS = ("module", "preferences", "dock", "environments")
+SCHEMAS = ("module", "preferences", "dock", "environments", "manifest")
 VALUE_TYPES = ("bool", "int", "string", "float")
 OS_VERSIONS = ("yosemite", "el_capitan", "sierra", "high_sierra", "mojave",
                "catalina", "big_sur", "monterey", "ventura", "sonoma")
@@ -101,6 +101,9 @@ def validate_config(data):
         return errors
     if schema == "environments":
         errors.extend(validate_environments(data))
+        return errors
+    if schema == "manifest":
+        errors.extend(validate_manifest(data))
         return errors
 
     # 4-8. os
@@ -310,6 +313,42 @@ def validate_environments(data):
     return errors
 
 
+def validate_manifest(data):
+    errors = []
+    profiles = data.get("profiles", _MISSING)
+    if profiles is _MISSING:
+        return ["profiles: required"]
+    if not isinstance(profiles, dict) or not profiles:
+        return ["profiles: must be a non-empty object"]
+    for pname in profiles:
+        prof = profiles[pname]
+        pre = "profiles.%s" % pname
+        if not isinstance(prof, dict):
+            errors.append("%s: must be an object" % pre)
+            continue
+        mods = prof.get("modules", _MISSING)
+        if mods is _MISSING:
+            errors.append("%s.modules: required" % pre)
+        elif not isinstance(mods, list) or not mods:
+            errors.append("%s.modules: must be a non-empty list" % pre)
+        else:
+            for i, m in enumerate(mods):
+                if not _is_str(m):
+                    errors.append("%s.modules[%d]: must be a string"
+                                  % (pre, i))
+                elif m == "":
+                    errors.append("%s.modules[%d]: must not be empty"
+                                  % (pre, i))
+        ext = prof.get("extends", _MISSING)
+        if ext is _MISSING:
+            continue
+        if not _is_str(ext):
+            errors.append("%s.extends: must be a string" % pre)
+        elif ext not in profiles:
+            errors.append("%s.extends: unknown profile '%s'" % (pre, ext))
+    return errors
+
+
 def validate_preferences(data):
     errors = []
     prefs = data.get("preferences", _MISSING)
@@ -412,6 +451,23 @@ def run_validation(root):
         for e in docks:
             e["errors"].append(
                 "multiple 'dock' schemas found \u2014 only one is allowed")
+
+    manifests = [e for e in entries
+                 if isinstance(e["data"], dict)
+                 and e["data"].get("schema") == "manifest"]
+    root_manifests = []
+    for e in manifests:
+        mod = module_name_of(e["rel"])
+        if mod:
+            e["errors"].append(
+                "manifest schema must be in the root directory, found in "
+                "'%s'" % mod)
+        else:
+            root_manifests.append(e)
+    if len(root_manifests) > 1:
+        for e in root_manifests:
+            e["errors"].append(
+                "multiple 'manifest' schemas found \u2014 only one is allowed")
 
     files = []
     all_valid = True
@@ -577,9 +633,18 @@ class DependencyError(PlanError):
         self.payload = payload
 
 
-def order_modules(modules, deps):
-    """Topologically order modules (dicts with 'name'); ties alphabetical."""
+def order_modules(modules, deps, priority=None):
+    """Topologically order modules (dicts with 'name').
+
+    Ties are broken by `priority` (name -> rank) when given, else
+    alphabetically.
+    """
     import heapq
+
+    def key(n):
+        if priority is not None:
+            return (priority.get(n, len(priority)), n)
+        return (0, n)
     names = {m["name"] for m in modules}
     for name in sorted(names):
         for d in sorted(deps.get(name, ())):
@@ -591,18 +656,18 @@ def order_modules(modules, deps):
     for n, ds in remaining.items():
         for d in ds:
             dependents[d].add(n)
-    heap = [n for n, ds in remaining.items() if not ds]
+    heap = [(key(n), n) for n, ds in remaining.items() if not ds]
     heapq.heapify(heap)
     order = []
     done = set()
     while heap:
-        n = heapq.heappop(heap)
+        _, n = heapq.heappop(heap)
         order.append(n)
         done.add(n)
         for x in dependents[n]:
             remaining[x].discard(n)
             if not remaining[x]:
-                heapq.heappush(heap, x)
+                heapq.heappush(heap, (key(x), x))
     if len(order) != len(names):
         left = sorted(n for n in names if n not in done)
         path = []
@@ -636,7 +701,98 @@ def find_conflicts(modules):
     return conflicts
 
 
-def build_plan(root, os_filter, module_filter, os_version=None):
+class ProfileError(PlanError):
+    def __init__(self, payload):
+        super().__init__(payload["error"], payload)
+        self.payload = payload
+
+
+def find_manifest(entries):
+    for e in entries:
+        if (isinstance(e["data"], dict)
+                and e["data"].get("schema") == "manifest"
+                and not module_name_of(e["rel"])):
+            return e["data"]
+    return None
+
+
+def discovered_modules(entries):
+    names = set()
+    for e in entries:
+        name = module_name_of(e["rel"])
+        if (name and isinstance(e["data"], dict)
+                and e["data"].get("schema") in
+                ("module", "preferences", "dock", "environments")):
+            names.add(name)
+    return names
+
+
+def _find_cycle(profiles, start):
+    path = []
+    seen = {}
+    cur = start
+    while cur is not None and cur in profiles:
+        if cur in seen:
+            cyc = path[seen[cur]:]
+            i = cyc.index(min(cyc))
+            cyc = cyc[i:] + cyc[:i]
+            return cyc + [cyc[0]]
+        seen[cur] = len(path)
+        path.append(cur)
+        cur = profiles[cur].get("extends")
+    return None
+
+
+def resolve_profiles(manifest, known_modules):
+    """Return {name: [resolved modules in order]} or raise ProfileError."""
+    profiles = manifest.get("profiles") or {}
+    for name in sorted(profiles):
+        cyc = _find_cycle(profiles, name)
+        if cyc:
+            raise ProfileError({"error": "circular_inheritance",
+                                "cycle": cyc})
+    resolved = {}
+
+    def res(name):
+        if name in resolved:
+            return resolved[name]
+        prof = profiles[name]
+        out = []
+        parent = prof.get("extends")
+        if parent is not None:
+            out.extend(res(parent))
+        for m in prof.get("modules") or []:
+            if m not in out:
+                out.append(m)
+        resolved[name] = out
+        return out
+
+    for name in sorted(profiles):
+        res(name)
+    for name in sorted(profiles):
+        missing = sorted(set(m for m in resolved[name]
+                             if m not in known_modules))
+        if missing:
+            raise ProfileError({"error": "invalid_profile",
+                                "profile": name,
+                                "missing_modules": missing})
+    return resolved
+
+
+def list_profiles(root):
+    payload, entries, _ = run_validation(root)
+    if not payload["valid"]:
+        raise PlanError("validation_failed", payload)
+    manifest = find_manifest(entries)
+    if manifest is None:
+        return {"profiles": []}
+    resolved = resolve_profiles(manifest, discovered_modules(entries))
+    return {"profiles": [{"name": n, "modules": sorted(resolved[n])}
+                         for n in sorted(resolved)]}
+
+
+def build_plan(root, os_filter, module_filter, os_version=None,
+               profile=None):
     if os_version is not None and os_version not in OS_VERSIONS:
         raise PlanError("unknown_os_version",
                         "unknown version '%s'" % os_version)
@@ -661,6 +817,28 @@ def build_plan(root, os_filter, module_filter, os_version=None):
             env_by_dir.setdefault(name, []).append(e)
         for d in e["data"].get("depends_on") or []:
             deps.setdefault(name, set()).add(d)
+
+    profile_order = None
+    if profile is not None:
+        manifest = find_manifest(entries)
+        if manifest is None:
+            raise PlanError("no_manifest",
+                            "no manifest found but --profile was specified")
+        if profile not in (manifest.get("profiles") or {}):
+            raise PlanError("unknown_profile",
+                            "unknown profile '%s'" % profile)
+        resolved = resolve_profiles(manifest, discovered_modules(entries))
+        selected = list(resolved[profile])
+        if module_filter is not None:
+            selected = [m for m in selected if m in module_filter]
+        i = 0
+        while i < len(selected):
+            for d in sorted(deps.get(selected[i], ())):
+                if d not in selected:
+                    selected.append(d)
+            i += 1
+        profile_order = {m: n for n, m in enumerate(selected)}
+        module_filter = set(selected)
 
     root_abs = os.path.abspath(root)
     modules = []
@@ -694,7 +872,7 @@ def build_plan(root, os_filter, module_filter, os_version=None):
         actions.extend(plan_environments(env_by_dir.get(name, [])))
         modules.append({"name": name, "actions": actions})
 
-    modules = order_modules(modules, deps)
+    modules = order_modules(modules, deps, profile_order)
 
     conflicts = find_conflicts(modules)
     if conflicts:
@@ -716,6 +894,9 @@ def main(argv=None):
     pp.add_argument("--os-version", dest="os_version", default=None)
     pp.add_argument("--module", dest="modules", nargs="+", action="extend",
                     default=None)
+    pp.add_argument("--profile", dest="profile", default=None)
+    pl = sub.add_parser("list-profiles")
+    pl.add_argument("dir")
     args = parser.parse_args(argv)
 
     if args.command == "validate":
@@ -724,11 +905,14 @@ def main(argv=None):
         return 0 if payload["valid"] else 1
 
     try:
-        plan = build_plan(args.dir, args.os_name,
-                          set(args.modules) if args.modules is not None
-                          else None, args.os_version)
+        if args.command == "list-profiles":
+            plan = list_profiles(args.dir)
+        else:
+            plan = build_plan(args.dir, args.os_name,
+                              set(args.modules) if args.modules is not None
+                              else None, args.os_version, args.profile)
     except PlanError as exc:
-        if isinstance(exc, DependencyError):
+        if isinstance(exc, (DependencyError, ProfileError)):
             err = exc.payload
         elif exc.kind == "conflict":
             err = {"error": "conflict", "conflicts": exc.details}
