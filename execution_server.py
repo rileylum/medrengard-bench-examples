@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Tiny local runner HTTP API (stdlib only)."""
 import argparse
+import base64
 import bz2
+import copy
+import hashlib
 import csv
 import glob
 import gzip
@@ -49,6 +52,16 @@ class Stats:
         self._durations = []
         self._cmd_durations = []
         self._cmd_total = 0
+        self._hits = 0
+        self._misses = 0
+
+    def hit(self):
+        with self._lock:
+            self._hits += 1
+
+    def miss(self):
+        with self._lock:
+            self._misses += 1
 
     def add(self, duration, cmd_durations, cmd_total):
         with self._lock:
@@ -61,7 +74,14 @@ class Stats:
             ds = list(self._durations)
             cds = list(self._cmd_durations)
             total = self._cmd_total
+            hits, misses = self._hits, self._misses
         n = len(ds)
+        lookups = hits + misses
+        if lookups:
+            cache = {"hits": hits, "misses": misses,
+                     "hit_rate": round(hits / lookups, 3)}
+        else:
+            cache = {"hits": None, "misses": None, "hit_rate": None}
         return {
             "ran": n,
             "commands": {
@@ -72,10 +92,49 @@ class Stats:
                 "duration": _dist(cds),
             },
             "duration": _dist(ds),
+            "cache": cache,
         }
 
 
 STATS = Stats()
+
+
+class ResultCache:
+    """In-memory cache of execution results keyed by the normalized request."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = {}
+
+    @staticmethod
+    def key(command, env, files, stdin, timeout, track, coe):
+        canon = {
+            "command": command,
+            "env": sorted(env.items()),
+            "files": sorted((k, base64.b64encode(v).decode("ascii"))
+                            for k, v in files.items()),
+            "stdin": stdin,
+            "timeout": timeout,
+            "track": track,
+            "continue_on_error": coe,
+        }
+        raw = json.dumps(canon, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def get(self, key):
+        with self._lock:
+            v = self._data.get(key)
+        return copy.deepcopy(v) if v is not None else None
+
+    def put(self, key, result):
+        stored = copy.deepcopy(result)
+        stored.pop("id", None)
+        stored.pop("cached", None)
+        with self._lock:
+            self._data[key] = stored
+
+
+CACHE = ResultCache()
 
 
 def _is_number(v):
@@ -184,7 +243,13 @@ def validate(body):
 
     track = validate_track(body.get("track"))
 
-    return command, env, clean_files, stdin, float(timeout), track, coe
+    force = body.get("force")
+    if force is None:
+        force = False
+    if not isinstance(force, bool):
+        raise ClientError("'force' must be a boolean", "INVALID_FIELD")
+
+    return (command, env, clean_files, stdin, float(timeout), track, coe), force
 
 
 COMPRESSIONS = {".gz": "gz", ".bz2": "bz2"}
@@ -548,13 +613,25 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 raise ClientError("malformed JSON body", "INVALID_JSON")
-            args = validate(body)
+            args, force = validate(body)
+            key = ResultCache.key(*args)
+            if not force:
+                cached = CACHE.get(key)
+                if cached is not None:
+                    result = {"id": str(uuid.uuid4())}
+                    result.update(cached)
+                    result["cached"] = True
+                    STATS.hit()
+                    return self._send(201, result)
             result, duration, cmd_durs, cmd_total = execute(*args)
+            result["cached"] = False
+            CACHE.put(key, result)
         except ClientError as e:
             self.close_connection = True if e.status == 413 else self.close_connection
             return self._error(e.status, e.code, e.message)
         except Exception as e:  # unexpected
             return self._error(500, "INTERNAL_ERROR", f"internal error: {e}")
+        STATS.miss()
         STATS.add(duration, cmd_durs, cmd_total)
         self._send(201, result)
 
