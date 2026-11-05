@@ -4268,7 +4268,10 @@ def send_http_request(method, url, headers, body, timeout=10.0):
     target = u.path or '/'
     if u.query:
         target += '?' + u.query
-    data = body.encode('utf-8') if body else b''
+    if isinstance(body, (bytes, bytearray)):
+        data = bytes(body)
+    else:
+        data = body.encode('utf-8') if body else b''
     try:
         conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
         has_host = False
@@ -4470,8 +4473,12 @@ def parse_mock(m, source, root=None):
                 bff = spec.get('body_from_file')
                 if body == '' and bff is not None and _scalar_str(bff) != '':
                     body = _read_body_file(root, _scalar_str(bff), source, key)
+                binary, _ = _binary_spec(spec, body, root, source, key)
+                bname = spec.get('binary_file_name')
+                bname = _scalar_str(bname) if bname is not None else ''
                 actions.append((order, 'reply_http', {'status_code': sc, 'headers': headers,
-                                               'body': body}))
+                                               'body': body, 'binary': binary,
+                                               'binary_file_name': bname}))
             elif name == 'sleep':
                 if not isinstance(spec, dict) or spec.get('duration') is None:
                     raise LoadError('%s: mock %s: sleep.duration is required' % (source, key))
@@ -4505,9 +4512,11 @@ def parse_mock(m, source, root=None):
                 bff = spec.get('body_from_file')
                 if body == '' and bff is not None and _scalar_str(bff) != '':
                     body = _read_body_file(root, _scalar_str(bff), source, key)
+                binary, bname = _binary_spec(spec, body, root, source, key)
                 actions.append((order, 'send_http', {'url': _scalar_str(url),
                                               'method': _scalar_str(smethod).strip().upper(),
-                                              'headers': headers, 'body': body}))
+                                              'headers': headers, 'body': body,
+                                              'binary': binary, 'binary_file_name': bname}))
             else:
                 log('warn', 'unsupported action ignored', key=key, action=str(name))
     # stable sort by order ascending (preserves relative order on ties)
@@ -4536,6 +4545,34 @@ def _read_body_file(root, rel, source, key):
     if data.startswith(b'\xef\xbb\xbf'):
         data = data[3:]
     return data.decode('utf-8', 'replace')
+
+
+def _read_binary_file(root, rel, source, key):
+    p = _resolve_body_file(root, rel)
+    try:
+        with open(p, 'rb') as fh:
+            return fh.read()
+    except OSError as e:
+        log('error', 'failed to read body_from_binary_file', key=key, file=p, err=str(e))
+        return b''
+
+
+def _binary_spec(spec, body, root, source, key):
+    """Return (binary_bytes_or_None, file_name) for body_from_binary_file.
+
+    The binary file is only used when the (possibly file-loaded) body is
+    empty. The bytes are read once, at load time, so a loaded configuration
+    keeps a stable snapshot.
+    """
+    bbf = spec.get('body_from_binary_file')
+    name = spec.get('binary_file_name')
+    name = _scalar_str(name) if name is not None else ''
+    if body != '' or bbf is None or _scalar_str(bbf) == '':
+        return None, name
+    rel = _scalar_str(bbf)
+    if name == '':
+        name = os.path.basename(rel.replace('\\', '/'))
+    return _read_binary_file(root, rel, source, key), name
 
 
 def _walk_files(root):
@@ -4739,13 +4776,22 @@ def condition_passes(b, ctx):
         return False
 
 
+CORS_HEADERS = (
+    ('Access-Control-Allow-Origin', '*'),
+    ('Access-Control-Allow-Methods', '*'),
+    ('Access-Control-Allow-Headers', '*'),
+    ('Access-Control-Allow-Credentials', 'true'),
+)
+
+
 class MockServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 128
 
-    def __init__(self, addr, handler, behaviors):
+    def __init__(self, addr, handler, behaviors, cors=False):
         self.behaviors = behaviors
+        self.cors = cors
         ThreadingHTTPServer.__init__(self, addr, handler)
 
 
@@ -4794,6 +4840,10 @@ class Handler(BaseHTTPRequestHandler):
         return b''
 
     def _send(self, status, headers, body):
+        if getattr(self.server, 'cors', False):
+            present = set(k.lower() for k, _ in headers)
+            headers = list(headers) + [(k, v) for k, v in CORS_HEADERS
+                                       if k.lower() not in present]
         self.send_response(status)
         for k, v in headers:
             self.send_header(k, v.replace('\r', ' ').replace('\n', ' '))
@@ -4837,7 +4887,12 @@ class Handler(BaseHTTPRequestHandler):
                 matched_key = b.key
                 status, res_body, sent = self._perform(b, ctx)
                 break
-            if matched_key is None:
+            if matched_key is None and method == 'OPTIONS' and \
+                    getattr(self.server, 'cors', False):
+                status, res_body = 200, b''
+                self._send(200, [('Content-Length', '0')], b'')
+                sent = True
+            elif matched_key is None:
                 self._send(404, [('Content-Type', 'text/plain; charset=UTF-8'),
                                  ('Content-Length', '9')], b'not found')
                 sent = True
@@ -4860,7 +4915,11 @@ class Handler(BaseHTTPRequestHandler):
                     out_headers = []
                     for k, v in spec['headers']:
                         out_headers.append((k, render(v, ctx)))
-                    rbody = render(spec['body'], ctx).encode('utf-8')
+                    binary = spec.get('binary')
+                    if binary is not None:
+                        rbody = binary
+                    else:
+                        rbody = render(spec['body'], ctx).encode('utf-8')
                 except Exception as e:
                     log('error', 'failed to render template for http', key=b.key, err=str(e))
                     eb = b'{"message":"Internal Server Error"}\n'
@@ -4868,7 +4927,15 @@ class Handler(BaseHTTPRequestHandler):
                                      ('Content-Length', str(len(eb)))], eb)
                     return 500, eb, True
                 headers = [(k, v) for k, v in out_headers if k.lower() != 'content-length']
-                if not any(k.lower() == 'content-type' for k, _ in headers):
+                if binary is not None:
+                    if not any(k.lower() == 'content-type' for k, _ in headers):
+                        headers.insert(0, ('Content-Type', 'application/octet-stream'))
+                    bname = spec.get('binary_file_name') or ''
+                    if bname and not any(k.lower() == 'content-disposition'
+                                         for k, _ in headers):
+                        headers.append(('Content-Disposition',
+                                        'inline; filename="%s"' % bname))
+                elif not any(k.lower() == 'content-type' for k, _ in headers):
                     headers.insert(0, ('Content-Type', 'application/json'))
                 headers.append(('Content-Length', str(len(rbody))))
                 self._send(spec['status_code'], headers, rbody)
@@ -4886,17 +4953,55 @@ class Handler(BaseHTTPRequestHandler):
         return status, res_body, sent
 
 
+def _quote_filename(name):
+    return name.replace('\\', '\\\\').replace('"', '\\"').replace('\r', '').replace('\n', '')
+
+
+def _binary_payload(method, data, filename, headers):
+    """Build the request body/headers for a send_http binary payload."""
+    ctype = None
+    rest = []
+    for k, v in headers:
+        if k.lower() == 'content-type':
+            ctype = v
+        else:
+            rest.append((k, v))
+    if method != 'POST':
+        if ctype is None:
+            ctype = 'application/octet-stream'
+        return data, rest + [('Content-Type', ctype)]
+    part_type = ctype
+    if part_type is None or part_type.strip() == '' or \
+            part_type.strip().lower().startswith('multipart/'):
+        part_type = 'application/octet-stream'
+    boundary = uuid.uuid4().hex + uuid.uuid4().hex
+    head = ('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\n'
+            'Content-Type: %s\r\n\r\n' % (boundary, _quote_filename(filename), part_type))
+    tail = '\r\n--%s--\r\n' % boundary
+    payload = head.encode('utf-8') + data + tail.encode('utf-8')
+    return payload, rest + [('Content-Type', 'multipart/form-data; boundary=%s' % boundary)]
+
+
 def do_send_http(b, spec, ctx):
     try:
         url = render(spec['url'], ctx).strip()
         headers = [(k, render(v, ctx)) for k, v in spec['headers']]
-        body = render(spec['body'], ctx)
+        binary = spec.get('binary')
+        if binary is not None:
+            body = ''
+            payload, headers = _binary_payload(spec['method'], binary,
+                                               spec.get('binary_file_name') or 'file',
+                                               headers)
+        else:
+            body = render(spec['body'], ctx)
+            payload = body
     except Exception as e:
         log('error', 'failed to render template for send_http', key=b.key, err=str(e))
         return
     try:
-        st, rbody = send_http_request(spec['method'], url, headers, body)
-        log('info', 'send_http', key=b.key, url=url, method=spec['method'], req=body,
+        st, rbody = send_http_request(spec['method'], url, headers, payload)
+        log('info', 'send_http', key=b.key, url=url, method=spec['method'],
+            req=body if binary is None else '<binary %d bytes>' % len(binary),
             status=st, res=rbody.decode('utf-8', 'replace'))
     except Exception as e:
         log('error', 'send_http failed', key=b.key, url=url, method=spec['method'], err=str(e))
@@ -5067,6 +5172,36 @@ class Registry(object):
         self.behaviors = []
         self.servers = []
         self._snapshot = None
+        self._fs_sig = None
+        self.hot_reload = True
+
+    def _sig_exclude(self):
+        p = getattr(self.store, 'path', None)
+        return (p,) if p else ()
+
+    def _current_fs_sig(self):
+        return fs_signature(self.root, self._sig_exclude())
+
+    def reload_fs_if_changed(self):
+        """Hot reload: rebuild when anything under the templates dir changed."""
+        sig = self._current_fs_sig()
+        if sig == self._fs_sig:
+            return
+        with self.lock:
+            sig = self._current_fs_sig()
+            if sig == self._fs_sig:
+                return
+            try:
+                fs_raw = read_fs_mocks(self.root)
+                behaviors = build_mocks(self._raw(fs_raw, self.base, self.sets), self.root)
+            except LoadError as e:
+                log('error', 'failed to hot reload templates, keeping previous', err=str(e))
+                self._fs_sig = sig
+                return
+            self.fs_raw = fs_raw
+            self._fs_sig = sig
+            self._apply(behaviors)
+            log('info', 'templates hot reloaded', dir=self.root, count=len(behaviors))
 
     def _raw(self, fs_raw, base, sets):
         raw = list(fs_raw)
@@ -5084,6 +5219,7 @@ class Registry(object):
         return _json_dumps([base, sorted(sets.items())])
 
     def startup(self):
+        self._fs_sig = self._current_fs_sig()
         self.fs_raw = read_fs_mocks(self.root)
         try:
             base, sets = self.store.load()
@@ -5103,7 +5239,9 @@ class Registry(object):
 
     def _refresh_fs(self):
         try:
+            sig = self._current_fs_sig()
             self.fs_raw = read_fs_mocks(self.root)
+            self._fs_sig = sig
         except LoadError as e:
             log('error', 'failed to reload filesystem mocks, keeping previous', err=str(e))
 
@@ -5201,6 +5339,42 @@ class Registry(object):
             except LoadError as e:
                 log('error', 'persisted mocks are invalid, not reloading', err=str(e))
                 self._snapshot = snap
+
+
+def fs_signature(root, exclude=()):
+    """A cheap fingerprint of every file under root (for hot reload)."""
+    exclude = set(os.path.abspath(x) for x in exclude if x)
+    sig = []
+    if not os.path.isdir(root):
+        return ('<missing>',)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if name.startswith('.hmock-store-'):
+                continue
+            p = os.path.join(dirpath, name)
+            if os.path.abspath(p) in exclude:
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            sig.append((p, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino))
+        try:
+            dst = os.stat(dirpath)
+            sig.append((dirpath + '/', dst.st_mtime_ns))
+        except OSError:
+            pass
+    return tuple(sig)
+
+
+def _hot_reload_loop(reg, interval):
+    while True:
+        time.sleep(interval)
+        try:
+            reg.reload_fs_if_changed()
+        except Exception as e:  # pragma: no cover - defensive
+            log('error', 'hot reload failed', err=repr(e))
 
 
 def _reload_loop(reg, interval):
@@ -5406,7 +5580,10 @@ def main():
         log('error', 'invalid HM_ADMIN_HTTP_PORT', value=os.environ.get('HM_ADMIN_HTTP_PORT'))
         sys.exit(1)
     get_redis()
+    cors = _env_bool('HM_CORS_ENABLED', False)
+    hot_reload = _env_bool('HM_TEMPLATES_DIR_HOT_RELOAD', True)
     registry = Registry(tdir, new_store(tdir))
+    registry.hot_reload = hot_reload
     try:
         behaviors = registry.startup()
     except LoadError as e:
@@ -5414,7 +5591,7 @@ def main():
         sys.exit(1)
     log('info', 'mocks loaded', count=len(behaviors), dir=tdir)
     try:
-        server = MockServer((host, port), Handler, behaviors)
+        server = MockServer((host, port), Handler, behaviors, cors=cors)
     except OSError as e:
         log('error', 'failed to start http server', err=str(e))
         sys.exit(1)
@@ -5437,6 +5614,14 @@ def main():
         interval = 1.0
     if interval > 0:
         threading.Thread(target=_reload_loop, args=(registry, interval), daemon=True).start()
+    if hot_reload:
+        try:
+            hr = parse_duration(os.environ.get('HM_TEMPLATES_DIR_HOT_RELOAD_INTERVAL') or '200ms')
+        except LoadError:
+            hr = 0.2
+        threading.Thread(target=_hot_reload_loop, args=(registry, max(hr, 0.05)),
+                         daemon=True).start()
+        log('info', 'templates hot reload enabled', dir=tdir)
     log('info', 'starting http server', host=host, port=port)
     try:
         server.serve_forever(poll_interval=0.2)

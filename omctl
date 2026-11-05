@@ -1,0 +1,5 @@
+#!/bin/sh
+# Wrapper so `omctl` can be run directly; uses the active python.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$DIR/.venv/bin/python" ]; then PY="$DIR/.venv/bin/python"; else PY="$(command -v python3 || command -v python)"; fi
+exec "$PY" "$DIR/omctl.py" "$@"
