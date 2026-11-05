@@ -33,6 +33,10 @@ class InvalidPipe(Exception):
     pass
 
 
+class CacheError(Exception):
+    pass
+
+
 class BreakEx(Exception):
     pass
 
@@ -365,6 +369,9 @@ class Task:
         self.requires = None  # list of statements
         self.output = None
         self.timeout = None
+        self.inputs = None  # expression node (list) or None
+        self.cache_cfg = None
+        self.cache = None  # parsed cache config dict or None
         self.fields = set()
 
 
@@ -378,7 +385,8 @@ def type_str(t):
 # Parser
 # --------------------------------------------------------------------------
 
-FIELD_NAMES = ("params", "run", "success", "requires", "output", "timeout")
+FIELD_NAMES = ("params", "run", "success", "requires", "output", "timeout",
+               "inputs", "cache")
 
 
 class Parser:
@@ -551,6 +559,85 @@ class Parser:
                 e = self.parse_expr()
                 entries.append((cname, "expr", e))
         task.success = entries
+
+    def parse_inputs(self, task):
+        lx = self.lx
+        if not lx.at_op("["):
+            self.err("inputs must be a list", lx.peek())
+        task.inputs = self.parse_expr()
+
+    def parse_cache(self, task):
+        lx = self.lx
+        if not lx.at_op("{"):
+            self.err("cache must be a block", lx.peek())
+        task.cache = self.parse_cache_value()
+
+    def parse_cache_value(self):
+        lx = self.lx
+        tok = lx.peek()
+        if tok.kind == "op" and tok.value == "{":
+            lx.next()
+            obj = {}
+            while True:
+                tok = lx.peek()
+                if tok.kind == "op" and tok.value == "}":
+                    lx.next()
+                    return obj
+                if tok.kind == "op" and tok.value in (";", ","):
+                    lx.next()
+                    continue
+                if tok.kind == "eof":
+                    self.err("unterminated cache block", tok)
+                if tok.kind == "str":
+                    lx.next()
+                    key = tok.raw
+                elif tok.kind == "id":
+                    lx.next()
+                    key = tok.value
+                else:
+                    self.err("unexpected %s in cache block" % Lexer._desc(tok), tok)
+                if key in obj:
+                    self.err("duplicate cache key '%s'" % key, tok)
+                if not (lx.accept_op(":") or lx.accept_op("=")):
+                    self.err("expected ':' after '%s'" % key, lx.peek())
+                obj[key] = self.parse_cache_value()
+        if tok.kind == "op" and tok.value == "[":
+            lx.next()
+            items = []
+            while True:
+                tok = lx.peek()
+                if tok.kind == "op" and tok.value == "]":
+                    lx.next()
+                    return items
+                if tok.kind == "op" and tok.value == ",":
+                    lx.next()
+                    continue
+                if tok.kind == "eof":
+                    self.err("unterminated list", tok)
+                items.append(self.parse_cache_value())
+        if tok.kind == "op" and tok.value == "-":
+            lx.next()
+            t2 = lx.peek()
+            if t2.kind != "num":
+                self.err("expected a number", t2)
+            lx.next()
+            return -t2.value
+        if tok.kind == "num":
+            lx.next()
+            return tok.value
+        if tok.kind == "str":
+            lx.next()
+            return tok.raw
+        if tok.kind == "id":
+            lx.next()
+            if tok.value in ("TRUE", "true", "True"):
+                return True
+            if tok.value in ("FALSE", "false", "False"):
+                return False
+            if tok.value in ("null", "NULL", "None", "none"):
+                return None
+            return tok.value
+        self.err("unexpected %s in cache block" % Lexer._desc(tok), tok)
 
     def parse_requires(self, task):
         self.lx.expect_op("{")
@@ -1603,6 +1690,7 @@ def check_param_refs_expr(e, task):
 def validate(tasks, runner):
     graph = {}
     for task in tasks.values():
+        task.cache_cfg = normalize_cache(task)
         # parameter defaults
         for p in task.params:
             if p.default is not None:
@@ -1689,6 +1777,155 @@ def validate(tasks, runner):
 
 
 # --------------------------------------------------------------------------
+# Cache
+# --------------------------------------------------------------------------
+
+import glob as _glob
+import hashlib
+
+CACHE_KEYS = ("enabled", "strategy", "location", "version", "ttl", "key")
+CACHE_STRATEGIES = ("content", "stale", "always")
+TTL_UNITS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+def _as_bool(v, what):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip().upper() in ("TRUE", "FALSE"):
+        return v.strip().upper() == "TRUE"
+    raise CacheError("%s must be a bool" % what)
+
+
+def normalize_cache(task):
+    """Validate a task's cache block and return a normalized config."""
+    raw = task.cache
+    if raw is None:
+        return None
+    where = "cache of task '%s'" % task.name
+    if not isinstance(raw, dict):
+        raise CacheError("%s must be a block" % where)
+    for k in raw:
+        if k not in CACHE_KEYS:
+            raise CacheError("unknown key '%s' in %s" % (k, where))
+    cfg = {"enabled": False, "strategy": "content", "location": None,
+           "version": None, "ttl": None, "include": None, "exclude": None}
+    if "enabled" in raw:
+        cfg["enabled"] = _as_bool(raw["enabled"], "'enabled' in %s" % where)
+    if "strategy" in raw:
+        st = raw["strategy"]
+        if not isinstance(st, str) or st.strip().lower() not in CACHE_STRATEGIES:
+            raise CacheError("invalid strategy %r in %s" % (st, where))
+        cfg["strategy"] = st.strip().lower()
+    if "location" in raw and raw["location"] is not None:
+        loc = raw["location"]
+        if not isinstance(loc, str) or not loc.strip():
+            raise CacheError("'location' in %s must be a non-empty string" % where)
+        cfg["location"] = loc
+    if "version" in raw and raw["version"] is not None:
+        ver = raw["version"]
+        if isinstance(ver, (dict, list)):
+            raise CacheError("'version' in %s must be a string" % where)
+        if isinstance(ver, bool):
+            ver = "TRUE" if ver else "FALSE"
+        cfg["version"] = str(ver)
+    if "ttl" in raw and raw["ttl"] is not None:
+        ttl = raw["ttl"]
+        if not isinstance(ttl, dict):
+            raise CacheError("'ttl' in %s must be a block" % where)
+        total = None
+        for k, v in ttl.items():
+            if k not in TTL_UNITS:
+                raise CacheError("unknown ttl unit '%s' in %s" % (k, where))
+            if v is None:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise CacheError("ttl '%s' in %s must be an int" % (k, where))
+            if isinstance(v, float) and not v.is_integer():
+                raise CacheError("ttl '%s' in %s must be an int" % (k, where))
+            if v < 0:
+                raise CacheError("ttl '%s' in %s must not be negative" % (k, where))
+            total = (total or 0) + int(v) * TTL_UNITS[k]
+        cfg["ttl"] = total
+    if cfg["strategy"] == "stale" and cfg["ttl"] is None and cfg["enabled"]:
+        raise CacheError("stale strategy requires a ttl in %s" % where)
+    if "key" in raw and raw["key"] is not None:
+        key = raw["key"]
+        if not isinstance(key, dict):
+            raise CacheError("'key' in %s must be a block" % where)
+        pnames = [p.name for p in task.params]
+        for k, v in key.items():
+            if k not in ("include", "exclude"):
+                raise CacheError("unknown key option '%s' in %s" % (k, where))
+            if v is None:
+                continue
+            if isinstance(v, str):
+                v = [v]
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise CacheError("'key.%s' in %s must be a list of parameter names" % (k, where))
+            names = []
+            for x in v:
+                x = x[len("params."):] if x.startswith("params.") else x
+                if x not in pnames:
+                    raise CacheError("unknown parameter '%s' in key.%s of %s" % (x, k, where))
+                names.append(x)
+            cfg[k] = names
+    return cfg
+
+
+def _sha_file(path, h):
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError as ex:
+        h.update(("<unreadable:%s>" % ex).encode())
+
+
+def hash_inputs(paths):
+    h = hashlib.sha256()
+    for p in paths:
+        h.update(b"\0F" + p.encode("utf-8", "surrogateescape") + b"\0")
+        if os.path.isdir(p):
+            for root, dirs, files in os.walk(p):
+                dirs.sort()
+                for fn in sorted(files):
+                    fp = os.path.join(root, fn)
+                    h.update(b"\0D" + os.path.relpath(fp, p).encode("utf-8", "surrogateescape"))
+                    _sha_file(fp, h)
+        elif os.path.exists(p):
+            _sha_file(p, h)
+        else:
+            h.update(b"<missing>")
+    return h.hexdigest()
+
+
+def snapshot_tree(root, exclude):
+    """Map relative file path -> (mtime_ns, size, ino) for all files under root."""
+    snap = {}
+    if not os.path.isdir(root):
+        return snap
+    ex = [os.path.realpath(e) for e in exclude if e]
+    for cur, dirs, files in os.walk(root):
+        rc = os.path.realpath(cur)
+        keep = []
+        for d in dirs:
+            full = os.path.realpath(os.path.join(rc, d))
+            if any(full == e or full.startswith(e.rstrip(os.sep) + os.sep) for e in ex):
+                continue
+            keep.append(d)
+        dirs[:] = keep
+        for fn in files:
+            full = os.path.join(cur, fn)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            snap[os.path.relpath(full, root)] = (st.st_mtime_ns, st.st_size, st.st_ino)
+    return snap
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 
@@ -1716,6 +1953,137 @@ class Runner:
         self.stack = []
         self.jobs_path = os.path.join(outdir, "jobs.jsonl")
         self.jobs_file = None
+        self.cache_enabled = True
+        self.cache_location = None
+        self.force_refresh = set()
+
+    # -- cache helpers
+    def cache_config_for(self, task):
+        if not self.cache_enabled or task.name in self.force_refresh:
+            return None
+        cfg = task.cache_cfg
+        if cfg is None or not cfg["enabled"]:
+            return None
+        return cfg
+
+    def cache_dir(self, cfg):
+        loc = cfg["location"] or self.cache_location or ".pipe-cache"
+        loc = os.path.expanduser(loc)
+        if not os.path.isabs(loc):
+            loc = os.path.join(self.workspace, loc)
+        return os.path.normpath(loc)
+
+    def resolve_inputs(self, task, params, cwd, output_abs):
+        ctx = Ctx(self, "const", params, cwd, output_abs)
+        v = eval_expr(task.inputs, ctx)
+        if not isinstance(v, list):
+            v = [v]
+        out = []
+        for item in v:
+            if isinstance(item, list):
+                items = item
+            else:
+                items = [item]
+            for it in items:
+                if isinstance(it, bool) or not isinstance(it, (str, int, float)):
+                    raise InvalidPipe("inputs of task '%s' must be file paths" % task.name)
+                pth = os.path.expanduser(to_str(it))
+                if not os.path.isabs(pth):
+                    pth = os.path.join(cwd, pth)
+                pth = os.path.normpath(pth)
+                if GLOB_CHARS.search(pth):
+                    matches = sorted(os.path.normpath(m)
+                                     for m in _glob.glob(pth, recursive=True))
+                    for m in matches:
+                        if m not in out:
+                            out.append(m)
+                elif pth not in out:
+                    out.append(pth)
+        return out
+
+    def cache_key(self, task, cfg, params, inputs):
+        kp = dict(params)
+        if cfg["include"] is not None:
+            kp = {k: v for k, v in kp.items() if k in cfg["include"]}
+        if cfg["exclude"] is not None:
+            kp = {k: v for k, v in kp.items() if k not in cfg["exclude"]}
+        data = {"task": task.name, "params": kp, "version": cfg["version"],
+                "strategy": cfg["strategy"]}
+        if cfg["strategy"] == "content":
+            rel = []
+            for pth in inputs or []:
+                rel.append(os.path.relpath(pth, self.workspace)
+                           if within(pth, self.workspace) else pth)
+            data["inputs"] = [hash_inputs(inputs or []), rel]
+        blob = json.dumps(data, sort_keys=True, default=str)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def cache_lookup(self, cfg, key):
+        """Returns (meta, entry_dir, reason)."""
+        entry = os.path.join(self.cache_dir(cfg), key)
+        meta_path = os.path.join(entry, "meta.json")
+        if not os.path.isfile(meta_path):
+            return None, entry, "not_found"
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if not isinstance(meta, dict) or "exit_code" not in meta:
+                return None, entry, "corrupt"
+        except (OSError, ValueError):
+            return None, entry, "corrupt"
+        if cfg["strategy"] != "always" and cfg["ttl"] is not None:
+            age = time.time() - float(meta.get("created", 0))
+            if age > cfg["ttl"]:
+                return None, entry, "expired"
+        return meta, entry, None
+
+    def cache_restore(self, meta, entry, cwd):
+        files_dir = os.path.join(entry, "files")
+        for rel in meta.get("files", []):
+            src = os.path.join(files_dir, rel)
+            dst = os.path.join(cwd, rel)
+            if not os.path.isfile(src):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.isdir(dst) and not os.path.islink(dst):
+                    shutil.rmtree(dst)
+                shutil.copy2(src, dst)
+            except OSError as ex:
+                raise CacheError("cannot restore cached file '%s': %s" % (rel, ex))
+
+    def cache_store(self, task, cfg, key, params, job, success, cwd, files):
+        loc = self.cache_dir(cfg)
+        entry = os.path.join(loc, key)
+        tmp = entry + ".tmp%d" % os.getpid()
+        try:
+            os.makedirs(loc, exist_ok=True)
+            if os.path.exists(tmp):
+                shutil.rmtree(tmp)
+            os.makedirs(os.path.join(tmp, "files"))
+            stored = []
+            for rel in files:
+                src = os.path.join(cwd, rel)
+                if not os.path.isfile(src):
+                    continue
+                dst = os.path.join(tmp, "files", rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+                stored.append(rel)
+            meta = {"task": task.name, "params": params, "key": key,
+                    "created": time.time(), "stdout": job["stdout"],
+                    "stderr": job["stderr"], "exit_code": job["exit_code"],
+                    "timed_out": job["timed_out"], "success": success,
+                    "files": stored}
+            with open(os.path.join(tmp, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, default=str)
+            if os.path.exists(entry):
+                shutil.rmtree(entry)
+            os.rename(tmp, entry)
+        except OSError as ex:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise CacheError("cannot write cache entry for task '%s' at '%s': %s"
+                             % (task.name, loc, ex))
 
     def emit(self, event, job_id, **extra):
         rec = {"event": event, "job_id": job_id}
@@ -1804,7 +2172,39 @@ class Runner:
                 except (BreakEx, ContinueEx):
                     raise InvalidPipe("break/continue outside of loop in task '%s'" % task.name)
             success = {}
-            if ok:
+            cfg = self.cache_config_for(task)
+            inputs = None
+            if task.inputs is not None:
+                inputs = self.resolve_inputs(task, params, cwd, output_abs)
+            key = None
+            hit = False
+            if cfg is not None:
+                key = self.cache_key(task, cfg, params, inputs)
+            if ok and cfg is not None:
+                self.emit("CACHE_CHECK", job_id, task=task.name, params=params,
+                          cache_key=key, strategy=cfg["strategy"])
+                meta, entry, why = self.cache_lookup(cfg, key)
+                if meta is not None:
+                    self.cache_restore(meta, entry, cwd)
+                    hit = True
+                    job["stdout"] = meta.get("stdout", "")
+                    job["stderr"] = meta.get("stderr", "")
+                    job["exit_code"] = meta.get("exit_code")
+                    job["timed_out"] = bool(meta.get("timed_out", False))
+                    success = dict(meta.get("success") or {})
+                    self.emit("CACHE_HIT", job_id, task=task.name, params=params,
+                              cache_key=key, strategy=cfg["strategy"],
+                              created=meta.get("created"))
+                    ok = (job["exit_code"] == 0 and not job["timed_out"]
+                          and all(success.values()))
+                else:
+                    self.emit("CACHE_MISS", job_id, task=task.name, params=params,
+                              cache_key=key, strategy=cfg["strategy"], reason=why)
+            if ok and not hit:
+                exclude = [self.outdir]
+                if cfg is not None:
+                    exclude.append(self.cache_dir(cfg))
+                before = snapshot_tree(cwd, exclude) if cfg is not None else None
                 self.emit("TASK_RUNNING", job_id, task=task.name, params=params, parent=parent_id)
                 if task.run is not None:
                     script = self.template(task.run, params, cwd, output_abs, for_shell=True)
@@ -1829,6 +2229,10 @@ class Runner:
                         success[cname] = bool(truthy(v))
                 ok = (job["exit_code"] == 0 and not job["timed_out"]
                       and all(success.values()))
+                if cfg is not None and not job["timed_out"]:
+                    after = snapshot_tree(cwd, exclude)
+                    changed = sorted(r for r, st in after.items() if before.get(r) != st)
+                    self.cache_store(task, cfg, key, params, job, success, cwd, changed)
             duration = round(time.time() - start, 4)
             rec = {
                 "job_id": job_id,
@@ -1842,12 +2246,19 @@ class Runner:
                 "exit_code": job["exit_code"],
                 "parent": parent_id,
                 "duration": duration,
+                "inputs": inputs,
+                "cache": task.cache if cfg is not None else None,
             }
+            if cfg is not None:
+                rec["cache_hit"] = hit
+                rec["cache_key"] = key
             self.write_job(rec)
             extra = dict(task=task.name, params=params, parent=parent_id,
                          exit_code=job["exit_code"], duration=duration)
             if reason:
                 extra["reason"] = reason
+            if hit:
+                extra["cached"] = True
             self.emit("TASK_COMPLETED" if ok else "TASK_FAILED", job_id, **extra)
             return ok
         finally:
@@ -1928,7 +2339,26 @@ def load_config(path):
     if not isinstance(env, dict):
         raise PipeSyntaxError("[env] must be a table")
     env = {str(k): env_value_str(v) for k, v in env.items()}
-    return entry, clean, env
+    cache = data.get("cache", {})
+    if not isinstance(cache, dict):
+        raise CacheError("[cache] must be a table")
+    ccfg = {"enabled": True, "location": None, "force_refresh": []}
+    for k, v in cache.items():
+        if k == "enabled":
+            ccfg["enabled"] = _as_bool(v, "cache.enabled")
+        elif k == "location":
+            if not isinstance(v, str) or not v.strip():
+                raise CacheError("cache.location must be a non-empty string")
+            ccfg["location"] = v
+        elif k == "force_refresh":
+            if isinstance(v, str):
+                v = [v]
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise CacheError("cache.force_refresh must be a list of task names")
+            ccfg["force_refresh"] = v
+        else:
+            raise CacheError("unknown key 'cache.%s' in config" % k)
+    return entry, clean, env, ccfg
 
 
 def parse_entry(text):
@@ -1985,8 +2415,9 @@ def main(argv=None):
 
     try:
         entry_text, clean, cfg_env = "main", False, {}
+        ccfg = {"enabled": True, "location": None, "force_refresh": []}
         if a.config:
-            entry_text, clean, cfg_env = load_config(a.config)
+            entry_text, clean, cfg_env, ccfg = load_config(a.config)
         try:
             with open(a.pipeline, "r", encoding="utf-8") as f:
                 text = f.read()
@@ -2002,6 +2433,9 @@ def main(argv=None):
         env["WORKSPACE"] = env.get("WORKSPACE", workspace)
 
         runner = Runner(tasks, workspace, outdir, env)
+        runner.cache_enabled = ccfg["enabled"]
+        runner.cache_location = ccfg["location"]
+        runner.force_refresh = set(ccfg["force_refresh"])
         validate(tasks, runner)
         if entry_name not in tasks:
             raise InvalidPipe("entry task '%s' is not defined" % entry_name)
@@ -2030,6 +2464,10 @@ def main(argv=None):
         sys.stdout.flush()
         sys.stderr.write("INVALID_PIPE:%s\n" % ex)
         return 3
+    except CacheError as ex:
+        sys.stdout.flush()
+        sys.stderr.write("CACHE_ERROR:%s\n" % ex)
+        return 5
     except RecursionError:
         sys.stderr.write("INVALID_PIPE:recursion too deep\n")
         return 3
