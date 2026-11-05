@@ -3162,13 +3162,19 @@ class State(object):
             finally:
                 del self.vars[mark:]
         elif isinstance(node, TemplateCall):
+            owner = self.tmpl
             lst = self.tmpl.defs.get(node.name)
+            if lst is None:
+                named = NAMED_TEMPLATES.get(node.name)
+                if named is not None:
+                    owner = named
+                    lst = named.tree
             if lst is None:
                 self.error('no such template "%s"' % node.name)
             if self.depth >= MAX_EXEC_DEPTH:
                 self.error('exceeded maximum template depth (%d)' % MAX_EXEC_DEPTH)
             newdot = self.eval_pipeline(dot, node.pipe) if node.pipe is not None else None
-            st = State(self.tmpl, newdot, self.depth + 1)
+            st = State(owner, newdot, self.depth + 1)
             st.walk_list(newdot, lst, out)
         elif isinstance(node, Break):
             raise _Break()
@@ -3392,6 +3398,9 @@ class Template(object):
 _cache = {}
 _cache_lock = threading.Lock()
 
+# Named templates registered from mocks of kind Template ({{template "key" .}}).
+NAMED_TEMPLATES = {}
+
 
 def clean(src):
     return src.replace('\r\n', ' ').replace('\n', ' ').replace('\t', ' ')
@@ -3548,7 +3557,7 @@ class HTTPContext(object):
 class Context(object):
     _go_type = 'openmock.Context'
     _tmpl_fields = ('HTTPHeader', 'HTTPBody', 'HTTPPath', 'HTTPQueryString',
-                    'HTTPContext', 'HTTPParams')
+                    'HTTPContext', 'HTTPParams', 'Values')
 
     def __init__(self, header, body, path, query):
         self.HTTPHeader = header
@@ -3557,6 +3566,7 @@ class Context(object):
         self.HTTPQueryString = query
         self.HTTPParams = {}
         self.HTTPContext = HTTPContext('', {}, query)
+        self.Values = {}
 
     def with_params(self, route, params):
         self.HTTPParams = params
@@ -4260,6 +4270,18 @@ class LoadError(Exception):
     pass
 
 
+KIND_BEHAVIOR = 'Behavior'
+KIND_TEMPLATE = 'Template'
+KIND_ABSTRACT = 'AbstractBehavior'
+KINDS = (KIND_BEHAVIOR, KIND_TEMPLATE, KIND_ABSTRACT)
+ALL_FIELDS = ('key', 'kind', 'extend', 'expect', 'actions', 'values', 'template')
+ALLOWED_FIELDS = {
+    KIND_BEHAVIOR: ('key', 'kind', 'extend', 'expect', 'actions', 'values'),
+    KIND_ABSTRACT: ('key', 'kind', 'expect', 'actions', 'values'),
+    KIND_TEMPLATE: ('key', 'kind', 'template'),
+}
+
+
 _DUR_UNITS = {'ns': 1e-9, 'us': 1e-6, 'µs': 1e-6, 'μs': 1e-6,
               'ms': 1e-3, 's': 1.0, 'm': 60.0, 'h': 3600.0}
 _DUR_PART = re.compile(r'(\d+\.?\d*|\.\d+)(ns|us|µs|μs|ms|s|m|h)')
@@ -4307,7 +4329,8 @@ def _scalar_str(v):
 
 
 class Behavior(object):
-    def __init__(self, key, kind, method, path, condition, actions, raw):
+    def __init__(self, key, kind, method, path, condition, actions, raw, values=None):
+        self.values = values if values is not None else {}
         self.key = key
         self.kind = kind
         self.method = method
@@ -4328,8 +4351,34 @@ def parse_mock(m, source, root=None):
         raise LoadError('%s: key must be a non-empty string' % source)
     kind = m.get('kind')
     if kind is None or kind == '':
-        kind = 'Behavior'
+        kind = KIND_BEHAVIOR
     kind = str(kind)
+    if kind not in KINDS:
+        raise LoadError('%s: mock %s: invalid kind %r (must be one of %s)'
+                        % (source, key, kind, ', '.join(KINDS)))
+    present = [f for f in m if m.get(f) is not None and f in ALL_FIELDS]
+    for f in present:
+        if f not in ALLOWED_FIELDS[kind]:
+            raise LoadError('%s: mock %s: field %r is not allowed for kind %s'
+                            % (source, key, f, kind))
+    if kind == KIND_TEMPLATE:
+        tsrc = m.get('template')
+        tsrc = _scalar_str(tsrc) if tsrc is not None else ''
+        try:
+            t = Template(clean(tsrc))
+        except TemplateError as e:
+            raise LoadError('%s: mock %s: invalid template: %s' % (source, key, e))
+        except RecursionError:
+            raise LoadError('%s: mock %s: template too deeply nested' % (source, key))
+        b = Behavior(key, kind, None, None, '', [], m)
+        b.template = t
+        return b
+    values = m.get('values')
+    if values is None:
+        values = {}
+    if not isinstance(values, dict):
+        raise LoadError('%s: mock %s: values must be a mapping' % (source, key))
+    values = dict((str(k) if not isinstance(k, str) else k, v) for k, v in values.items())
     expect = m.get('expect') or {}
     if not isinstance(expect, dict):
         raise LoadError('%s: mock %s: expect must be a mapping' % (source, key))
@@ -4356,7 +4405,17 @@ def parse_mock(m, source, root=None):
     for a in raw_actions:
         if not isinstance(a, dict):
             raise LoadError('%s: mock %s: each action must be a mapping' % (source, key))
+        order = a.get('order', 0)
+        if order is None:
+            order = 0
+        if isinstance(order, bool) or not isinstance(order, (int, float)) or \
+                (isinstance(order, float) and order != int(order)):
+            raise LoadError('%s: mock %s: action order must be an integer, got %r'
+                            % (source, key, order))
+        order = int(order)
         for name, spec in a.items():
+            if name == 'order':
+                continue
             if name == 'reply_http':
                 replies += 1
                 if replies > 1:
@@ -4383,7 +4442,7 @@ def parse_mock(m, source, root=None):
                 bff = spec.get('body_from_file')
                 if body == '' and bff is not None and _scalar_str(bff) != '':
                     body = _read_body_file(root, _scalar_str(bff), source, key)
-                actions.append(('reply_http', {'status_code': sc, 'headers': headers,
+                actions.append((order, 'reply_http', {'status_code': sc, 'headers': headers,
                                                'body': body}))
             elif name == 'sleep':
                 if not isinstance(spec, dict) or spec.get('duration') is None:
@@ -4392,14 +4451,14 @@ def parse_mock(m, source, root=None):
                     d = parse_duration(spec.get('duration'))
                 except LoadError as e:
                     raise LoadError('%s: mock %s: %s' % (source, key, e))
-                actions.append(('sleep', {'duration': max(d, 0.0)}))
+                actions.append((order, 'sleep', {'duration': max(d, 0.0)}))
             elif name == 'redis':
                 if spec is None:
                     spec = []
                 if not isinstance(spec, list):
                     spec = [spec]
                 items = [_scalar_str(x) for x in spec if x is not None]
-                actions.append(('redis', {'items': items}))
+                actions.append((order, 'redis', {'items': items}))
             elif name == 'send_http':
                 if not isinstance(spec, dict):
                     raise LoadError('%s: mock %s: send_http must be a mapping' % (source, key))
@@ -4418,12 +4477,15 @@ def parse_mock(m, source, root=None):
                 bff = spec.get('body_from_file')
                 if body == '' and bff is not None and _scalar_str(bff) != '':
                     body = _read_body_file(root, _scalar_str(bff), source, key)
-                actions.append(('send_http', {'url': _scalar_str(url),
+                actions.append((order, 'send_http', {'url': _scalar_str(url),
                                               'method': _scalar_str(smethod).strip().upper(),
                                               'headers': headers, 'body': body}))
             else:
                 log('warn', 'unsupported action ignored', key=key, action=str(name))
-    return Behavior(key, kind, method, path, condition, actions, m)
+    # stable sort by order ascending (preserves relative order on ties)
+    actions = [(typ, spec) for _, typ, spec in
+               sorted(actions, key=lambda x: x[0])]
+    return Behavior(key, kind, method, path, condition, actions, m, values)
 
 
 def _resolve_body_file(root, rel):
@@ -4484,15 +4546,119 @@ def load_mocks(root):
                     raw.append((m, path))
             else:
                 raw.append((doc, path))
-    ordered = {}
+    by_key = {}
     for m, path in raw:
-        b = parse_mock(m, path, root)
-        if b.key in ordered:
+        if not isinstance(m, dict):
+            raise LoadError('%s: mock must be a mapping, got %s' % (path, type(m).__name__))
+        if 'key' not in m or m.get('key') is None:
+            raise LoadError('%s: key is required' % path)
+        k = m['key']
+        if not isinstance(k, str) or k == '':
+            raise LoadError('%s: key must be a non-empty string' % path)
+        if k in by_key:
             log('warn', 'duplicate template key, the latter one will override the former one',
-                key=b.key, file=path)
-        ordered[b.key] = b
-        log('debug', 'loaded mock', key=b.key, file=path)
-    return list(ordered.values())
+                key=k, file=path)
+            del by_key[k]
+        by_key[k] = (m, path)
+
+    resolved = {}
+
+    def resolve(k, stack):
+        if k in resolved:
+            return resolved[k]
+        m, path = by_key[k]
+        parent_key = m.get('extend')
+        if parent_key is not None and m.get('kind') != KIND_TEMPLATE:
+            pk = _scalar_str(parent_key)
+            if pk == '' or pk not in by_key:
+                if pk != '':
+                    log('warn', 'extend target not found, skipping extension', key=k, extend=pk)
+            elif pk in stack:
+                log('warn', 'circular extend detected, skipping extension', key=k, extend=pk)
+            elif by_key[pk][0].get('kind') == KIND_TEMPLATE:
+                log('warn', 'cannot extend a Template, skipping extension', key=k, extend=pk)
+            else:
+                parent = resolve(pk, stack + [k])
+                if _is_zero(m.get('kind')):
+                    m = dict(m)
+                    m['kind'] = KIND_BEHAVIOR
+                m = merge_mock(parent, m)
+        resolved[k] = m
+        return m
+
+    for k in by_key:
+        resolve(k, [k])
+
+    out = []
+    templates = {}
+    for k, (m, path) in by_key.items():
+        b = parse_mock(resolved[k], path, root)
+        if b.kind == KIND_TEMPLATE:
+            templates[b.key] = b.template
+        out.append(b)
+        log('debug', 'loaded mock', key=b.key, kind=b.kind, file=path)
+    NAMED_TEMPLATES.clear()
+    NAMED_TEMPLATES.update(templates)
+    return out
+
+
+def _is_zero(v):
+    return v is None or v == '' or (isinstance(v, (dict, list)) and len(v) == 0)
+
+
+def _deep_merge(parent, child):
+    if not isinstance(parent, dict) or not isinstance(child, dict):
+        return parent if _is_zero(child) else child
+    out = dict(parent)
+    for k, v in child.items():
+        out[k] = _deep_merge(out[k], v) if k in out else v
+    return out
+
+
+def merge_mock(parent, child):
+    """Merge a resolved parent mock dict with a child mock dict."""
+    out = {}
+    for k, v in parent.items():
+        if k in ('values', 'actions', 'expect'):
+            continue
+        out[k] = v
+    for k, v in child.items():
+        if k in ('values', 'actions', 'expect'):
+            continue
+        if not _is_zero(v) or k not in out:
+            out[k] = v
+    # values: shallow map merge, child keys win
+    pv, cv = parent.get('values'), child.get('values')
+    if isinstance(pv, dict) or isinstance(cv, dict):
+        vals = {}
+        if isinstance(pv, dict):
+            vals.update(pv)
+        if isinstance(cv, dict):
+            vals.update(cv)
+        elif cv is not None:
+            vals = cv  # invalid type; let validation report it
+        out['values'] = vals
+    elif cv is not None or pv is not None:
+        out['values'] = cv if cv is not None else pv
+    # actions: parent actions precede child actions
+    pa, ca = parent.get('actions'), child.get('actions')
+    if ca is None:
+        if pa is not None:
+            out['actions'] = pa
+    elif isinstance(ca, list) and (pa is None or isinstance(pa, list)):
+        out['actions'] = list(pa or []) + list(ca)
+    else:
+        out['actions'] = ca  # invalid type; let validation report it
+    # expect: recursive merge
+    pe, ce = parent.get('expect'), child.get('expect')
+    if pe is None:
+        if ce is not None:
+            out['expect'] = ce
+    elif ce is None:
+        out['expect'] = pe
+    else:
+        out['expect'] = _deep_merge(pe, ce)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -4624,6 +4790,7 @@ class Handler(BaseHTTPRequestHandler):
                 if params is None:
                     continue
                 ctx.with_params(b.path, params)
+                ctx.Values = b.values
                 if not condition_passes(b, ctx):
                     continue
                 matched_key = b.key
