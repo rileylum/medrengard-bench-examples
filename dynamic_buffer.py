@@ -1473,6 +1473,22 @@ def add_stateful(cols, in_rows, out_rows, align, in_cols, fmt, has_filter):
 
 
 # ---------------------------------------------------------------- driver
+def canonical_align(in_rows, align, in_cols):
+    """Within runs of identical input rows the alignment is arbitrary; move each
+    aligned row to the earliest identical row of its run."""
+    def key(r):
+        return json.dumps([r.get(c) for c in in_cols], sort_keys=True)
+    res = []
+    prev = -1
+    for i in align:
+        k = key(in_rows[i])
+        while i - 1 > prev and key(in_rows[i - 1]) == k:
+            i -= 1
+        res.append(i)
+        prev = i
+    return res
+
+
 def transformed_anchors(in_rows, out_rows, in_cols, out_cols, n, m, limit=6):
     """Monotone alignments where one output column equals a simple transform
     (affix, offset, ratio) of one input column, found by greedy matching."""
@@ -1626,6 +1642,7 @@ def infer(sample_dir):
         if q == m * len(out_cols):
             break
     _, align, cols = best
+    align = canonical_align(in_rows, align, in_cols)
     flt, vdefs = infer_filter_ext(in_rows, align, in_cols, fmt)
     cols = add_stateful(cols, in_rows, out_rows, align, in_cols, fmt, flt is not None)
     return {"format": fmt, "input_columns": in_cols, "filter": flt, "columns": cols, "virtual": vdefs}
