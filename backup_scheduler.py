@@ -8,10 +8,13 @@ exclusion globs) and writes a JSON Lines event history to stdout.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import os
 import re
 import sys
+import tarfile
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -19,6 +22,8 @@ import yaml
 
 DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 MOUNT_PREFIX = "mount://"
+STRATEGY_KINDS = ("full", "pack", "verify", "dry-run")
+DEFAULT_MAX_PACK_BYTES = 1048576
 
 
 class ScheduleError(Exception):
@@ -208,6 +213,40 @@ def local_to_aware(d: date, t: time, tz) -> datetime:
 # Schedule parsing
 # --------------------------------------------------------------------------
 
+def parse_strategy(raw, job_id: str):
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = {"kind": raw}
+    if not isinstance(raw, dict):
+        raise ScheduleError(f"job {job_id}: strategy must be a mapping")
+    kind = raw.get("kind")
+    if isinstance(kind, str):
+        kind = kind.strip().lower().replace("_", "-")
+        if kind == "dryrun":
+            kind = "dry-run"
+    if kind not in STRATEGY_KINDS:
+        raise ScheduleError(f"job {job_id}: invalid strategy kind {kind!r}")
+    options = raw.get("options") or {}
+    if not isinstance(options, dict):
+        raise ScheduleError(f"job {job_id}: strategy options must be a mapping")
+    strategy = {"kind": kind, "options": options}
+    if kind == "pack":
+        mpb = options.get("max_pack_bytes", DEFAULT_MAX_PACK_BYTES)
+        if mpb is None:
+            mpb = DEFAULT_MAX_PACK_BYTES
+        if isinstance(mpb, bool):
+            raise ScheduleError(f"job {job_id}: invalid max_pack_bytes")
+        if isinstance(mpb, float) and mpb.is_integer():
+            mpb = int(mpb)
+        if isinstance(mpb, str) and mpb.strip().isdigit():
+            mpb = int(mpb.strip())
+        if not isinstance(mpb, int) or mpb <= 0:
+            raise ScheduleError(f"job {job_id}: invalid max_pack_bytes {mpb!r}")
+        strategy["max_pack_bytes"] = mpb
+    return strategy
+
+
 def load_schedule(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -260,7 +299,9 @@ def load_schedule(path: str) -> dict:
         source = job.get("source", MOUNT_PREFIX)
         if source is None:
             source = MOUNT_PREFIX
+        strategy = parse_strategy(job.get("strategy"), job_id)
         entry = {
+            "strategy": strategy,
             "id": job_id,
             "enabled": bool(enabled),
             "kind": kind,
@@ -343,6 +384,72 @@ def list_files(root: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Strategies
+# --------------------------------------------------------------------------
+
+def read_file(root: str, rel: str) -> bytes:
+    try:
+        with open(os.path.join(root, rel), "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def sha256_tag(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def build_tar(entries: list[tuple[str, bytes]]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tar:
+        for name, data in entries:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mtime = 0
+            info.mode = 0o644
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.type = tarfile.REGTYPE
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+class Packer:
+    def __init__(self, job_id: str, limit: int, timestamp: str):
+        self.job_id = job_id
+        self.limit = limit
+        self.timestamp = timestamp
+        self.index = 0
+        self.entries: list[tuple[str, bytes]] = []
+        self.size = 0
+        self.packs = 0
+
+    def add(self, path: str, data: bytes) -> None:
+        if self.entries and self.size + len(data) > self.limit:
+            self.finalize()
+        if not self.entries:
+            self.index += 1
+        self.entries.append((path, data))
+        self.size += len(data)
+        emit({"event": "FILE_PACKED", "job_id": self.job_id, "pack_id": self.index,
+              "path": path, "size": len(data)})
+
+    def finalize(self) -> None:
+        if not self.entries:
+            return
+        tar_bytes = build_tar(self.entries)
+        emit({"event": "PACK_CREATED", "job_id": self.job_id,
+              "name": f"pack-{self.index}.tar", "size": self.size,
+              "timestamp": self.timestamp, "checksum": sha256_tag(tar_bytes),
+              "tar_size": len(tar_bytes)})
+        self.packs += 1
+        self.entries = []
+        self.size = 0
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
@@ -373,6 +480,14 @@ def run(args) -> int:
               "now_local": format_local(local_t)})
         emit({"event": "JOB_STARTED", "job_id": job_id,
               "exclude_count": len(job["exclude"])})
+        strategy = job.get("strategy")
+        skind = strategy["kind"] if strategy else None
+        if strategy:
+            emit({"event": "STRATEGY_SELECTED", "job_id": job_id, "kind": skind})
+        packer = None
+        if skind == "pack":
+            packer = Packer(job_id, strategy["max_pack_bytes"], format_local(local_t))
+        total_size = 0
         root = resolve_source(job["source"], args.mount)
         if root not in file_cache:
             file_cache[root] = list_files(root)
@@ -382,12 +497,27 @@ def run(args) -> int:
             if pat is None:
                 selected += 1
                 emit({"event": "FILE_SELECTED", "job_id": job_id, "path": path})
+                if skind:
+                    data = read_file(root, path)
+                    total_size += len(data)
+                    if skind == "pack":
+                        packer.add(path, data)
+                    elif skind in ("full", "verify"):
+                        emit({"event": "FILE_BACKED_UP" if skind == "full"
+                              else "FILE_VERIFIED", "job_id": job_id, "path": path,
+                              "size": len(data), "checksum": sha256_tag(data)})
             else:
                 excluded += 1
                 emit({"event": "FILE_EXCLUDED", "job_id": job_id, "path": path,
                       "pattern": pat})
-        emit({"event": "JOB_COMPLETED", "job_id": job_id, "selected": selected,
-              "excluded": excluded})
+        done = {"event": "JOB_COMPLETED", "job_id": job_id, "selected": selected,
+                "excluded": excluded}
+        if packer is not None:
+            packer.finalize()
+            done["packs"] = packer.packs
+        if skind:
+            done["total_size"] = total_size
+        emit(done)
     return 0
 
 
