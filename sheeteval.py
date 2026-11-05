@@ -1093,6 +1093,123 @@ def grade_computed(ctx):
     return False
 
 
+DEFAULT_THRESHOLD_MESSAGE = "Minimum score not met."
+NUMERIC_TEXT_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+
+
+def coord_key(coord):
+    return coord.replace("$", "").strip().upper()
+
+
+def parse_flags(raw, where, rep):
+    """Return (fatal, concealed, manual) for a checklist flags value."""
+    if raw is None:
+        return False, False, False
+    if isinstance(raw, float) and raw == int(raw):
+        raw = int(raw)
+    text = str(raw).strip()
+    if not text:
+        return False, False, False
+    if text.lower() == "manual":
+        return False, False, True
+    fatal = concealed = manual = False
+    bad = []
+    for ch in text:
+        u = ch.upper()
+        if u == "F":
+            fatal = True
+        elif u == "C":
+            concealed = True
+        elif u == "M":
+            manual = True
+        elif ch.isspace():
+            continue
+        else:
+            bad.append(ch)
+    if bad:
+        rep.warn("%s: unrecognized flag(s) %r in flags value %r; ignored"
+                 % (where, "".join(bad), text))
+    return fatal, concealed, manual
+
+
+def parse_min_score(raw, sheet, rep):
+    if raw is None:
+        return None
+    if is_number(raw):
+        if raw != raw:
+            rep.warn("sheet '%s': non-numeric min-score %r; threshold ignored" % (sheet, raw))
+            return None
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return None
+    if NUMERIC_TEXT_RE.match(text):
+        return float(text)
+    rep.warn("sheet '%s': non-numeric min-score %r; threshold ignored" % (sheet, text))
+    return None
+
+
+def check_depends(rule, sheet, where, outcomes, checklist_cells, rep):
+    """Return the first unmet dependency cell (as written), or None if all are met."""
+    if "depends" not in rule or rule["depends"] is None:
+        return None
+    deps = rule["depends"]
+    if not isinstance(deps, (list, tuple)):
+        deps = [deps]
+    for dep in deps:
+        text = str(dep).strip() if dep is not None else ""
+        ref = text
+        if "!" in text:
+            sh, _, ref = text.rpartition("!")
+            sh = sh.strip()
+            if len(sh) >= 2 and sh[0] == "'" and sh[-1] == "'":
+                sh = sh[1:-1].replace("''", "'")
+            if sh != sheet:
+                rep.warn("%s: rule.depends references %r, which is not on sheet '%s'; "
+                         "dependency treated as unmet" % (where, text, sheet))
+                return text
+        try:
+            coord, _, _ = parse_coord(ref)
+        except ValueError:
+            rep.warn("%s: rule.depends references %r, which is not a cell on sheet '%s'; "
+                     "dependency treated as unmet" % (where, text, sheet))
+            return text
+        key = coord_key(coord)
+        if key not in checklist_cells:
+            rep.warn("%s: rule.depends references %s, which has no rule on sheet '%s'; "
+                     "dependency treated as unmet" % (where, coord, sheet))
+            return key
+        if outcomes.get(key) != "CORRECT":
+            return key
+    return None
+
+
+class SheetBuffer(object):
+    """Collects a sheet's per-rule report lines, optionally deferring them."""
+
+    def __init__(self, out, defer):
+        self.out, self.defer = out, defer
+        self.pending = []
+
+    def header(self, text):
+        if self.defer:
+            self.pending.append(text)
+        else:
+            self.out.line(text)
+
+    def line(self, text):
+        self.header(text)
+
+    def replace_rules(self, text):
+        # Keep the header (first pending line), drop rule lines.
+        self.pending = self.pending[:1] + [text]
+
+    def flush(self):
+        for ln in self.pending:
+            self.out.line(ln)
+        self.pending = []
+
+
 def grade(key_path, sub_path, rep, out):
     import openpyxl
 
@@ -1113,6 +1230,9 @@ def grade(key_path, sub_path, rep, out):
     if name_col is None:
         raise FatalError("EvalManifest worksheet has no name/sheet/tab column")
 
+    min_col = find_exact_col(manifest, "min-score")
+    msg_col = find_exact_col(manifest, "threshold-message")
+
     sheets = []
     for row in range(2, manifest.max_row + 1):
         v = manifest.cell(row=row, column=name_col).value
@@ -1123,11 +1243,25 @@ def grade(key_path, sub_path, rep, out):
         s = str(v)
         if not s.strip():
             continue
-        sheets.append(s)
+        min_score = None
+        if min_col is not None:
+            min_score = parse_min_score(manifest.cell(row=row, column=min_col).value, s, rep)
+        message = None
+        if msg_col is not None:
+            mv = manifest.cell(row=row, column=msg_col).value
+            if mv is not None:
+                if isinstance(mv, float) and mv == int(mv):
+                    mv = int(mv)
+                mv = str(mv).strip()
+                if mv:
+                    message = mv
+        if message is None:
+            message = DEFAULT_THRESHOLD_MESSAGE
+        sheets.append((s, min_score, message))
 
     total_earned = 0
     total_max = 0
-    for sheet in sheets:
+    for sheet, min_score, threshold_message in sheets:
         cl_name = "%s_Checklist" % sheet
         if cl_name not in key_wb.sheetnames:
             rep.warn("missing checklist sheet '%s'; skipping sheet '%s'" % (cl_name, sheet))
@@ -1141,17 +1275,30 @@ def grade(key_path, sub_path, rep, out):
         flags_col = find_exact_col(cl, "flags")
         key_ws = key_wb[sheet] if sheet in key_wb.sheetnames else None
         sub_ws = sub_wb[sheet] if sub_wb is not None and sheet in sub_wb.sheetnames else None
-        out.line("Sheet '%s':" % sheet)
+
+        # Per-rule lines are deferred when a threshold is configured.
+        sheet_out = SheetBuffer(out, defer=min_score is not None)
+        sheet_out.header("Sheet '%s':" % sheet)
         sheet_earned = 0
         sheet_max = 0
 
+        # Collect checklist rows first (needed to validate dependencies).
+        rows = []
         for row in range(2, cl.max_row + 1):
             raw = cl.cell(row=row, column=id_col).value
             if raw is None or (isinstance(raw, str) and not raw.strip()):
                 continue
             coord, r, c = parse_coord(raw)
-            flags = cl.cell(row=row, column=flags_col).value if flags_col else None
-            if isinstance(flags, str) and flags.strip().lower() == "manual":
+            flags_raw = cl.cell(row=row, column=flags_col).value if flags_col else None
+            rows.append((coord, r, c, flags_raw))
+        checklist_cells = set(coord_key(coord) for coord, _, _, _ in rows)
+
+        outcomes = {}  # normalized coord -> outcome of an earlier rule
+        halted = False
+        for coord, r, c, flags_raw in rows:
+            where = "%s.%s" % (sheet, coord)
+            fatal, concealed, manual = parse_flags(flags_raw, where, rep)
+            if manual:
                 continue
             parsed = parse_annotation(get_cell(key_ws, r, c))
             if parsed is None:
@@ -1162,7 +1309,27 @@ def grade(key_path, sub_path, rep, out):
             if kind not in RULE_KINDS:
                 rep.warn("%s.%s: unknown rule kind '%s'; rule skipped" % (sheet, coord, kind))
                 continue
-            where = "%s.%s" % (sheet, coord)
+            label = "[concealed]" if concealed else coord
+            key = coord_key(coord)
+
+            if halted:
+                possible = abs(points)
+                sheet_max += possible
+                outcomes[key] = "SKIPPED"
+                sheet_out.line("  [SKIPPED] %s %s: 0 / %s" % (coord, label, fmt_num(possible)))
+                rep.log("%s.%s: %s SKIPPED" % (sheet, coord, kind))
+                continue
+
+            unmet = check_depends(rule, sheet, where, outcomes, checklist_cells, rep)
+            if unmet is not None:
+                possible = abs(points)
+                sheet_max += possible
+                outcomes[key] = "PREREQ"
+                sheet_out.line("  [PREREQ] %s %s: 0 / %s (requires %s)"
+                               % (coord, label, fmt_num(possible), unmet))
+                rep.log("%s.%s: %s PREREQ (requires %s)" % (sheet, coord, kind, unmet))
+                continue
+
             tol = get_tolerance(rule, where, rep)
             mode = get_mode(rule, where, rep)
             alts = []
@@ -1186,9 +1353,12 @@ def grade(key_path, sub_path, rep, out):
                     possible = points
                     sheet_max += points
                 earned = 0
-                out.line("  [INCORRECT] %s %s: %s / %s" % (coord, coord, fmt_num(earned),
-                                                           fmt_num(possible)))
+                outcomes[key] = "INCORRECT"
+                sheet_out.line("  [INCORRECT] %s %s: %s / %s" % (coord, label, fmt_num(earned),
+                                                                fmt_num(possible)))
                 rep.log("%s.%s: %s ERROR" % (sheet, coord, kind))
+                if fatal:
+                    halted = True
                 continue
             if mode == "penalty":
                 possible = abs(points)
@@ -1198,9 +1368,18 @@ def grade(key_path, sub_path, rep, out):
                 earned = points if ok else 0
                 sheet_max += points
             sheet_earned += earned
-            out.line("  [%s] %s %s: %s / %s" % ("CORRECT" if ok else "INCORRECT", coord, coord,
-                                               fmt_num(earned), fmt_num(possible)))
-            rep.log("%s.%s: %s %s" % (sheet, coord, kind, "CORRECT" if ok else "INCORRECT"))
+            outcome = "CORRECT" if ok else "INCORRECT"
+            outcomes[key] = outcome
+            sheet_out.line("  [%s] %s %s: %s / %s" % (outcome, coord, label,
+                                                     fmt_num(earned), fmt_num(possible)))
+            rep.log("%s.%s: %s %s" % (sheet, coord, kind, outcome))
+            if fatal and not ok:
+                halted = True
+
+        if min_score is not None and sheet_earned < min_score:
+            sheet_earned = 0
+            sheet_out.replace_rules("  %s" % threshold_message)
+        sheet_out.flush()
         out.line("Sheet '%s': %s / %s" % (sheet, fmt_num(sheet_earned), fmt_num(sheet_max)))
         out.line("")
         total_earned += sheet_earned
