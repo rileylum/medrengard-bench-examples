@@ -5,6 +5,7 @@ Usage:
     python launch.py <pipeline> --workspace <dir> --output <dir> [--config <toml>]
 """
 import argparse
+import copy
 import json
 import os
 import re
@@ -564,7 +565,118 @@ class Parser:
         lx = self.lx
         if not lx.at_op("["):
             self.err("inputs must be a list", lx.peek())
-        task.inputs = self.parse_expr()
+        lx.next()
+        lx._reset_to_last()
+        t = lx.t
+        n = len(t)
+        i = lx.i
+        items = []
+        cur_start = None
+        depth = 0
+        state = None
+
+        def flush(end):
+            if cur_start is None:
+                return
+            text = t[cur_start:end].strip()
+            if text:
+                items.append(self._input_item(text, cur_start))
+
+        while True:
+            if i >= n:
+                lx.err("unterminated inputs list", lx.i)
+            c = t[i]
+            if state is not None:
+                if c == "\\" and state == '"':
+                    i += 2
+                    continue
+                if c == state:
+                    state = None
+                i += 1
+                continue
+            if depth == 0 and (t.startswith("//", i) or c == "#"):
+                flush(i)
+                cur_start = None
+                j = t.find("\n", i)
+                i = n if j < 0 else j
+                continue
+            if c in "'\"":
+                if cur_start is None:
+                    cur_start = i
+                state = c
+                i += 1
+                continue
+            if c in "[({":
+                if cur_start is None:
+                    cur_start = i
+                depth += 1
+                i += 1
+                continue
+            if c in ")}":
+                depth -= 1
+                i += 1
+                continue
+            if c == "]":
+                if depth == 0:
+                    flush(i)
+                    i += 1
+                    break
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0 and c in ",\n":
+                flush(i)
+                cur_start = None
+                i += 1
+                continue
+            if cur_start is None and not c.isspace():
+                cur_start = i
+            i += 1
+        lx.i = i
+        lx.last_end = i
+        lx.buf = []
+        task.inputs = ("list", items)
+
+    def _input_item(self, text, pos):
+        try:
+            sub = Parser(text)
+            e = sub.parse_expr()
+            if sub.lx.peek().kind == "eof" and (
+                    text[0] in "'\"" or e[0] in ("lit", "str", "ref", "env", "list")):
+                return e
+        except PipeSyntaxError:
+            pass
+        parts = []
+        cur = []
+        j = 0
+        while j < len(text):
+            c = text[j]
+            if text.startswith("${", j):
+                k = text.find("}", j + 2)
+                if k < 0:
+                    self.lx.err("unterminated ${", pos + j)
+                if cur:
+                    parts.append("".join(cur))
+                    cur = []
+                parts.append(("ref", text[j + 2:k].strip()))
+                j = k + 1
+                continue
+            if c == "$":
+                m = ENV_NAME_RE.match(text, j + 1)
+                if m:
+                    if cur:
+                        parts.append("".join(cur))
+                        cur = []
+                    parts.append(("env", m.group(0)))
+                    j = m.end()
+                    continue
+            cur.append(c)
+            j += 1
+        if cur or not parts:
+            parts.append("".join(cur))
+        if len(parts) == 1 and isinstance(parts[0], str):
+            return ("lit", parts[0])
+        return ("str", parts)
 
     def parse_cache(self, task):
         lx = self.lx
@@ -724,6 +836,9 @@ class Parser:
     def parse_simple(self):
         """Declaration, assignment, increment or expression statement (no ';')."""
         lx = self.lx
+        if (lx.at("id") and lx.at("id", k=1) and lx.at_op("=", 2)
+                and lx.at("id", "CachedTask", 3) and lx.at_op("(", 4)):
+            return self.parse_cached_decl()
         if self.is_decl_start():
             t = self.parse_type()
             name = lx.expect_id("variable name").value
@@ -749,6 +864,89 @@ class Parser:
             lx.next()
             return ("incdec", e, tok.value)
         return ("expr", e)
+
+    def parse_cached_decl(self):
+        """<task> <name> = CachedTask(key.path=value, ...)"""
+        lx = self.lx
+        base_tok = lx.next()
+        alias = lx.next().value
+        lx.next()  # =
+        lx.next()  # CachedTask
+        lx.next()  # (
+        items = []
+        seen = set()
+        while not lx.at_op(")"):
+            tok = lx.peek()
+            path = [self._cached_key()]
+            while lx.accept_op("."):
+                path.append(self._cached_key())
+            if not lx.accept_op("="):
+                self.err("expected '=' after CachedTask argument '%s'" % ".".join(path), lx.peek())
+            dotted = ".".join(path)
+            if dotted in seen:
+                self.err("duplicate CachedTask argument '%s'" % dotted, tok)
+            seen.add(dotted)
+            items.append((path, self.parse_dyn_value()))
+            if not lx.accept_op(","):
+                break
+        lx.expect_op(")")
+        return ("cached_decl", base_tok.value, alias, items, base_tok.line)
+
+    def _cached_key(self):
+        lx = self.lx
+        tok = lx.peek()
+        if tok.kind == "id":
+            lx.next()
+            return tok.value
+        if tok.kind == "str" and isinstance(tok.raw, str):
+            lx.next()
+            return tok.raw
+        self.err("expected a cache parameter name, got %s" % Lexer._desc(tok), tok)
+
+    def parse_dyn_value(self):
+        lx = self.lx
+        tok = lx.peek()
+        if tok.kind == "op" and tok.value == "{":
+            lx.next()
+            items = []
+            keys = set()
+            while True:
+                tok = lx.peek()
+                if tok.kind == "op" and tok.value == "}":
+                    lx.next()
+                    return ("dobj", items)
+                if tok.kind == "op" and tok.value in (";", ","):
+                    lx.next()
+                    continue
+                if tok.kind == "eof":
+                    self.err("unterminated block", tok)
+                key = self._cached_key()
+                if key in keys:
+                    self.err("duplicate key '%s'" % key, tok)
+                keys.add(key)
+                if not (lx.accept_op(":") or lx.accept_op("=")):
+                    self.err("expected ':' after '%s'" % key, lx.peek())
+                items.append((key, self.parse_dyn_value()))
+        if tok.kind == "op" and tok.value == "[":
+            lx.next()
+            items = []
+            while True:
+                tok = lx.peek()
+                if tok.kind == "op" and tok.value == "]":
+                    lx.next()
+                    return ("list", items)
+                if tok.kind == "op" and tok.value == ",":
+                    lx.next()
+                    continue
+                if tok.kind == "eof":
+                    self.err("unterminated list", tok)
+                items.append(self.parse_dyn_value())
+        e = self.parse_expr()
+        if e[0] == "var":
+            if e[1] in ("null", "NULL", "None", "none"):
+                return ("lit", None)
+            return ("bare", e[1])
+        return e
 
     def check_target(self, e, tok):
         if e[0] not in ("var", "index"):
@@ -1289,12 +1487,67 @@ def eval_expr(e, ctx):
         return binop(e[1], eval_expr(e[2], ctx), eval_expr(e[3], ctx))
     if k == "call":
         return eval_call(e, ctx, blocking=False)
+    if k == "dobj":
+        return {kk: eval_expr(v, ctx) for kk, v in e[1]}
+    if k == "bare":
+        try:
+            v = lookup_var(e[1], ctx)
+        except InvalidPipe:
+            return e[1]
+        if isinstance(v, CachedRef):
+            raise InvalidPipe("cached task '%s' cannot be used as a value" % e[1])
+        return v
     raise InvalidPipe("bad expression")
+
+
+class CachedRef:
+    """A task with an overridden cache configuration (CachedTask)."""
+    def __init__(self, task, raw, cfg):
+        self.task = task
+        self.raw = raw
+        self.cfg = cfg
+
+
+def merge_cache(base_raw, items, where):
+    raw = copy.deepcopy(base_raw) if isinstance(base_raw, dict) else {}
+    for path, value in items:
+        cur = raw
+        for i, part in enumerate(path[:-1]):
+            nxt = cur.get(part)
+            if nxt is None:
+                nxt = cur[part] = {}
+            elif not isinstance(nxt, dict):
+                raise CacheError("cannot set '%s' in %s: '%s' is not a block"
+                                 % (".".join(path), where, ".".join(path[:i + 1])))
+            cur = nxt
+        cur[path[-1]] = copy.deepcopy(value)
+    return raw
+
+
+def make_cached_ref(task, base_raw, items, alias):
+    where = "CachedTask '%s' of task '%s'" % (alias, task.name)
+    raw = merge_cache(base_raw, items, where)
+    cfg = normalize_cache(task, raw, where)
+    return CachedRef(task, raw, cfg)
+
+
+def resolve_callable(name, ctx):
+    """Return (task, CachedRef-or-None) for a call name."""
+    v = ctx.vars.get(name) if ctx.vars else None
+    if isinstance(v, CachedRef):
+        return v.task, v
+    runner = ctx.runner
+    if name not in runner.tasks:
+        raise InvalidPipe("undefined task '%s'" % name)
+    return runner.tasks[name], None
 
 
 def lookup_var(name, ctx):
     if name in ctx.vars:
-        return ctx.vars[name]
+        v = ctx.vars[name]
+        if isinstance(v, CachedRef):
+            raise InvalidPipe("cached task '%s' cannot be used as a value" % name)
+        return v
     if ctx.mode == "success" and ctx.job is not None:
         if name == "stdout":
             return ctx.job["stdout"]
@@ -1405,13 +1658,12 @@ def eval_call(e, ctx, blocking):
 def run_task_call(e, ctx):
     _, name, args, kwargs, line = e
     runner = ctx.runner
-    if name not in runner.tasks:
-        raise InvalidPipe("undefined task '%s'" % name)
+    task, ref = resolve_callable(name, ctx)
     pos = [eval_expr(a, ctx) for a in args]
     kw = [(k, eval_expr(v, ctx)) for k, v in kwargs]
-    task = runner.tasks[name]
     bound = bind_args(task, pos, kw, runner)
-    return runner.run_task(task, bound, parent_id=ctx.job_id, parent_cwd=ctx.cwd)
+    return runner.run_task(task, bound, parent_id=ctx.job_id, parent_cwd=ctx.cwd,
+                           cache_ref=ref)
 
 
 def assign_target(target, value, ctx, decl_check=True):
@@ -1453,6 +1705,17 @@ def exec_stmt(s, ctx):
                 raise RequiresFailed()
             return
         eval_expr(e, ctx)
+        return
+    if k == "cached_decl":
+        _, base, alias, items, line = s
+        if ctx.mode != "requires":
+            raise InvalidPipe("CachedTask is only allowed in requires")
+        task, ref = resolve_callable(base, ctx)
+        base_raw = ref.raw if ref is not None else task.cache
+        vals = [(path, eval_expr(v, ctx)) for path, v in items]
+        ctx.vars[alias] = make_cached_ref(task, base_raw, vals, alias)
+        if hasattr(ctx, "vars_types"):
+            ctx.vars_types.pop(alias, None)
         return
     if k == "decl":
         _, t, name, e = s
@@ -1632,6 +1895,50 @@ def iter_exprs_in_stmts(stmts):
         elif k == "return":
             if s[1] is not None:
                 yield s[1]
+        elif k == "cached_decl":
+            for _, v in s[3]:
+                yield v
+
+
+def iter_all_stmts(stmts):
+    for s in stmts:
+        yield s
+        k = s[0]
+        if k == "if":
+            for _, b in s[1]:
+                yield from iter_all_stmts(b)
+            if s[2]:
+                yield from iter_all_stmts(s[2])
+        elif k == "while":
+            yield from iter_all_stmts(s[2])
+        elif k == "for":
+            if s[1] is not None:
+                yield from iter_all_stmts([s[1]])
+            if s[3] is not None:
+                yield from iter_all_stmts([s[3]])
+            yield from iter_all_stmts(s[4])
+
+
+def is_static_value(e, names):
+    k = e[0]
+    if k == "bare":
+        return e[1] not in names
+    if k == "dobj":
+        return all(is_static_value(v, names) for _, v in e[1])
+    if k == "list":
+        return all(is_static_value(x, names) for x in e[1])
+    return is_literal(e)
+
+
+def static_value(e):
+    k = e[0]
+    if k == "bare":
+        return e[1]
+    if k == "dobj":
+        return {kk: static_value(v) for kk, v in e[1]}
+    if k == "list":
+        return [static_value(x) for x in e[1]]
+    return literal_value(e)
 
 
 def iter_subexprs(e):
@@ -1655,6 +1962,9 @@ def iter_subexprs(e):
         for a in e[2]:
             yield from iter_subexprs(a)
         for _, a in e[3]:
+            yield from iter_subexprs(a)
+    elif k == "dobj":
+        for _, a in e[1]:
             yield from iter_subexprs(a)
 
 
@@ -1720,7 +2030,34 @@ def validate(tasks, runner):
         check_param_refs_text(task.run, task)
         check_param_refs_text(task.output, task)
         calls = []
+        aliases = {}  # alias name -> (base task, raw cache or None if dynamic)
         if task.requires:
+            varnames = {p.name for p in task.params}
+            for st in iter_all_stmts(task.requires):
+                if st[0] == "decl":
+                    varnames.add(st[2])
+                elif st[0] == "assign" and st[1][0] == "var":
+                    varnames.add(st[1][1])
+            for st in iter_all_stmts(task.requires):
+                if st[0] != "cached_decl":
+                    continue
+                _, base, alias, items, line = st
+                if base in aliases:
+                    btask, braw = aliases[base]
+                elif base in tasks:
+                    btask, braw = tasks[base], tasks[base].cache
+                else:
+                    raise InvalidPipe("CachedTask '%s' in task '%s' refers to undefined task '%s'"
+                                      % (alias, task.name, base))
+                raw = None
+                if (base not in aliases or braw is not None) and \
+                        all(is_static_value(v, varnames) for _, v in items) and alias not in aliases:
+                    raw = make_cached_ref(btask, braw,
+                                          [(pth, static_value(v)) for pth, v in items],
+                                          alias).raw
+                if alias in aliases:
+                    raw = None
+                aliases[alias] = (btask, raw)
             for e in all_subexprs(task.requires):
                 check_param_refs_expr(e, task)
                 if e[0] == "call":
@@ -1731,12 +2068,16 @@ def validate(tasks, runner):
                     elif e[1] in BUILTINS:
                         pass
                     else:
-                        if e[1] not in tasks:
+                        if e[1] in aliases:
+                            ctask = aliases[e[1]][0]
+                        elif e[1] in tasks:
+                            ctask = tasks[e[1]]
+                        else:
                             raise InvalidPipe("task '%s' requires undefined task '%s'"
                                               % (task.name, e[1]))
-                        calls.append(e[1])
+                        calls.append(ctask.name)
                         if all(is_literal(a) for a in e[2]) and all(is_literal(a) for _, a in e[3]):
-                            bind_args(tasks[e[1]], [literal_value(a) for a in e[2]],
+                            bind_args(ctask, [literal_value(a) for a in e[2]],
                                       [(k, literal_value(a)) for k, a in e[3]], runner, static=True)
         if task.success:
             for cname, kind, node in task.success:
@@ -1797,12 +2138,14 @@ def _as_bool(v, what):
     raise CacheError("%s must be a bool" % what)
 
 
-def normalize_cache(task):
+def normalize_cache(task, raw=None, where=None):
     """Validate a task's cache block and return a normalized config."""
-    raw = task.cache
+    if raw is None:
+        raw = task.cache
     if raw is None:
         return None
-    where = "cache of task '%s'" % task.name
+    if where is None:
+        where = "cache of task '%s'" % task.name
     if not isinstance(raw, dict):
         raise CacheError("%s must be a block" % where)
     for k in raw:
@@ -1958,10 +2301,10 @@ class Runner:
         self.force_refresh = set()
 
     # -- cache helpers
-    def cache_config_for(self, task):
+    def cache_config_for(self, task, ref=None):
         if not self.cache_enabled or task.name in self.force_refresh:
             return None
-        cfg = task.cache_cfg
+        cfg = ref.cfg if ref is not None else task.cache_cfg
         if cfg is None or not cfg["enabled"]:
             return None
         return cfg
@@ -2124,7 +2467,7 @@ class Runner:
             s = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", rep_env, s)
         return s
 
-    def run_task(self, task, params, parent_id=None, parent_cwd=None):
+    def run_task(self, task, params, parent_id=None, parent_cwd=None, cache_ref=None):
         if task.name in self.stack:
             raise InvalidPipe("recursive invocation of task '%s'" % task.name)
         base = parent_cwd if parent_cwd is not None else self.workspace
@@ -2172,7 +2515,7 @@ class Runner:
                 except (BreakEx, ContinueEx):
                     raise InvalidPipe("break/continue outside of loop in task '%s'" % task.name)
             success = {}
-            cfg = self.cache_config_for(task)
+            cfg = self.cache_config_for(task, cache_ref)
             inputs = None
             if task.inputs is not None:
                 inputs = self.resolve_inputs(task, params, cwd, output_abs)
@@ -2247,7 +2590,8 @@ class Runner:
                 "parent": parent_id,
                 "duration": duration,
                 "inputs": inputs,
-                "cache": task.cache if cfg is not None else None,
+                "cache": ((cache_ref.raw if cache_ref is not None else task.cache)
+                          if cfg is not None else None),
             }
             if cfg is not None:
                 rec["cache_hit"] = hit
