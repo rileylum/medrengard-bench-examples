@@ -332,6 +332,95 @@ def validate_access(acc_in, errors):
     return access
 
 
+EXPOSURE_TYPES = ("Gateway", "DirectPort", "Balancer")
+EXPOSURE_FIELDS = {
+    "Gateway": ("hostname", "annotations"),
+    "DirectPort": ("port", "directPort"),
+    "Balancer": ("port",),
+}
+DEFAULT_EXPOSURE_PORT = 11222
+MANAGEMENT_PORT = 9990
+
+
+def valid_port(v):
+    return is_int(v) and 1 <= v <= 65535
+
+
+def validate_exposure(exp_in, errors):
+    base = "spec.exposure"
+    if not isinstance(exp_in, dict):
+        errors.append(err(base, "exposure must be a mapping", "invalid"))
+        return None
+    etype = exp_in.get("type")
+    if etype is None or etype == "":
+        errors.append(err(base + ".type", "exposure type is required", "required"))
+        return None
+    if etype not in EXPOSURE_TYPES:
+        errors.append(err(base + ".type", "exposure type must be one of %s, got %r"
+                          % (", ".join(EXPOSURE_TYPES), etype), "invalid"))
+        return None
+    allowed = EXPOSURE_FIELDS[etype]
+    exp = {"type": etype}
+    for k, v in exp_in.items():
+        if k == "type":
+            continue
+        p = "%s.%s" % (base, k)
+        if k not in allowed:
+            errors.append(err(p, "field '%s' is forbidden for exposure type %r" % (p, etype),
+                              "forbidden"))
+            continue
+        if v is None:
+            continue
+        if k == "hostname":
+            if not isinstance(v, str) or v == "":
+                errors.append(err(p, "hostname must be a non-empty string", "invalid"))
+            else:
+                exp[k] = v
+        elif k == "annotations":
+            if not isinstance(v, dict) or not all(
+                    isinstance(ak, str) and isinstance(av, str) for ak, av in v.items()):
+                errors.append(err(p, "annotations must be a mapping of string to string",
+                                  "invalid"))
+            else:
+                exp[k] = dict(v)
+        elif k in ("port", "directPort"):
+            if not valid_port(v):
+                errors.append(err(p, "%s must be an integer between 1 and 65535, got %r"
+                                  % (k, v), "invalid"))
+            else:
+                exp[k] = v
+    if "port" in allowed and "port" not in exp:
+        if not any(e["field"] == base + ".port" for e in errors):
+            exp["port"] = DEFAULT_EXPOSURE_PORT
+    return exp
+
+
+def connection_details(name, spec):
+    exp = spec.get("exposure")
+    if not isinstance(exp, dict):
+        return None
+    etype = exp.get("type")
+    if etype == "Gateway":
+        host = exp.get("hostname") or "%s-gateway" % name
+        port = 443
+    elif etype == "DirectPort":
+        host = name
+        port = exp.get("directPort") or DEFAULT_EXPOSURE_PORT
+    elif etype == "Balancer":
+        host = "%s-external" % name
+        port = exp.get("port") or DEFAULT_EXPOSURE_PORT
+    else:
+        return None
+    return {"host": host, "port": port, "protocol": "https"}
+
+
+def management_details(name, spec):
+    mg = spec.get("management")
+    if isinstance(mg, dict) and mg.get("enabled") is True:
+        return {"host": "%s-admin" % name, "port": MANAGEMENT_PORT, "protocol": "https"}
+    return None
+
+
 def validate(doc, update=False):
     """Validate a document. With update=True the spec is an already-merged spec
     (stored values + provided fields) and instances may be 0."""
@@ -504,6 +593,28 @@ def validate(doc, update=False):
                               % (rf, spec["instances"]), "invalid"))
     spec["network"] = network
 
+    # exposure
+    if "exposure" in spec_in and spec_in["exposure"] is not None:
+        exp = validate_exposure(spec_in["exposure"], errors)
+        if exp is not None:
+            spec["exposure"] = exp
+
+    # management endpoint
+    mg_in = spec_in.get("management")
+    if mg_in is None:
+        mg_in = {}
+    management = {"enabled": False}
+    if not isinstance(mg_in, dict):
+        errors.append(err("spec.management", "management must be a mapping", "invalid"))
+    else:
+        men = mg_in.get("enabled")
+        if men is not None:
+            if not isinstance(men, bool):
+                errors.append(err("spec.management.enabled", "enabled must be a boolean", "invalid"))
+            else:
+                management["enabled"] = men
+    spec["management"] = management
+
     result["spec"] = spec
     return result, name, errors
 
@@ -580,6 +691,14 @@ def render(resource):
         m = st["migration"]
         st["migration"] = {k: m[k] for k in ("sourceRuntime", "stage", "targetRuntime") if k in m}
     r["status"] = {k: st[k] for k in order if k in st}
+    name = (r.get("metadata") or {}).get("name")
+    spec = r.get("spec", {})
+    cd = connection_details(name, spec)
+    if cd is not None:
+        r["status"]["connectionDetails"] = cd
+    md = management_details(name, spec)
+    if md is not None:
+        r["status"]["managementConnectionDetails"] = md
     return r
 
 
@@ -608,6 +727,18 @@ def reconcile_access(merged, patch):
                 enc.pop(fname, None)
         if src == "None" and "clientMode" not in penc:
             enc.pop("clientMode", None)
+
+
+def reconcile_exposure(merged, stored_spec, patch):
+    """When the exposure type changes, discard stored fields of the old mode
+    (including defaulted ones) so only the patch's fields apply."""
+    pexp = patch.get("exposure")
+    sexp = stored_spec.get("exposure")
+    if not isinstance(pexp, dict) or not isinstance(sexp, dict):
+        return
+    ptype = pexp.get("type")
+    if ptype is not None and ptype != sexp.get("type"):
+        merged["exposure"] = {k: v for k, v in pexp.items() if v is not None}
 
 
 def deep_merge(base, patch):
@@ -728,7 +859,18 @@ def cmd_update(args):
 
     merged_spec = deep_merge(stored["spec"], spec_patch)
     reconcile_access(merged_spec, spec_patch)
+    reconcile_exposure(merged_spec, stored["spec"], spec_patch)
     resource, _, errors = validate({"metadata": {"name": raw_name}, "spec": merged_spec}, update=True)
+
+    # immutable management endpoint flag
+    old_mg = (stored["spec"].get("management") or {}).get("enabled", False)
+    mg_patch = spec_patch.get("management")
+    if isinstance(mg_patch, dict) and isinstance(mg_patch.get("enabled"), bool) \
+            and mg_patch["enabled"] != old_mg:
+        errors = [e for e in errors if e["field"] != "spec.management.enabled"]
+        errors.append(err("spec.management.enabled",
+                          "field 'spec.management.enabled' is immutable after creation",
+                          "immutable"))
 
     # immutable storage size
     new_size = None
@@ -864,6 +1006,21 @@ def cmd_migrate(args):
     st["stable"] = compute_stable(st)
     save_store(store)
     out(render(r))
+    return 0
+
+
+def cmd_shell(args):
+    name = get_name(args)
+    if not name:
+        return fail([err("metadata.name", "name is required", "required")])
+    store = load_store()
+    if name not in store:
+        return fail([err("metadata.name", "mesh %r not found" % name, "not_found")])
+    cd = connection_details(name, store[name].get("spec", {}))
+    if cd is None:
+        return fail([err("spec.exposure", "mesh '%s' has no exposure configured" % name,
+                         "invalid")])
+    out(cd)
     return 0
 
 
@@ -1489,6 +1646,7 @@ COMMANDS = {
     "delete": cmd_delete,
     "update": cmd_update,
     "migrate": cmd_migrate,
+    "shell": cmd_shell,
 }
 
 
@@ -1498,7 +1656,7 @@ def main(argv):
              "snapshot": make_oneshot_commands("snapshot"),
              "recovery": make_oneshot_commands("recovery")}.get(argv[0] if argv else None)
     if table is None or len(argv) < 2 or argv[1] not in table:
-        return fail([err("", "usage: meshctl.py <mesh|vault|task|snapshot|recovery> <create|list|describe|delete|update|run> [arguments]",
+        return fail([err("", "usage: meshctl.py <mesh|vault|task|snapshot|recovery> <create|list|describe|delete|update|run|migrate|shell> [arguments]",
                          "invalid")])
     return table[argv[1]](argv[2:])
 
