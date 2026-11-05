@@ -1,0 +1,3 @@
+# No third-party dependencies: dynamic_buffer.py and the generated Python
+# modules use only the standard library (Python >= 3.8). Generated
+# JavaScript modules use only Node.js built-ins.
