@@ -1,7 +1,26 @@
 #!/usr/bin/env python3
-"""dynamic_buffer.py - infer a row-wise transformation from a sample
-input/output pair and generate a streaming ``DynamicPreprocessor`` module
-(Python package or Node.js module) that applies it.
+"""dynamic_buffer.py - infer a transformation from a sample input/output pair
+and generate a streaming ``DynamicPreprocessor`` module (Python package or
+Node.js module) that applies it.
+
+Supported transformations:
+  * row filters: CNF/DNF of column-vs-constant comparisons, column equality,
+    and neighbor predicates on the previous / next input row (one row of
+    lookahead, e.g. "drop a row whose next row is a duplicate", "keep only the
+    first / last row of a run");
+  * per-row columns: copy/rename, constants, linear, string cleanup, affixes,
+    splits, concatenation, two-column arithmetic;
+  * stateful columns: prefix (cumulative) and sliding-window (W <= 64)
+    sum / mean / min / max / predicate counts with ``a * S + b``, counters and
+    segment ids (increment on a predicate, a value change or a threshold
+    crossing), cyclic labels, rule-driven state machines (<= 16 labels),
+    lag and difference to the previous row.  Each is computed either over all
+    input rows or over the rows that survive the filter.
+
+The generated module keeps only the state it needs (aggregates, window tails,
+previous row, current label, the row awaiting lookahead) and, with
+``cache_dir``, checkpoints it at every buffer boundary so runs can stop and
+resume anywhere with output identical to a single pass.
 
 Usage:
     python dynamic_buffer.py <module_name> --output <dir> --sample <dir> \
@@ -201,23 +220,46 @@ def _apply(t, row):
     return None
 
 
-def _filt(f, row):
+def _filt(f, row, prev=None, nxt=None):
     if f is None:
         return True
     k = f['k']
     if k == 'and':
         for a in f['args']:
-            if not _filt(a, row):
+            if not _filt(a, row, prev, nxt):
                 return False
         return True
     if k == 'or':
         for a in f['args']:
-            if _filt(a, row):
+            if _filt(a, row, prev, nxt):
                 return True
         return False
     if k == 'const':
         return f['v']
-    v = row.get(f['col'])
+    if k == 'edge':
+        if prev is None:
+            return False
+        c = bool(_filt(f['arg'], row))
+        p = bool(_filt(f['arg'], prev))
+        m = f['mode']
+        if m == 'rise':
+            return c and not p
+        if m == 'fall':
+            return p and not c
+        return c != p
+    if k == 'same':
+        nb = prev if f['rel'] < 0 else nxt
+        r = nb is not None and _eq(row.get(f['col']), nb.get(f['col']))
+        return r if f['op'] == '==' else not r
+    if k == 'colcmp':
+        r = _eq(row.get(f['a']), row.get(f['b']))
+        return r if f['op'] == '==' else not r
+    rel = f.get('rel', 0)
+    if rel:
+        src = prev if rel < 0 else nxt
+        v = None if src is None else src.get(f['col'])
+    else:
+        v = row.get(f['col'])
     op = f['op']
     if k == 'eq':
         r = _eq(v, f['v'])
@@ -257,6 +299,230 @@ def _transform_row(spec, raw):
     out = {}
     for name, t in spec['columns']:
         out[name] = _apply(t, raw)
+    return out
+
+
+def _isint(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _acc_new():
+    # [phase(0 = ints only so far, 1 = float), int partial, float sum, compensation]
+    return [0, 0, 0.0, 0.0]
+
+
+def _acc_add(acc, x, neu):
+    """Add x to an accumulator.  neu=False: plain left-to-right ``s + x``;
+    neu=True: the Neumaier-compensated algorithm of CPython 3.12+ sum()."""
+    if not neu:
+        acc[1] = acc[1] + x
+        return
+    if acc[0] == 0:
+        if _isint(x):
+            acc[1] = acc[1] + x
+            return
+        acc[0] = 1
+        acc[2] = acc[1] + x
+        acc[3] = 0.0
+        return
+    if _isint(x):
+        acc[2] = acc[2] + float(x)
+        return
+    x = float(x)
+    f = acc[2]
+    s = f + x
+    if abs(f) >= abs(x):
+        acc[3] += (f - s) + x
+    else:
+        acc[3] += (x - s) + f
+    acc[2] = s
+
+
+def _acc_val(acc, neu):
+    if not neu or acc[0] == 0:
+        return acc[1]
+    f = acc[2]
+    c = acc[3]
+    if c and c - c == 0:
+        f = f + c
+    return f
+
+
+def _st_init(t):
+    k = t['kind']
+    if k == 'agg':
+        if t['w']:
+            return {'win': [], 'n': 0}
+        return {'a': _acc_new(), 'c': 0, 'm': None, 'n': 0}
+    if k == 'counter':
+        return {'c': 0}
+    if k == 'lag':
+        return {'h': []}
+    if k == 'diff':
+        return {'p': None, 'n': 0}
+    if k == 'fsm':
+        return {'v': t['init']}
+    return {}
+
+
+def _st_step(t, st, raw, prev):
+    """Advance one stateful column by one row; return the series value."""
+    k = t['kind']
+    if k == 'agg':
+        fn = t['fn']
+        neu = t.get('acc') == 'neu'
+        if fn == 'count':
+            x = 1 if _filt(t['cond'], raw, prev) else 0
+        else:
+            x = _num(raw.get(t['src']))
+        st['n'] += 1
+        w = t['w']
+        if w:
+            win = st['win']
+            win.append(x)
+            if len(win) > w:
+                del win[0]
+            acc = _acc_new()
+            c = 0
+            m = None
+            for v in win:
+                if v is None:
+                    continue
+                _acc_add(acc, v, neu)
+                c += 1
+                if m is None or (fn == 'min' and v < m) or (fn == 'max' and v > m):
+                    m = v
+            s = _acc_val(acc, neu)
+        else:
+            if x is not None:
+                _acc_add(st['a'], x, neu)
+                st['c'] += 1
+                m = st['m']
+                if m is None or (fn == 'min' and x < m) or (fn == 'max' and x > m):
+                    st['m'] = x
+            s = _acc_val(st['a'], neu)
+            c = st['c']
+            m = st['m']
+        if t.get('full') and st['n'] < w:
+            return None
+        if fn == 'sum' or fn == 'count':
+            return s
+        if fn == 'mean':
+            return s / c if c else None
+        return m
+    if k == 'counter':
+        if _filt(t['cond'], raw, prev):
+            st['c'] += 1
+        return st['c']
+    if k == 'lag':
+        h = st['h']
+        kk = t['k']
+        r = h[0] if len(h) >= kk else None
+        has = len(h) >= kk
+        h.append(raw.get(t['src']))
+        if len(h) > kk:
+            del h[0]
+        return [r] if has else None
+    if k == 'diff':
+        x = _num(raw.get(t['src']))
+        p = st['p']
+        st['n'] += 1
+        st['p'] = x
+        if x is None or p is None:
+            return None
+        return x - p
+    if k == 'fsm':
+        for cond, label in t['rules']:
+            if _filt(cond, raw, prev):
+                st['v'] = label
+                break
+        return st['v']
+    return None
+
+
+def _st_out(t, s):
+    if s is None:
+        return t['none']
+    k = t['kind']
+    if k == 'lag':
+        return s[0]
+    if k == 'fsm':
+        return s
+    labels = t.get('labels')
+    if labels is not None:
+        return labels[s % len(labels)]
+    p = t.get('post')
+    if p is None:
+        return s
+    return _apply(p, {'_s': s})
+
+
+def _new_state(spec):
+    return {'prev': None, 'pk': None, 'pend': None, 'hp': False,
+            'st': [(_st_init(t) if t['type'] == 'st' else None) for _, t in spec['columns']]}
+
+
+class _Engine(object):
+    """Row-at-a-time state machine: neighbor-aware filtering (one row of
+    lookahead) plus stateful columns.  All state lives in ``self.s`` which is
+    plain JSON so it can be checkpointed and restored."""
+
+    def __init__(self, spec, state=None):
+        self.spec = spec
+        self.cols = spec['columns']
+        self.filt = spec['filter']
+        self.look = bool(spec.get('lookahead'))
+        self.s = _new_state(spec) if state is None else state
+
+    def push(self, raw):
+        s = self.s
+        if not self.look:
+            return self._proc(raw, None)
+        out = self._proc(s['pend'], raw) if s['hp'] else []
+        s['pend'] = raw
+        s['hp'] = True
+        return out
+
+    def finish(self):
+        s = self.s
+        if self.look and s['hp']:
+            r = s['pend']
+            s['pend'] = None
+            s['hp'] = False
+            return self._proc(r, None)
+        return []
+
+    def _proc(self, raw, nxt):
+        s = self.s
+        prev = s['prev']
+        keep = _filt(self.filt, raw, prev, nxt)
+        sts = s['st']
+        vals = {}
+        for i, (name, t) in enumerate(self.cols):
+            if t['type'] == 'st' and t['scope'] == 'all':
+                vals[i] = _st_out(t, _st_step(t, sts[i], raw, prev))
+        s['prev'] = raw
+        if not keep:
+            return []
+        pk = s['pk']
+        out = {}
+        for i, (name, t) in enumerate(self.cols):
+            if t['type'] == 'st':
+                if t['scope'] != 'all':
+                    vals[i] = _st_out(t, _st_step(t, sts[i], raw, pk))
+                out[name] = vals[i]
+            else:
+                out[name] = _apply(t, raw)
+        s['pk'] = raw
+        return [out]
+
+
+def _run_engine(spec, rows):
+    eng = _Engine(spec)
+    out = []
+    for r in rows:
+        out.extend(eng.push(r))
+    out.extend(eng.finish())
     return out
 '''
 
@@ -362,8 +628,13 @@ def _write_int(fh, value):
 class DynamicPreprocessor(object):
     """Streams a data file, applying the inferred filter/column transforms.
 
-    buffer    -- maximum number of rows held in memory at once.
-    cache_dir -- optional directory for caching / resuming.
+    buffer    -- maximum number of input rows read and processed at once.
+    cache_dir -- optional directory for caching / resuming.  Besides the
+                 consumed-row counter, a checkpoint of the streaming state
+                 (running aggregates, window tails, state-machine labels,
+                 previous row and the row awaiting its lookahead) is stored
+                 at every buffer boundary so a later run resumes exactly
+                 where the previous one stopped.
     """
 
     def __init__(self, buffer=1024, cache_dir=None):
@@ -383,24 +654,42 @@ class DynamicPreprocessor(object):
         return self._run(_os.fspath(path))
 
     def transform(self, row):
-        return _transform_row(SPEC, row)
+        return _Engine(dict(SPEC, filter=None, lookahead=False))._proc(row, None)[0]
 
-    def _compute(self, path):
-        filt = SPEC['filter']
+    def _compute(self, path, ck=None, save=None):
         size = self.buffer
-        batch = []
-        for raw in _read_raw(path):
-            batch.append(raw)
-            if len(batch) >= size:
-                out = [_transform_row(SPEC, r) for r in batch if _filt(filt, r)]
-                batch = []
-                for row in out:
-                    yield row
-        if batch:
-            out = [_transform_row(SPEC, r) for r in batch if _filt(filt, r)]
+        eng = _Engine(SPEC, ck['state'] if ck else None)
+        n_in = ck['in'] if ck else 0
+        emitted = ck['out'] if ck else 0
+        it = iter(_read_raw(path))
+        skipped = 0
+        while skipped < n_in:
+            try:
+                next(it)
+            except StopIteration:
+                break
+            skipped += 1
+        while True:
+            if save is not None:
+                save(n_in, emitted, eng.s)
             batch = []
+            for raw in it:
+                batch.append(raw)
+                if len(batch) >= size:
+                    break
+            if not batch:
+                break
+            out = []
+            for raw in batch:
+                out.extend(eng.push(raw))
+            n_in += len(batch)
+            batch = []
+            emitted += len(out)
             for row in out:
                 yield row
+        out = eng.finish()
+        for row in out:
+            yield row
 
     def _read_cached(self, rows_path):
         size = self.buffer
@@ -431,6 +720,7 @@ class DynamicPreprocessor(object):
         meta_p = _os.path.join(d, 'meta.json')
         prog_p = _os.path.join(d, 'progress')
         rows_p = _os.path.join(d, 'rows.jsonl')
+        state_p = _os.path.join(d, 'state.json')
         st = _os.stat(path)
         meta = {'path': apath, 'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'spec': _SPEC_ID}
         old = None
@@ -440,7 +730,7 @@ class DynamicPreprocessor(object):
         except (OSError, ValueError):
             old = None
         if old != meta:
-            for p in (prog_p, rows_p):
+            for p in (prog_p, rows_p, state_p):
                 try:
                     _os.remove(p)
                 except OSError:
@@ -459,7 +749,24 @@ class DynamicPreprocessor(object):
             start = 0
         complete = _os.path.exists(rows_p)
         build = (not complete) and start == 0
-        source = self._read_cached(rows_p) if complete else self._compute(path)
+        ck = None
+        if not complete and start > 0:
+            try:
+                with open(state_p, 'r', encoding='utf-8') as f:
+                    ck = _json.load(f)
+                if not (isinstance(ck, dict) and ck.get('spec') == _SPEC_ID
+                        and 0 <= ck['out'] <= start and ck['in'] >= 0):
+                    ck = None
+            except (OSError, ValueError, KeyError, TypeError):
+                ck = None
+
+        def save(n_in, emitted, state):
+            tmp = state_p + '.%d.tmp' % _os.getpid()
+            with open(tmp, 'w', encoding='utf-8') as f:
+                _json.dump({'spec': _SPEC_ID, 'in': n_in, 'out': emitted, 'state': state}, f)
+            _os.replace(tmp, state_p)
+
+        source = self._read_cached(rows_p) if complete else self._compute(path, ck, save)
         tmp_rows = rows_p + '.%d.tmp' % _os.getpid()
         tf = None
         pf = open(prog_p, 'r+b' if _os.path.exists(prog_p) else 'w+b')
@@ -467,7 +774,7 @@ class DynamicPreprocessor(object):
             if build:
                 tf = open(tmp_rows, 'w', encoding='utf-8')
             wbuf = []
-            idx = 0
+            idx = ck['out'] if ck else 0
             for row in source:
                 if tf is not None:
                     wbuf.append(_json.dumps(row))
@@ -487,6 +794,10 @@ class DynamicPreprocessor(object):
                 _os.replace(tmp_rows, rows_p)
                 tf = None
             _write_int(pf, 0)
+            try:
+                _os.remove(state_p)
+            except OSError:
+                pass
         finally:
             pf.close()
             if tf is not None:
@@ -636,11 +947,45 @@ function _roundHalfEven0(y) {
   return f % 2 === 0 ? f : f + 1;
 }
 
+// Python round(y, d) for d > 0: nearest decimal, exact ties to even.
+function _roundPos(y, d) {
+  const a = Math.abs(y);
+  if (!(a < 1e21)) return y;
+  const s = a.toFixed(Math.min(100, d + 40));
+  const dot = s.indexOf(".");
+  const rest = s.slice(dot + 1 + d);
+  if (rest[0] === "5" && /^50*$/.test(rest)) {
+    const kept = s.slice(0, dot + 1 + d);
+    const last = kept.charCodeAt(kept.length - 1) - 48;
+    let r = Number(kept);
+    if (last % 2 !== 0) {
+      // Build the incremented decimal string exactly.
+      const digits = kept.replace(".", "").split("");
+      let i = digits.length - 1;
+      while (i >= 0) {
+        if (digits[i] === "9") {
+          digits[i] = "0";
+          i--;
+        } else {
+          digits[i] = String.fromCharCode(digits[i].charCodeAt(0) + 1);
+          break;
+        }
+      }
+      let str = digits.join("");
+      if (i < 0) str = "1" + str;
+      r = Number(str.slice(0, str.length - d) + "." + str.slice(str.length - d));
+    }
+    return y < 0 ? -r : r;
+  }
+  const r = Number(a.toFixed(d));
+  return y < 0 ? -r : r;
+}
+
 function _round(y, d) {
   if (d === null || d === undefined) return y;
   if (!isFinite(y)) return y;
   if (d === 0) return _roundHalfEven0(y);
-  if (d > 0) return Number(y.toFixed(Math.min(d, 100)));
+  if (d > 0) return _roundPos(y, Math.min(d, 60));
   const m = Math.pow(10, -d);
   return _roundHalfEven0(y / m) * m;
 }
@@ -655,7 +1000,12 @@ function _fmt(y, fmt) {
   if (k === "int") return _roundHalfEven0(y);
   if (k === "s_g") return _isInt(y) ? String(y) : _pyFloatRepr(y);
   if (k === "s_int") return String(_roundHalfEven0(y));
-  if (k === "s_fixed") return y.toFixed(fmt[1]);
+  if (k === "s_fixed") {
+    if (!isFinite(y) || Math.abs(y) >= 1e21) return y.toFixed(fmt[1]);
+    let s = _roundPos(y, fmt[1]).toFixed(fmt[1]);
+    if ((y < 0 || Object.is(y, -0)) && s[0] !== "-") s = "-" + s;
+    return s;
+  }
   if (k === "s_repr") return _pyFloatRepr(y);
   return y;
 }
@@ -732,19 +1082,43 @@ function _apply(t, row) {
   return null;
 }
 
-function _filt(f, row) {
+function _filt(f, row, prev, nxt) {
   if (f === null || f === undefined) return true;
+  if (prev === undefined) prev = null;
+  if (nxt === undefined) nxt = null;
   const k = f.k;
   if (k === "and") {
-    for (const a of f.args) if (!_filt(a, row)) return false;
+    for (const a of f.args) if (!_filt(a, row, prev, nxt)) return false;
     return true;
   }
   if (k === "or") {
-    for (const a of f.args) if (_filt(a, row)) return true;
+    for (const a of f.args) if (_filt(a, row, prev, nxt)) return true;
     return false;
   }
   if (k === "const") return f.v;
-  const v = _get(row, f.col);
+  if (k === "edge") {
+    if (prev === null) return false;
+    const c = !!_filt(f.arg, row, null, null);
+    const p = !!_filt(f.arg, prev, null, null);
+    if (f.mode === "rise") return c && !p;
+    if (f.mode === "fall") return p && !c;
+    return c !== p;
+  }
+  if (k === "same") {
+    const nb = f.rel < 0 ? prev : nxt;
+    const r = nb !== null && _eq(_get(row, f.col), _get(nb, f.col));
+    return f.op === "==" ? r : !r;
+  }
+  if (k === "colcmp") {
+    const r = _eq(_get(row, f.a), _get(row, f.b));
+    return f.op === "==" ? r : !r;
+  }
+  const rel = f.rel || 0;
+  let v;
+  if (rel) {
+    const src = rel < 0 ? prev : nxt;
+    v = src === null ? null : _get(src, f.col);
+  } else v = _get(row, f.col);
   const op = f.op;
   if (k === "eq") {
     const r = _eq(v, f.v);
@@ -778,6 +1152,214 @@ function _transformRow(raw) {
   const out = {};
   for (const [name, t] of SPEC.columns) out[name] = _apply(t, raw);
   return out;
+}
+
+// Whether Python would see this value as an int (vs float) after _num().
+function _numIsInt(row, c) {
+  const v = _get(row, c);
+  if (typeof v === "string") return INT_RE.test(v);
+  if (typeof v === "number") return Number.isInteger(v) && !_isFloatKey(row, c);
+  return false;
+}
+
+function _accNew() {
+  return [0, 0, 0.0, 0.0];
+}
+
+// neu=false: plain left-to-right s + x; neu=true: CPython 3.12+ sum() (Neumaier).
+function _accAdd(acc, x, isInt, neu) {
+  if (!neu) {
+    acc[1] = acc[1] + x;
+    return;
+  }
+  if (acc[0] === 0) {
+    if (isInt) {
+      acc[1] = acc[1] + x;
+      return;
+    }
+    acc[0] = 1;
+    acc[2] = acc[1] + x;
+    acc[3] = 0.0;
+    return;
+  }
+  if (isInt) {
+    acc[2] = acc[2] + x;
+    return;
+  }
+  const f = acc[2];
+  const s = f + x;
+  if (Math.abs(f) >= Math.abs(x)) acc[3] += f - s + x;
+  else acc[3] += x - s + f;
+  acc[2] = s;
+}
+
+function _accVal(acc, neu) {
+  if (!neu || acc[0] === 0) return acc[1];
+  let f = acc[2];
+  const c = acc[3];
+  if (c && c - c === 0) f = f + c;
+  return f;
+}
+
+function _stInit(t) {
+  const k = t.kind;
+  if (k === "agg") return t.w ? { win: [], n: 0 } : { a: _accNew(), c: 0, m: null, n: 0 };
+  if (k === "counter") return { c: 0 };
+  if (k === "lag") return { h: [] };
+  if (k === "diff") return { p: null, n: 0 };
+  if (k === "fsm") return { v: t.init };
+  return {};
+}
+
+function _stStep(t, st, raw, prev) {
+  const k = t.kind;
+  if (k === "agg") {
+    const fn = t.fn;
+    const neu = t.acc === "neu";
+    let x, xi;
+    if (fn === "count") {
+      x = _filt(t.cond, raw, prev, null) ? 1 : 0;
+      xi = true;
+    } else {
+      x = _num(_get(raw, t.src));
+      xi = x !== null && _numIsInt(raw, t.src);
+    }
+    st.n += 1;
+    const w = t.w;
+    let s, c, m;
+    if (w) {
+      const win = st.win;
+      win.push(x === null ? null : [x, xi]);
+      if (win.length > w) win.shift();
+      const acc = _accNew();
+      c = 0;
+      m = null;
+      for (const e of win) {
+        if (e === null) continue;
+        const v = e[0];
+        _accAdd(acc, v, e[1], neu);
+        c += 1;
+        if (m === null || (fn === "min" && v < m) || (fn === "max" && v > m)) m = v;
+      }
+      s = _accVal(acc, neu);
+    } else {
+      if (x !== null) {
+        _accAdd(st.a, x, xi, neu);
+        st.c += 1;
+        const mm = st.m;
+        if (mm === null || (fn === "min" && x < mm) || (fn === "max" && x > mm)) st.m = x;
+      }
+      s = _accVal(st.a, neu);
+      c = st.c;
+      m = st.m;
+    }
+    if (t.full && st.n < w) return null;
+    if (fn === "sum" || fn === "count") return s;
+    if (fn === "mean") return c ? s / c : null;
+    return m;
+  }
+  if (k === "counter") {
+    if (_filt(t.cond, raw, prev, null)) st.c += 1;
+    return st.c;
+  }
+  if (k === "lag") {
+    const h = st.h;
+    const kk = t.k;
+    const has = h.length >= kk;
+    const r = has ? h[0] : null;
+    h.push(_get(raw, t.src));
+    if (h.length > kk) h.shift();
+    return has ? [r] : null;
+  }
+  if (k === "diff") {
+    const x = _num(_get(raw, t.src));
+    const p = st.p;
+    st.n += 1;
+    st.p = x;
+    if (x === null || p === null) return null;
+    return x - p;
+  }
+  if (k === "fsm") {
+    for (const [cond, label] of t.rules) {
+      if (_filt(cond, raw, prev, null)) {
+        st.v = label;
+        break;
+      }
+    }
+    return st.v;
+  }
+  return null;
+}
+
+function _stOut(t, s) {
+  if (s === null || s === undefined) return t.none === undefined ? null : t.none;
+  const k = t.kind;
+  if (k === "lag") return s[0];
+  if (k === "fsm") return s;
+  if (t.labels !== undefined && t.labels !== null) return t.labels[s % t.labels.length];
+  if (t.post === undefined || t.post === null) return s;
+  return _apply(t.post, { _s: s });
+}
+
+function _newState() {
+  return {
+    prev: null,
+    pk: null,
+    pend: null,
+    hp: false,
+    st: SPEC.columns.map(([, t]) => (t.type === "st" ? _stInit(t) : null)),
+  };
+}
+
+class _Engine {
+  constructor(spec, state) {
+    this.cols = spec.columns;
+    this.filt = spec.filter;
+    this.look = !!spec.lookahead;
+    this.s = state ? state : _newState();
+  }
+  push(raw) {
+    const s = this.s;
+    if (!this.look) return this._proc(raw, null);
+    const out = s.hp ? this._proc(s.pend, raw) : [];
+    s.pend = raw;
+    s.hp = true;
+    return out;
+  }
+  finish() {
+    const s = this.s;
+    if (this.look && s.hp) {
+      const r = s.pend;
+      s.pend = null;
+      s.hp = false;
+      return this._proc(r, null);
+    }
+    return [];
+  }
+  _proc(raw, nxt) {
+    const s = this.s;
+    const prev = s.prev;
+    const keep = _filt(this.filt, raw, prev, nxt);
+    const sts = s.st;
+    const vals = new Array(this.cols.length);
+    for (let i = 0; i < this.cols.length; i++) {
+      const t = this.cols[i][1];
+      if (t.type === "st" && t.scope === "all") vals[i] = _stOut(t, _stStep(t, sts[i], raw, prev));
+    }
+    s.prev = raw;
+    if (!keep) return [];
+    const pk = s.pk;
+    const out = {};
+    for (let i = 0; i < this.cols.length; i++) {
+      const [name, t] = this.cols[i];
+      if (t.type === "st") {
+        if (t.scope !== "all") vals[i] = _stOut(t, _stStep(t, sts[i], raw, pk));
+        out[name] = vals[i];
+      } else out[name] = _apply(t, raw);
+    }
+    s.pk = raw;
+    return [out];
+  }
 }
 
 const CHUNK = 1 << 16;
@@ -934,23 +1516,35 @@ function _readRaw(path) {
 
 const SPEC_ID = crypto.createHash("sha256").update(JSON.stringify(SPEC)).digest("hex").slice(0, 16);
 
-function* _compute(path, size) {
-  const filt = SPEC.filter;
-  let batch = [];
-  for (const raw of _readRaw(path)) {
-    batch.push(raw);
-    if (batch.length >= size) {
+function* _compute(path, size, ck, save) {
+  const eng = new _Engine(SPEC, ck ? ck.state : null);
+  let nIn = ck ? ck.in : 0;
+  let emitted = ck ? ck.out : 0;
+  const it = _readRaw(path)[Symbol.iterator]();
+  let skipped = 0;
+  while (skipped < nIn) {
+    if (it.next().done) break;
+    skipped++;
+  }
+  try {
+    for (;;) {
+      if (save) save(nIn, emitted, eng.s);
+      const batch = [];
+      while (batch.length < size) {
+        const r = it.next();
+        if (r.done) break;
+        batch.push(r.value);
+      }
+      if (!batch.length) break;
       const out = [];
-      for (const r of batch) if (_filt(filt, r)) out.push(_transformRow(r));
-      batch = [];
+      for (const raw of batch) for (const o of eng.push(raw)) out.push(o);
+      nIn += batch.length;
+      emitted += out.length;
       yield* out;
     }
-  }
-  if (batch.length) {
-    const out = [];
-    for (const r of batch) if (_filt(filt, r)) out.push(_transformRow(r));
-    batch = [];
-    yield* out;
+    yield* eng.finish();
+  } finally {
+    if (typeof it.return === "function") it.return();
   }
 }
 
@@ -986,7 +1580,7 @@ function _rm(p) {
 function* _run(path, size, cacheDir) {
   path = String(path);
   if (cacheDir === null || cacheDir === undefined) {
-    yield* _compute(path, size);
+    yield* _compute(path, size, null, null);
     return;
   }
   const apath = nodePath.resolve(path);
@@ -996,6 +1590,7 @@ function* _run(path, size, cacheDir) {
   const metaP = nodePath.join(d, "meta.json");
   const progP = nodePath.join(d, "progress");
   const rowsP = nodePath.join(d, "rows.jsonl");
+  const stateP = nodePath.join(d, "state.json");
   const st = fs.statSync(path, { bigint: true });
   const meta = JSON.stringify({ path: apath, size: String(st.size), mtime_ns: String(st.mtimeNs), spec: SPEC_ID });
   let old = null;
@@ -1007,6 +1602,7 @@ function* _run(path, size, cacheDir) {
   if (old !== meta) {
     _rm(progP);
     _rm(rowsP);
+    _rm(stateP);
     fs.writeFileSync(metaP + ".tmp", meta);
     fs.renameSync(metaP + ".tmp", metaP);
   }
@@ -1019,14 +1615,28 @@ function* _run(path, size, cacheDir) {
   }
   const complete = fs.existsSync(rowsP);
   const build = !complete && start === 0;
-  const source = complete ? _readCached(rowsP, size) : _compute(path, size);
+  let ck = null;
+  if (!complete && start > 0) {
+    try {
+      ck = _parseRow(fs.readFileSync(stateP, "utf8"));
+      if (!(ck && ck.spec === SPEC_ID && ck.out >= 0 && ck.out <= start && ck.in >= 0)) ck = null;
+    } catch (e) {
+      ck = null;
+    }
+  }
+  const save = (nIn, emitted, state) => {
+    const tmp = stateP + "." + process.pid + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ spec: SPEC_ID, in: nIn, out: emitted, state: state }));
+    fs.renameSync(tmp, stateP);
+  };
+  const source = complete ? _readCached(rowsP, size) : _compute(path, size, ck, save);
   const tmpRows = rowsP + "." + process.pid + ".tmp";
   let tf = null;
   const pf = fs.openSync(progP, fs.existsSync(progP) ? "r+" : "w+");
   try {
     if (build) tf = fs.openSync(tmpRows, "w");
     let wbuf = [];
-    let idx = 0;
+    let idx = ck ? ck.out : 0;
     for (const row of source) {
       if (tf !== null) {
         wbuf.push(JSON.stringify(row));
@@ -1050,6 +1660,7 @@ function* _run(path, size, cacheDir) {
       fs.renameSync(tmpRows, rowsP);
     }
     fs.writeSync(pf, _pad(0), 0);
+    _rm(stateP);
   } finally {
     fs.closeSync(pf);
     if (tf !== null) {
@@ -1082,7 +1693,7 @@ function DynamicPreprocessor(opts, cacheDirArg) {
   fn.cache_dir = cacheDir;
   fn.process = fn;
   fn.iterate = fn;
-  fn.transform = (row) => _transformRow(row);
+  fn.transform = (row) => new _Engine(Object.assign({}, SPEC, { filter: null, lookahead: false }), null)._proc(row, null)[0];
   return fn;
 }
 
@@ -1461,7 +2072,27 @@ def arith_candidates(in_cols, pairs, ys, is_text):
                                 return
 
 
-def infer_column(oc, in_cols, pairs, is_text):
+def lossy_int(t, pairs):
+    if t.get("type") not in ("linear", "arith"):
+        return False
+    raw_t = dict(t, round=None, fmt=["raw"])
+    lossy = False
+    for row, y in pairs:
+        yn = y if is_number(y) else (_num(y) if isinstance(y, str) else None)
+        if yn is None:
+            continue
+        if yn != int(yn):
+            return False
+        try:
+            p = _apply(raw_t, row)
+        except Exception:
+            return False
+        if is_number(p) and abs(p - yn) > 1e-9 * max(1.0, abs(yn)):
+            lossy = True
+    return lossy
+
+
+def infer_column(oc, in_cols, pairs, is_text, final=True, stateful=None):
     ys = [y for _, y in pairs]
     if not pairs:
         if oc in in_cols:
@@ -1471,8 +2102,17 @@ def infer_column(oc, in_cols, pairs, is_text):
     def first_fit(gen):
         for t in gen:
             if fits(t, pairs):
-                return t
+                return prefer_stateful(t)
         return None
+
+    def prefer_stateful(t):
+        # A numeric fit that only works thanks to rounding to integers is a
+        # weak explanation (e.g. segment ids); an exact stateful one wins.
+        if final and stateful is not None and lossy_int(t, pairs):
+            s = stateful()
+            if s:
+                return s
+        return t
 
     def first_approx(gen):
         for t in gen:
@@ -1503,6 +2143,12 @@ def infer_column(oc, in_cols, pairs, is_text):
         return t
     if all_same:
         return const_t
+    if not final:
+        return {"type": "unfit"}
+    if stateful is not None:
+        t = stateful()
+        if t:
+            return t
     # Approximate fallbacks / best partial matches.
     best = None
     best_score = -1
@@ -1535,11 +2181,16 @@ def infer_column(oc, in_cols, pairs, is_text):
     return {"type": "const", "value": ys[0]}
 
 
-def infer_columns(in_cols, in_rows, out_cols, out_rows, align, is_text):
+def infer_columns(in_cols, in_rows, out_cols, out_rows, align, is_text, final=True):
     cols = []
     for oc in out_cols:
         pairs = [(in_rows[align[j]], out_rows[j].get(oc)) for j in range(len(out_rows))]
-        cols.append([oc, infer_column(oc, in_cols, pairs, is_text)])
+        ys = [y for _, y in pairs]
+
+        def st(oc=oc, ys=ys):
+            return infer_stateful(oc, in_cols, in_rows, align, ys, is_text)
+
+        cols.append([oc, infer_column(oc, in_cols, pairs, is_text, final, st if final else None)])
     return cols
 
 
@@ -1633,6 +2284,9 @@ def basic_similarity(in_cols, in_rows, out_cols, out_rows):
                         break
                 if hit:
                     score += 2
+                    oc = out_cols[idx]
+                    if oc in in_cols and _eq(in_rows[i].get(oc), o.get(oc)):
+                        score += 3
                 elif small and ostrs[idx] is not None and len(ostrs[idx]) >= 2:
                     os_ = ostrs[idx]
                     for st in in_strs[i]:
@@ -1669,6 +2323,8 @@ def exact_similarity(columns, in_rows, out_rows):
     n_in = len(in_rows)
     indexes = []
     for name, t in columns:
+        if t.get("type") in ("unfit", "st"):
+            continue
         idx = {}
         for i, r in enumerate(in_rows):
             try:
@@ -1838,6 +2494,12 @@ def gen_atoms(in_cols, rows, K=None):
                 if x is not None:
                     pts.append((x, i))
             uniq = sorted(set(p[0] for p in pts))
+            # Thresholds on a strictly increasing row-id like column rarely
+            # generalize; make them slightly more expensive.
+            seqx = [p[0] for p in pts]
+            gcost = 100
+            if n >= 4 and len(seqx) == n and all(seqx[i] < seqx[i + 1] for i in range(n - 1)):
+                gcost = 130
             if len(uniq) >= 2:
                 # mask of rows with value >= uniq[g+1]
                 pts.sort()
@@ -1861,8 +2523,8 @@ def gen_atoms(in_cols, rows, K=None):
                     hi = tidy_number(hi) if isinstance(hi, float) else hi
                     mge = ge[g + 1]
                     mle = allnum & ~mge
-                    atoms.append((100, {"k": "gapnum", "col": c, "side": "ge", "lo": lo, "hi": hi, "g": g, "b": bnd}, mge))
-                    atoms.append((100, {"k": "gapnum", "col": c, "side": "le", "lo": lo, "hi": hi, "g": g, "b": bnd}, mle))
+                    atoms.append((gcost, {"k": "gapnum", "col": c, "side": "ge", "lo": lo, "hi": hi, "g": g, "b": bnd}, mge))
+                    atoms.append((gcost, {"k": "gapnum", "col": c, "side": "le", "lo": lo, "hi": hi, "g": g, "b": bnd}, mle))
         elif nonmiss and all(isinstance(v, str) for v in nonmiss) and card >= 3:
             strs = sorted(set(v for v in vals if isinstance(v, str) and v != ""))
             if 2 <= len(strs) <= 5000:
@@ -2012,7 +2674,7 @@ def formula_mask(kind, groups, mask_of, ALL):
     return m
 
 
-def widen_thresholds(kind, groups, raw_atoms, K, D, ALL, rows):
+def widen_thresholds(kind, groups, raw_atoms, K, D, ALL, rows, valid=None):
     """For each threshold atom, find the contiguous range of gaps that keep the
     formula consistent and replace it with an atom spanning that whole range."""
     masks = {}
@@ -2022,7 +2684,9 @@ def widen_thresholds(kind, groups, raw_atoms, K, D, ALL, rows):
         if node["k"] in ("gapnum", "gapstr"):
             by_axis.setdefault((node["k"], node["col"], node["side"]), {})[node["g"]] = (node, mask)
     groups = [list(g) for g in groups]
-    target = K if kind == "cnf" else K  # formula must equal K on sample rows
+    if valid is None:
+        def valid(m):
+            return m == K
 
     def mask_of(a):
         m = masks.get(id(a))
@@ -2034,7 +2698,7 @@ def widen_thresholds(kind, groups, raw_atoms, K, D, ALL, rows):
             masks[id(a)] = m
         return m
 
-    base_ok = formula_mask(kind, groups, mask_of, ALL) == target
+    base_ok = valid(formula_mask(kind, groups, mask_of, ALL))
     if not base_ok:
         return groups
     for gi in range(len(groups)):
@@ -2049,7 +2713,7 @@ def widen_thresholds(kind, groups, raw_atoms, K, D, ALL, rows):
                 g = g0 + step
                 while g in axis:
                     groups[gi][ai] = axis[g][0]
-                    if formula_mask(kind, groups, mask_of, ALL) == target:
+                    if valid(formula_mask(kind, groups, mask_of, ALL)):
                         ok.append(g)
                         g += step
                     else:
@@ -2068,7 +2732,7 @@ def widen_thresholds(kind, groups, raw_atoms, K, D, ALL, rows):
                     op, v = (">=", t) if a["side"] == "ge" else ("<", t)
                 new = {"k": "num", "col": a["col"], "op": op, "v": v}
                 groups[gi][ai] = new
-                if formula_mask(kind, groups, mask_of, ALL) != target:
+                if not valid(formula_mask(kind, groups, mask_of, ALL)):
                     groups[gi][ai] = a
             else:
                 if a["side"] == "ge":
@@ -2078,18 +2742,15 @@ def widen_thresholds(kind, groups, raw_atoms, K, D, ALL, rows):
     return groups
 
 
-def infer_filter(in_cols, rows, kept_idx):
+def infer_formula(in_cols, rows, T, F, bounds_k=None, penalty=None, want_cost=False):
+    """Find a CNF/DNF formula over atoms that is true on rows in mask T and
+    false on rows in mask F (other rows are don't-care)."""
     n = len(rows)
     ALL = (1 << n) - 1
-    K = 0
-    for i in kept_idx:
-        K |= (1 << i)
-    D = ALL & ~K
-    if D == 0:
-        return None
-    if K == 0:
-        return {"k": "const", "v": False}
-    raw_atoms = gen_atoms(in_cols, rows, K)
+    K, D = T, F
+    raw_atoms = gen_atoms(in_cols, rows, bounds_k)
+    if penalty:
+        raw_atoms = [(c + penalty(node), node, m) for (c, node, m) in raw_atoms]
     atoms = dedupe_atoms([a for a in raw_atoms if a[1].get("b", True)])
 
     results = []
@@ -2141,14 +2802,882 @@ def infer_filter(in_cols, rows, kept_idx):
         return None
     results.sort(key=lambda x: x[:4])
     best = results[0]
-    groups = widen_thresholds(best[4], best[5], raw_atoms, K, D, ALL, rows)
-    node = build_node(best[4], groups)
-    return materialize(node)
+
+    def valid(m):
+        return (m & K) == K and (m & D) == 0
+
+    groups = widen_thresholds(best[4], best[5], raw_atoms, K, D, ALL, rows, valid)
+    node = materialize(build_node(best[4], groups))
+    if want_cost:
+        return node, not best[0], best[1]
+    return node
+
+
+def infer_filter(in_cols, rows, kept_idx):
+    n = len(rows)
+    ALL = (1 << n) - 1
+    K = 0
+    for i in kept_idx:
+        K |= (1 << i)
+    D = ALL & ~K
+    if D == 0:
+        return None
+    if K == 0:
+        return {"k": "const", "v": False}
+    return infer_formula(in_cols, rows, K, D, K)
+
+
+# ---------------------------------------------------------------------------
+# Neighbor features (for neighbor-aware filters and state transitions)
+# ---------------------------------------------------------------------------
+
+FEAT = "\x01"
+
+
+def augment(in_cols, rows, use_next=True, use_colcmp=True):
+    """Add synthetic columns describing the previous / next row so the plain
+    atom-based formula search can express neighbor-dependent predicates."""
+    n = len(rows)
+    cols = list(in_cols)
+    extra = []
+    for c in in_cols:
+        extra.append(("p", c, FEAT + "p" + FEAT + c))
+        if use_next:
+            extra.append(("n", c, FEAT + "n" + FEAT + c))
+        extra.append(("s-", c, FEAT + "s-" + FEAT + c))
+        if use_next:
+            extra.append(("s+", c, FEAT + "s+" + FEAT + c))
+    pairs = []
+    if use_colcmp and len(in_cols) <= 40:
+        for i in range(len(in_cols)):
+            for j in range(i + 1, len(in_cols)):
+                a, b = in_cols[i], in_cols[j]
+                if any(_eq(r.get(a), r.get(b)) for r in rows):
+                    pairs.append((a, b, FEAT + "c" + FEAT + a + FEAT + b))
+    out = []
+    for i, r in enumerate(rows):
+        d = dict(r)
+        pv = rows[i - 1] if i > 0 else None
+        nx = rows[i + 1] if i + 1 < n else None
+        for tag, c, key in extra:
+            if tag == "p":
+                d[key] = None if pv is None else pv.get(c)
+            elif tag == "n":
+                d[key] = None if nx is None else nx.get(c)
+            elif tag == "s-":
+                d[key] = pv is not None and _eq(r.get(c), pv.get(c))
+            else:
+                d[key] = nx is not None and _eq(r.get(c), nx.get(c))
+        for a, b, key in pairs:
+            d[key] = _eq(r.get(a), r.get(b))
+        out.append(d)
+    cols = cols + [e[2] for e in extra] + [p[2] for p in pairs]
+    return cols, out
+
+
+def feat_penalty(node):
+    col = node.get("col")
+    if not isinstance(col, str) or not col.startswith(FEAT):
+        return 0
+    tag = col.split(FEAT)[1]
+    if tag in ("p", "n"):
+        return 60
+    if tag in ("s-", "s+"):
+        return 40
+    return 50
+
+
+def delift(node):
+    k = node.get("k")
+    if k in ("and", "or"):
+        return {"k": k, "args": [delift(a) for a in node["args"]]}
+    col = node.get("col")
+    if not isinstance(col, str) or not col.startswith(FEAT):
+        return node
+    parts = col.split(FEAT)
+    tag = parts[1]
+    if tag in ("p", "n"):
+        nn = dict(node)
+        nn["col"] = FEAT.join(parts[2:])
+        nn["rel"] = -1 if tag == "p" else 1
+        return nn
+    if k == "eq":
+        positive = (node["op"] == "==") == (node["v"] is True)
+    else:
+        positive = True
+    op = "==" if positive else "!="
+    if tag in ("s-", "s+"):
+        return {"k": "same", "col": FEAT.join(parts[2:]), "rel": -1 if tag == "s-" else 1, "op": op}
+    return {"k": "colcmp", "a": parts[2], "b": parts[3], "op": op}
+
+
+def uses_next(node):
+    if node is None:
+        return False
+    k = node.get("k")
+    if k in ("and", "or"):
+        return any(uses_next(a) for a in node["args"])
+    if k == "edge":
+        return uses_next(node["arg"])
+    return node.get("rel", 0) > 0
+
+
+def node_mask(node, rows):
+    m = 0
+    n = len(rows)
+    for i, r in enumerate(rows):
+        if _filt(node, r, rows[i - 1] if i > 0 else None, rows[i + 1] if i + 1 < n else None):
+            m |= (1 << i)
+    return m
+
+
+def find_predicate(in_cols, rows, T, F, with_prev=False, with_next=False):
+    """Formula true on T, false on F (rows elsewhere don't care); None if no exact one."""
+    n = len(rows)
+    if T & F:
+        return None
+    if F == 0:
+        return {"k": "const", "v": True}, 0
+    if T == 0:
+        return {"k": "const", "v": False}, 0
+    bk = T if (T | F) == (1 << n) - 1 else None
+    cands = []
+    r = infer_formula(in_cols, rows, T, F, bk, want_cost=True)
+    if r and r[1]:
+        cands.append((r[2], 0, r[0]))
+    if (with_prev or with_next) and not cands:
+        acols, arows = augment(in_cols, rows, use_next=with_next)
+        r = infer_formula(acols, arows, T, F, None, penalty=feat_penalty, want_cost=True)
+        if r and r[1]:
+            cands.append((r[2], 1, delift(r[0])))
+    for cost, _, node in sorted(cands, key=lambda x: (x[0], x[1])):
+        m = node_mask(node, rows)
+        if (m & T) == T and (m & F) == 0:
+            return node, cost
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Stateful column inference
+# ---------------------------------------------------------------------------
+
+_st_init = RT["_st_init"]
+_st_step = RT["_st_step"]
+_st_out = RT["_st_out"]
+
+
+def y_numeric(y, is_text):
+    if is_text:
+        return _num(y) if isinstance(y, str) else None
+    return y if is_number(y) else None
+
+
+def sim_series(t, rows):
+    st = _st_init(t)
+    prev = None
+    out = []
+    for r in rows:
+        out.append(_st_step(t, st, r, prev))
+        prev = r
+    return out
+
+
+def max_decimals(ys, is_text):
+    d = 0
+    for y in ys:
+        if isinstance(y, str):
+            dd = decimals_of(y)
+        elif isinstance(y, float):
+            s = repr(y)
+            dd = None if ("e" in s or "n" in s) else (len(s) - s.index(".") - 1 if "." in s else 0)
+        else:
+            dd = 0
+        if dd is None:
+            return None
+        d = max(d, dd)
+    return d
+
+
+def precheck(xs, yv, ys, is_text):
+    x0, y0 = xs[0], yv[0]
+    j = max(range(len(xs)), key=lambda i: (abs(xs[i] - x0), -i))
+    if xs[j] == x0:
+        return False
+    dec = max_decimals(ys, is_text)
+    if dec is None:
+        return True
+    try:
+        a = (yv[j] - y0) / (xs[j] - x0)
+        b = y0 - a * x0
+        base = 0.6 * (10.0 ** -dec)
+        for x, y in zip(xs, yv):
+            if abs(a * x + b - y) > 3 * base + 1e-6 * max(1.0, abs(y)):
+                return False
+    except (OverflowError, ZeroDivisionError, ValueError):
+        return False
+    return True
+
+
+def fit_post(t, S, ys, is_text, strict=False):
+    """Find post-processing (y = a*s + b, rounding, format) for series S."""
+    nv = "" if is_text else None
+    nones = [y for s, y in zip(S, ys) if s is None]
+    if nones:
+        nv = nones[0]
+        if not all(_eq(v, nv) for v in nones):
+            return None
+    xs, ysub = [], []
+    for s, y in zip(S, ys):
+        if s is not None:
+            xs.append(s)
+            ysub.append(y)
+    if len(xs) < 2 or all(x == xs[0] for x in xs):
+        return None
+    yv = [y_numeric(y, is_text) for y in ysub]
+    if any(v is None for v in yv):
+        return None
+    if not precheck(xs, yv, ysub, is_text):
+        return None
+    pairs = [({"_s": x}, y) for x, y in zip(xs, ysub)]
+    ident = {"type": "linear", "src": "_s", "a": 1, "b": 0, "round": None, "fmt": ["s_g" if is_text else "intify"]}
+    if fits(ident, pairs):
+        tt = dict(t)
+        tt["post"] = ident
+        tt["none"] = nv
+        return tt
+    for post in linear_candidates("_s", pairs, ysub, is_text):
+        if strict and not (post["a"] == 1 and post["b"] == 0):
+            return None
+        tt = dict(t)
+        tt["post"] = post
+        tt["none"] = nv
+        return tt
+    return None
+
+
+def verify_col(t, rows, obs, ys):
+    S = sim_series(t, rows)
+    for j, a in enumerate(obs):
+        if not _eq(_st_out(t, S[a]), ys[j]):
+            return False
+    return True
+
+
+def numeric_cols(in_cols, rows):
+    out = []
+    for c in in_cols:
+        vals = [r.get(c) for r in rows]
+        nn = [_num(v) for v in vals if v is not None and v != ""]
+        if nn and sum(1 for x in nn if x is not None) * 2 >= len(vals) and \
+                not all(isinstance(v, bool) for v in vals):
+            out.append(c)
+    return out
+
+
+def base_spec(kind, scope, **kw):
+    t = {"type": "st", "kind": kind, "scope": scope}
+    t.update(kw)
+    return t
+
+
+class Scope(object):
+    def __init__(self, name, rows, obs):
+        self.name = name
+        self.rows = rows
+        self.obs = obs
+        self.full = len(obs) == len(rows)
+        self._conds = None
+
+    def conds(self, in_cols):
+        if self._conds is None:
+            self._conds = cond_candidates(in_cols, self.rows)
+        return self._conds
+
+
+def edge_mask(m, mode, ALL):
+    pm = (m << 1) & ALL
+    if mode == "flip":
+        return (m ^ pm) & ALL & ~1
+    if mode == "rise":
+        return m & ~pm & ALL & ~1
+    if mode == "fall":
+        return pm & ~m & ALL
+    return m
+
+
+def cond_candidates(in_cols, rows):
+    n = len(rows)
+    ALL = (1 << n) - 1
+    raw = gen_atoms(in_cols, rows, None)
+    cands = [(0, 0, ("const",), ALL)]
+    seq = 1
+    for idx, (c, node, m) in enumerate(raw):
+        for extra, mode in ((0, None), (30, "flip"), (32, "rise"), (34, "fall")):
+            cands.append((c + extra, seq, ("atom", idx, mode), edge_mask(m, mode, ALL)))
+            seq += 1
+    for c in in_cols:
+        same = 0
+        for i in range(1, n):
+            if _eq(rows[i].get(c), rows[i - 1].get(c)):
+                same |= (1 << i)
+        cands.append((90, seq, ("same", c, "!="), ALL & ~same))
+        cands.append((95, seq + 1, ("same", c, "=="), same))
+        seq += 2
+    cands.sort(key=lambda x: (x[0], x[1]))
+    seen = set()
+    out = []
+    for c in cands:
+        if c[3] in seen:
+            continue
+        seen.add(c[3])
+        out.append(c)
+    return raw, out
+
+
+def build_cond(raw, cand, rows, ok):
+    """Turn an enumerated candidate into a runtime condition node; numeric
+    thresholds are widened over all equivalent gaps and rounded."""
+    n = len(rows)
+    ALL = (1 << n) - 1
+    kind = cand[0]
+    if kind == "const":
+        return {"k": "const", "v": True}
+    if kind == "same":
+        return {"k": "same", "col": cand[1], "rel": -1, "op": cand[2]}
+    idx, mode = cand[1], cand[2]
+    node = raw[idx][1]
+    base = materialize(node)
+    if node["k"] == "gapnum":
+        axis = {}
+        for c, nd, m in raw:
+            if nd["k"] == "gapnum" and nd["col"] == node["col"] and nd["side"] == node["side"]:
+                axis[nd["g"]] = (nd, m)
+        g0 = node["g"]
+        lo_g = hi_g = g0
+        while lo_g - 1 in axis and ok(edge_mask(axis[lo_g - 1][1], mode, ALL)):
+            lo_g -= 1
+        while hi_g + 1 in axis and ok(edge_mask(axis[hi_g + 1][1], mode, ALL)):
+            hi_g += 1
+        lo, hi = axis[lo_g][0]["lo"], axis[hi_g][0]["hi"]
+        t = roundest(lo, hi)
+        ge = node["side"] == "ge"
+        if t == hi:
+            op, v = (">=", hi) if ge else ("<", hi)
+        elif t == lo:
+            op, v = (">", lo) if ge else ("<=", lo)
+        else:
+            op, v = (">=", t) if ge else ("<", t)
+        cand_node = {"k": "num", "col": node["col"], "op": op, "v": v}
+        m = 0
+        for i, r in enumerate(rows):
+            if _filt(cand_node, r):
+                m |= (1 << i)
+        if ok(edge_mask(m, mode, ALL)):
+            base = cand_node
+    if mode is None:
+        return base
+    return {"k": "edge", "mode": mode, "arg": base}
+
+
+def prefix_counts(m, obs):
+    return [(m & ((2 << a) - 1)).bit_count() for a in obs]
+
+
+def cycle_labels(cs, ys):
+    if not cs:
+        return None
+    span = max(cs) - min(cs) + 1
+    for m in range(2, 17):
+        if span <= m:
+            break
+        mp = {}
+        ok = True
+        for c, y in zip(cs, ys):
+            r = c % m
+            if r in mp:
+                if not _eq(mp[r], y):
+                    ok = False
+                    break
+            else:
+                mp[r] = y
+        if ok and len(mp) == m:
+            return [mp[r] for r in range(m)]
+    return None
+
+
+def infer_counter(in_cols, sc, ys, yn, is_text):
+    """segment ids / prefix counts: value = a * (#rows with cond so far) + b."""
+    if any(v is None for v in yn):
+        return None
+    rows, obs = sc.rows, sc.obs
+    T = F = None
+    if sc.full:
+        T = F = 0
+        step = None
+        for j in range(1, len(yn)):
+            d = yn[j] - yn[j - 1]
+            if d == 0:
+                F |= (1 << j)
+            else:
+                if step is None:
+                    step = d
+                elif d != step:
+                    return None
+                T |= (1 << j)
+        if step is None:
+            return None
+    raw, cands = sc.conds(in_cols)
+
+    def ok_full(m):
+        return (m & T) == T and (m & F) == 0
+
+    for cost, _, cand, m in cands:
+        if sc.full:
+            if not ok_full(m):
+                continue
+            ok = ok_full
+        else:
+            cs = prefix_counts(m, obs)
+            j1 = None
+            for j in range(1, len(cs)):
+                if cs[j] != cs[0]:
+                    j1 = j
+                    break
+            if j1 is None:
+                continue
+            step = (yn[j1] - yn[0]) / (cs[j1] - cs[0])
+            good = True
+            for j in range(len(cs)):
+                if abs(yn[0] + step * (cs[j] - cs[0]) - yn[j]) > 1e-9 * max(1.0, abs(yn[j])):
+                    good = False
+                    break
+            if not good:
+                continue
+
+            def ok(mm, _cs=cs):
+                return prefix_counts(mm, obs) == _cs
+        cond = build_cond(raw, cand, rows, ok)
+        t0 = base_spec("counter", sc.name, cond=cond)
+        S = sim_series(t0, rows)
+        t = fit_post(t0, [S[a] for a in obs], ys, is_text)
+        if t and verify_col(t, rows, obs, ys):
+            return t
+    return None
+
+
+def infer_counter_formula(in_cols, sc, ys, yn, is_text):
+    """Counter whose increment condition needs a compound (prev/current) formula."""
+    if not sc.full or any(v is None for v in yn):
+        return None
+    T = F = 0
+    step = None
+    for j in range(1, len(yn)):
+        d = yn[j] - yn[j - 1]
+        if d == 0:
+            F |= (1 << j)
+        else:
+            if step is None:
+                step = d
+            elif d != step:
+                return None
+            T |= (1 << j)
+    if step is None:
+        return None
+    r = find_predicate(in_cols, sc.rows, T, F, with_prev=True)
+    if not r:
+        return None
+    t0 = base_spec("counter", sc.name, cond=r[0])
+    S = sim_series(t0, sc.rows)
+    t = fit_post(t0, [S[a] for a in sc.obs], ys, is_text)
+    if t and verify_col(t, sc.rows, sc.obs, ys):
+        return t
+    return None
+
+
+def infer_cycle(in_cols, sc, ys):
+    """Labels that cycle through a fixed list each time a condition fires."""
+    rows, obs = sc.rows, sc.obs
+    T = F = None
+    if sc.full:
+        T = F = 0
+        for j in range(1, len(ys)):
+            if _eq(ys[j], ys[j - 1]):
+                F |= (1 << j)
+            else:
+                T |= (1 << j)
+        if T == 0:
+            return None
+    raw, cands = sc.conds(in_cols)
+    for cost, _, cand, m in cands:
+        if sc.full and not ((m & T) == T and (m & F) == 0):
+            continue
+        cs = prefix_counts(m, obs)
+        labels = cycle_labels(cs, ys)
+        if labels is None or not plausible_labels(labels, len(ys)):
+            continue
+        if sc.full:
+            def ok(mm):
+                return (mm & T) == T and (mm & F) == 0
+        else:
+            def ok(mm, _cs=cs):
+                return cycle_labels(prefix_counts(mm, obs), ys) == labels
+        cond = build_cond(raw, cand, rows, ok)
+        t = base_spec("counter", sc.name, cond=cond, labels=labels, none=None)
+        if verify_col(t, rows, obs, ys):
+            return t, cost
+    return None
+
+
+def infer_fsm_partial(in_cols, sc, ys):
+    """FSM over all input rows when only the kept rows' labels are observed:
+    each label's trigger must fire somewhere since the previous observed row
+    and never on an observed row carrying another label."""
+    rows, obs = sc.rows, sc.obs
+    labels = []
+    for y in ys:
+        if not any(_eq(l, y) for l in labels):
+            labels.append(y)
+            if len(labels) > 16:
+                return None
+    if not plausible_labels(labels, len(ys)):
+        return None
+    raw, cands = sc.conds(in_cols)
+    rules = []
+    total = 0
+    for L in labels:
+        F = 0
+        windows = []
+        first = None
+        for j, y in enumerate(ys):
+            if _eq(y, L):
+                if j > 0 and not _eq(ys[j - 1], L):
+                    lo = obs[j - 1] + 1
+                    windows.append(((1 << (obs[j] + 1)) - (1 << lo)))
+                    if first is None:
+                        first = j
+            else:
+                F |= (1 << obs[j])
+        if not windows:
+            continue
+
+        def ok(m, F=F, windows=windows):
+            return (m & F) == 0 and all(m & w for w in windows)
+
+        found = None
+        for cost, _, cand, m in cands:
+            if cand[0] == "const" or not ok(m):
+                continue
+            found = (build_cond(raw, cand, rows, ok), cost)
+            break
+        if found is None:
+            return None
+        rules.append((first, [found[0], L]))
+        total += found[1]
+    rules.sort(key=lambda x: x[0])
+    t = base_spec("fsm", sc.name, init=ys[0], rules=[r for _, r in rules], none=None)
+    if verify_col(t, rows, obs, ys):
+        return t, total
+    return None
+
+
+def plausible_labels(labels, n):
+    """State labels are a small set of strings / small integers / booleans."""
+    if len(labels) < 2 or len(labels) > 16 or n < 2 * len(labels):
+        return False
+    for l in labels:
+        if isinstance(l, float) and not l.is_integer():
+            return False
+        if isinstance(l, str):
+            x = _num(l)
+            if x is not None and isinstance(x, float) and not x.is_integer():
+                return False
+    return True
+
+
+def infer_fsm(in_cols, sc, ys):
+    """Labels set by rules: 'if predicate P_k holds, switch to S_k, else keep'."""
+    if not ys:
+        return None
+    if not sc.full:
+        return infer_fsm_partial(in_cols, sc, ys)
+    rows = sc.rows
+    labels = []
+    for y in ys:
+        if not any(_eq(l, y) for l in labels):
+            labels.append(y)
+            if len(labels) > 16:
+                return None
+    if not plausible_labels(labels, len(ys)):
+        return None
+    rules = []
+    total = 0
+    for L in labels:
+        E = F = 0
+        first = None
+        for j, y in enumerate(ys):
+            if _eq(y, L):
+                if j > 0 and not _eq(ys[j - 1], L):
+                    E |= (1 << j)
+                    if first is None:
+                        first = j
+            else:
+                F |= (1 << j)
+        if E == 0:
+            continue
+        r = find_predicate(in_cols, rows, E, F, with_prev=True)
+        if not r:
+            return None
+        rules.append((first, [r[0], L]))
+        total += r[1]
+    rules.sort(key=lambda x: x[0])
+    t = base_spec("fsm", sc.name, init=ys[0], rules=[r for _, r in rules], none=None)
+    if verify_col(t, rows, sc.obs, ys):
+        return t, total
+    return None
+
+
+def infer_lag(in_cols, sc, ys, kmax=64):
+    rows, obs = sc.rows, sc.obs
+    for k in range(1, min(kmax, len(rows) - 1) + 1):
+        for c in in_cols:
+            nv = None
+            have_nv = False
+            good = True
+            hits = 0
+            for j, a in enumerate(obs):
+                if a - k < 0:
+                    if not have_nv:
+                        nv, have_nv = ys[j], True
+                    elif not _eq(nv, ys[j]):
+                        good = False
+                        break
+                else:
+                    if not _eq(rows[a - k].get(c), ys[j]):
+                        good = False
+                        break
+                    hits += 1
+            if good and hits >= 2:
+                t = base_spec("lag", sc.name, src=c, k=k, none=nv)
+                if verify_col(t, rows, obs, ys):
+                    return t
+    return None
+
+
+def approx_window(vals, w, fn, full):
+    """Fast (approximate for floats) window series, used only to pre-screen."""
+    out = []
+    n = len(vals)
+    ps = [0.0]
+    pc = [0]
+    for v in vals:
+        ps.append(ps[-1] + (0.0 if v is None else float(v)))
+        pc.append(pc[-1] + (0 if v is None else 1))
+    for i in range(n):
+        lo = 0 if not w else max(0, i + 1 - w)
+        if full and w and i + 1 < w:
+            out.append(None)
+            continue
+        c = pc[i + 1] - pc[lo]
+        if fn == "sum":
+            out.append(ps[i + 1] - ps[lo])
+        elif fn == "mean":
+            out.append((ps[i + 1] - ps[lo]) / c if c else None)
+        else:
+            seg = [v for v in vals[lo:i + 1] if v is not None]
+            out.append((min(seg) if fn == "min" else max(seg)) if seg else None)
+    return out
+
+
+def try_agg(t, approx, sc, ys, yn, is_text, strict=False):
+    S = [approx[a] for a in sc.obs]
+    xs, yv, ysub = [], [], []
+    for s, v, y in zip(S, yn, ys):
+        if (s is None) != (v is None):
+            return None
+        if s is not None:
+            xs.append(s)
+            yv.append(v)
+            ysub.append(y)
+    if len(xs) < 2 or all(abs(x - xs[0]) < 1e-12 for x in xs):
+        return None
+    if not precheck(xs, yv, ysub, is_text):
+        return None
+    if t["kind"] != "agg" or t["fn"] in ("min", "max"):
+        variants = [t]
+    else:
+        # Running totals are usually plain "s += x"; window sums usually come
+        # from sum(window) (compensated in Python >= 3.12).  Try both.
+        order = ("naive", "neu") if not t["w"] else ("neu", "naive")
+        variants = [dict(t, acc=a) for a in order]
+    for tv in variants:
+        ex = sim_series(tv, sc.rows)
+        tt = fit_post(tv, [ex[a] for a in sc.obs], ys, is_text, strict)
+        if tt and verify_col(tt, sc.rows, sc.obs, ys):
+            return tt
+    return None
+
+
+def infer_window_count(in_cols, sc, ys, yn, is_text):
+    if not sc.full or any(v is None or v != int(v) for v in yn):
+        return None
+    y = [int(v) for v in yn]
+    n = len(y)
+    for w in range(2, min(64, n) + 1):
+        P = []
+        good = True
+        for i in range(n):
+            p = y[i] - (y[i - 1] if i > 0 else 0) + (P[i - w] if i - w >= 0 else 0)
+            if p not in (0, 1):
+                good = False
+                break
+            P.append(p)
+        if not good or all(p == P[0] for p in P):
+            continue
+        T = 0
+        for i, p in enumerate(P):
+            if p:
+                T |= (1 << i)
+        F = ((1 << n) - 1) & ~T
+        r = find_predicate(in_cols, sc.rows, T, F)
+        if not r:
+            continue
+        t0 = base_spec("agg", sc.name, fn="count", src=None, cond=r[0], w=w, full=False)
+        S = sim_series(t0, sc.rows)
+        t = fit_post(t0, [S[a] for a in sc.obs], ys, is_text)
+        if t and verify_col(t, sc.rows, sc.obs, ys):
+            return t
+    return None
+
+
+def infer_stateful(oc, in_cols, in_rows, align, ys, is_text):
+    if not ys or not in_rows:
+        return None
+    scopes = [Scope("all", in_rows, list(align))]
+    if len(align) != len(in_rows):
+        scopes.append(Scope("kept", [in_rows[a] for a in align], list(range(len(align)))))
+    yn = [y_numeric(y, is_text) for y in ys]
+    nn = [y for y, v in zip(ys, yn) if v is None]
+    numeric = (sum(1 for v in yn if v is not None) >= 2 and
+               all(_eq(y, nn[0]) for y in nn) and len(nn) * 2 <= len(ys) + 2)
+    if numeric:
+        ncols = {sc.name: numeric_cols(in_cols, sc.rows) for sc in scopes}
+        series = {}
+
+        def vals_of(sc, c):
+            key = (sc.name, c)
+            if key not in series:
+                series[key] = [_num(r.get(c)) for r in sc.rows]
+            return series[key]
+
+        has_none = any(v is None for v in yn)
+
+        def prefix_aggs(strict):
+            for sc in scopes:
+                for c in ncols[sc.name]:
+                    v = vals_of(sc, c)
+                    for fn in ("sum", "mean", "max", "min"):
+                        t = base_spec("agg", sc.name, fn=fn, src=c, w=0, full=False)
+                        r = try_agg(t, approx_window(v, 0, fn, False), sc, ys, yn, is_text, strict)
+                        if r:
+                            return r
+            return None
+
+        def windows(strict):
+            for sc in scopes:
+                for w in range(2, min(64, len(sc.rows)) + 1):
+                    for c in ncols[sc.name]:
+                        v = vals_of(sc, c)
+                        for fn in ("sum", "mean", "max", "min"):
+                            for full in ((False, True) if has_none else (False,)):
+                                t = base_spec("agg", sc.name, fn=fn, src=c, w=w, full=full)
+                                r = try_agg(t, approx_window(v, w, fn, full), sc, ys, yn, is_text, strict)
+                                if r:
+                                    return r
+            return None
+
+        def diffs(strict):
+            for sc in scopes:
+                for c in ncols[sc.name]:
+                    v = vals_of(sc, c)
+                    approx = [None] + [(v[i] - v[i - 1]) if v[i] is not None and v[i - 1] is not None else None
+                                       for i in range(1, len(v))]
+                    t = base_spec("diff", sc.name, src=c)
+                    r = try_agg(t, approx, sc, ys, yn, is_text, strict)
+                    if r:
+                        return r
+            return None
+
+        steps = [
+            lambda: prefix_aggs(True),                       # cumulative sum / mean / max / min
+            lambda: next((r for r in (infer_counter(in_cols, sc, ys, yn, is_text) for sc in scopes) if r), None),
+            lambda: windows(True),                           # sliding windows
+            lambda: next((r for r in (infer_lag(in_cols, sc, ys) for sc in scopes) if r), None),
+            lambda: diffs(True),
+            lambda: next((r for r in (infer_window_count(in_cols, sc, ys, yn, is_text) for sc in scopes) if r), None),
+            lambda: next((r for r in (infer_counter_formula(in_cols, sc, ys, yn, is_text) for sc in scopes) if r),
+                         None),
+            lambda: prefix_aggs(False),                      # affine variants: a * S + b
+            lambda: windows(False),
+            lambda: diffs(False),
+        ]
+        for step in steps:
+            r = step()
+            if r:
+                return r
+    else:
+        for sc in scopes:
+            r = infer_lag(in_cols, sc, ys)
+            if r:
+                return r
+    # 6. label state machines
+    for sc in scopes:
+        best = None
+        for i, f in enumerate((infer_fsm, infer_cycle)):
+            r = f(in_cols, sc, ys)
+            if r and (best is None or r[1] < best[1]):
+                best = r
+        if best:
+            return best[0]
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Top-level inference
 # ---------------------------------------------------------------------------
+
+def filter_exact(node, rows, kept):
+    n = len(rows)
+    for i, r in enumerate(rows):
+        k = _filt(node, r, rows[i - 1] if i > 0 else None, rows[i + 1] if i + 1 < n else None)
+        if bool(k) != (i in kept):
+            return False
+    return True
+
+
+def infer_row_filter(in_cols, in_rows, kept):
+    n = len(in_rows)
+    K = 0
+    for i in kept:
+        K |= (1 << i)
+    D = ((1 << n) - 1) & ~K
+    if D == 0:
+        return None
+    if K == 0:
+        return {"k": "const", "v": False}
+    best = None
+    r = infer_formula(in_cols, in_rows, K, D, K, want_cost=True)
+    if r is not None:
+        best = (0 if filter_exact(r[0], in_rows, kept) else 1, r[2], 0, r[0])
+    # Neighbor-aware filter: predicates may also look at the previous / next row.
+    acols, arows = augment(in_cols, in_rows, use_next=True)
+    r = infer_formula(acols, arows, K, D, K, penalty=feat_penalty, want_cost=True)
+    if r is not None:
+        node = delift(r[0])
+        cand = (0 if filter_exact(node, in_rows, kept) else 1, r[2], 1, node)
+        if best is None or cand[:3] < best[:3]:
+            best = cand
+    return None if best is None else best[3]
+
 
 def infer_spec(fmt, in_cols, in_rows, out_cols, out_rows):
     is_text = fmt in ("csv", "tsv")
@@ -2158,24 +3687,26 @@ def infer_spec(fmt, in_cols, in_rows, out_cols, out_rows):
         n_out = n_in
     if n_out == n_in:
         align = list(range(n_in))
-        columns = infer_columns(in_cols, in_rows, out_cols, out_rows, align, is_text)
     else:
         sim = basic_similarity(in_cols, in_rows, out_cols, out_rows)
         align = align_dp(n_in, n_out, sim)
-        columns = infer_columns(in_cols, in_rows, out_cols, out_rows, align, is_text)
+        columns = infer_columns(in_cols, in_rows, out_cols, out_rows, align, is_text, final=False)
         for _ in range(2):
             sim2 = exact_similarity(columns, in_rows, out_rows)
             align2 = align_dp(n_in, n_out, sim2)
             if align2 == align:
                 break
             align = align2
-            columns = infer_columns(in_cols, in_rows, out_cols, out_rows, align, is_text)
-    filt = infer_filter(in_cols, in_rows, set(align))
-    return {"format": fmt, "input_columns": list(in_cols), "columns": columns, "filter": filt}
+            columns = infer_columns(in_cols, in_rows, out_cols, out_rows, align, is_text, final=False)
+    columns = infer_columns(in_cols, in_rows, out_cols, out_rows, align, is_text, final=True)
+    kept = set(align)
+    filt = infer_row_filter(in_cols, in_rows, kept)
+    return {"format": fmt, "input_columns": list(in_cols), "columns": columns, "filter": filt,
+            "lookahead": uses_next(filt)}
 
 
 def check_spec(spec, in_rows, out_rows):
-    got = [RT["_transform_row"](spec, r) for r in in_rows if _filt(spec["filter"], r)]
+    got = RT["_run_engine"](spec, in_rows)
     if len(got) != len(out_rows):
         return False, "row count %d != %d" % (len(got), len(out_rows))
     for i, (g, o) in enumerate(zip(got, out_rows)):
