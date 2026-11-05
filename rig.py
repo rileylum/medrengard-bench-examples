@@ -12,7 +12,10 @@ CONFIG_EXTS = (".yaml", ".yml", ".json")
 OS_NAMES = ("macos", "linux")
 PACKAGE_MANAGERS = ("brew", "apt", "yum")
 ACTION_TYPES = ("link", "copy", "run")
-SCHEMAS = ("module",)
+SCHEMAS = ("module", "preferences", "dock")
+VALUE_TYPES = ("bool", "int", "string", "float")
+OS_VERSIONS = ("yosemite", "el_capitan", "sierra", "high_sierra", "mojave",
+               "catalina", "big_sur", "monterey", "ventura", "sonoma")
 _MISSING = object()
 
 
@@ -86,7 +89,14 @@ def validate_config(data):
     elif not _is_str(schema):
         errors.append("schema: must be a string")
     elif schema not in SCHEMAS:
-        errors.append("unknown schema '%s'" % schema)
+        errors.append("schema: unrecognized schema '%s'" % schema)
+
+    if schema == "preferences":
+        errors.extend(validate_preferences(data))
+        return errors
+    if schema == "dock":
+        errors.extend(validate_dock(data))
+        return errors
 
     # 4-8. os
     osv = data.get("os", _MISSING)
@@ -196,6 +206,83 @@ def validate_config(data):
     return errors
 
 
+def validate_preferences(data):
+    errors = []
+    prefs = data.get("preferences", _MISSING)
+    if prefs is _MISSING:
+        return ["preferences: required"]
+    if not isinstance(prefs, list):
+        return ["preferences: must be a list"]
+    for i, p in enumerate(prefs):
+        pre = "preferences[%d]" % i
+        if not isinstance(p, dict):
+            errors.append("%s: must be an object" % pre)
+            continue
+        for key in ("name", "domain", "key"):
+            v = p.get(key, _MISSING)
+            if v is _MISSING:
+                errors.append("%s.%s: required" % (pre, key))
+            elif not _is_str(v):
+                errors.append("%s.%s: must be a string" % (pre, key))
+            elif v == "":
+                errors.append("%s.%s: must not be empty" % (pre, key))
+        if "value" not in p:
+            errors.append("%s.value: required" % pre)
+        vt = p.get("value_type", _MISSING)
+        if vt is _MISSING:
+            errors.append("%s.value_type: required" % pre)
+        elif not _is_str(vt) or vt not in VALUE_TYPES:
+            errors.append(
+                "%s.value_type: must be 'bool', 'int', 'string', or "
+                "'float', got '%s'" % (pre, _fmt(vt)))
+        v = p.get("apply_command", _MISSING)
+        if v is _MISSING:
+            errors.append("%s.apply_command: required" % pre)
+        elif not _is_str(v):
+            errors.append("%s.apply_command: must be a string" % pre)
+        elif v == "":
+            errors.append("%s.apply_command: must not be empty" % pre)
+        for key in ("check_command", "expected_state"):
+            v = p.get(key, _MISSING)
+            if v is not _MISSING and not _is_str(v):
+                errors.append("%s.%s: must be a string" % (pre, key))
+        ok = True
+        for key in ("min_version", "max_version"):
+            v = p.get(key, _MISSING)
+            if v is _MISSING:
+                continue
+            if not _is_str(v) or v not in OS_VERSIONS:
+                ok = False
+                errors.append("%s.%s: unknown version '%s'"
+                              % (pre, key, _fmt(v)))
+        if ok and "min_version" in p and "max_version" in p:
+            lo, hi = p["min_version"], p["max_version"]
+            if OS_VERSIONS.index(lo) > OS_VERSIONS.index(hi):
+                errors.append(
+                    "%s: min_version '%s' is later than max_version '%s'"
+                    % (pre, lo, hi))
+        v = p.get("enabled", _MISSING)
+        if v is not _MISSING and not isinstance(v, bool):
+            errors.append("%s.enabled: must be a boolean" % pre)
+    return errors
+
+
+def validate_dock(data):
+    errors = []
+    if data.get("os") != "macos":
+        errors.append("dock: 'os' is required and must be 'macos'")
+    items = data.get("items", _MISSING)
+    if items is _MISSING:
+        errors.append("dock.items: required")
+    elif not isinstance(items, list) or not items:
+        errors.append("dock.items: must be a non-empty list of strings")
+    else:
+        for i, it in enumerate(items):
+            if not _is_str(it):
+                errors.append("dock.items[%d]: must be a string" % i)
+    return errors
+
+
 def run_validation(root):
     discovered = discover(root)
     entries = []
@@ -214,6 +301,13 @@ def run_validation(root):
             for e in es:
                 e["errors"].append(
                     "duplicate 'module' schema in '%s'" % label)
+
+    docks = [e for e in entries
+             if isinstance(e["data"], dict) and e["data"].get("schema") == "dock"]
+    if len(docks) > 1:
+        for e in docks:
+            e["errors"].append(
+                "multiple 'dock' schemas found \u2014 only one is allowed")
 
     files = []
     all_valid = True
@@ -325,28 +419,99 @@ def plan_module(name, mod_dir, data):
     return out
 
 
-def build_plan(root, os_filter, module_filter):
+def plan_preferences(pref_entries, os_version):
+    out = []
+    for e in pref_entries:
+        for p in e["data"].get("preferences") or []:
+            if p.get("enabled", True) is False:
+                continue
+            if os_version is not None:
+                idx = OS_VERSIONS.index(os_version)
+                lo = OS_VERSIONS.index(p.get("min_version", OS_VERSIONS[0]))
+                hi = OS_VERSIONS.index(p.get("max_version", OS_VERSIONS[-1]))
+                if not lo <= idx <= hi:
+                    continue
+            act = {"type": "set_preference", "name": p["name"],
+                   "domain": p["domain"], "key": p["key"],
+                   "value": p["value"], "value_type": p["value_type"],
+                   "apply_command": p["apply_command"]}
+            if "check_command" in p:
+                act["check_command"] = p["check_command"]
+                if "expected_state" in p:
+                    act["expected_state"] = p["expected_state"]
+            out.append(act)
+    return out
+
+
+def find_conflicts(modules):
+    by_dest = {}
+    for m in modules:
+        for act in m["actions"]:
+            if act["type"] in ("link", "copy"):
+                by_dest.setdefault(act["destination"], []).append(
+                    {"module": m["name"], "type": act["type"],
+                     "source": act["source"]})
+    conflicts = []
+    for dest in sorted(by_dest):
+        srcs = by_dest[dest]
+        if len(srcs) > 1:
+            srcs.sort(key=lambda x: (x["module"], x["source"], x["type"]))
+            conflicts.append({"destination": dest, "sources": srcs})
+    return conflicts
+
+
+def build_plan(root, os_filter, module_filter, os_version=None):
+    if os_version is not None and os_version not in OS_VERSIONS:
+        raise PlanError("unknown_os_version",
+                        "unknown version '%s'" % os_version)
     payload, entries, by_dir = run_validation(root)
     if not payload["valid"]:
         raise PlanError("validation_failed", payload)
     if not entries:
         raise PlanError("no_configs", "no rig config files found in '%s'" % root)
 
+    prefs_by_dir = {}
+    dock_by_dir = {}
+    for e in entries:
+        schema = e["data"].get("schema")
+        name = module_name_of(e["rel"])
+        if schema == "preferences":
+            prefs_by_dir.setdefault(name, []).append(e)
+        elif schema == "dock":
+            dock_by_dir.setdefault(name, []).append(e)
+
     root_abs = os.path.abspath(root)
     modules = []
-    for name in sorted(by_dir):
+    names = set(by_dir) | set(prefs_by_dir) | set(dock_by_dir)
+    for name in sorted(names):
         if not name:
             continue  # root-level configs are not modules
-        data = by_dir[name][0]["data"]
-        osv = data.get("os")
+        if module_filter is not None and name not in module_filter:
+            continue
+        data = by_dir[name][0]["data"] if name in by_dir else None
+        osv = data.get("os") if data is not None else None
         if os_filter is not None and isinstance(osv, dict):
             if osv.get("name") != os_filter:
                 continue
-        if module_filter is not None and name not in module_filter:
-            continue
+        dock_ok = name in dock_by_dir and (os_filter is None
+                                           or os_filter == "macos")
+        if data is None and name not in prefs_by_dir and not dock_ok:
+            continue  # dock-only module excluded by --os
         mod_dir = os.path.join(root_abs, *name.split("/"))
-        modules.append({"name": name,
-                        "actions": plan_module(name, mod_dir, data)})
+        actions = []
+        if data is not None:
+            actions.extend(plan_module(name, mod_dir, data))
+        actions.extend(plan_preferences(prefs_by_dir.get(name, []),
+                                        os_version))
+        if dock_ok:
+            actions.append({"type": "configure_dock",
+                            "items": list(dock_by_dir[name][0]["data"]
+                                          ["items"])})
+        modules.append({"name": name, "actions": actions})
+
+    conflicts = find_conflicts(modules)
+    if conflicts:
+        raise PlanError("conflict", conflicts)
     return {"modules": modules}
 
 
@@ -361,6 +526,7 @@ def main(argv=None):
     pp = sub.add_parser("plan")
     pp.add_argument("dir")
     pp.add_argument("--os", dest="os_name", default=None)
+    pp.add_argument("--os-version", dest="os_version", default=None)
     pp.add_argument("--module", dest="modules", nargs="+", action="extend",
                     default=None)
     args = parser.parse_args(argv)
@@ -373,10 +539,13 @@ def main(argv=None):
     try:
         plan = build_plan(args.dir, args.os_name,
                           set(args.modules) if args.modules is not None
-                          else None)
+                          else None, args.os_version)
     except PlanError as exc:
-        sys.stderr.write(json.dumps({"error": exc.kind,
-                                     "details": exc.details}, indent=2) + "\n")
+        if exc.kind == "conflict":
+            err = {"error": "conflict", "conflicts": exc.details}
+        else:
+            err = {"error": exc.kind, "details": exc.details}
+        sys.stderr.write(json.dumps(err, indent=2) + "\n")
         return 1
     print(json.dumps(plan, indent=2))
     return 0
