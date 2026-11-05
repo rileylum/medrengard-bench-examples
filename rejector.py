@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import random
 import re
 import signal
 import subprocess
@@ -24,6 +25,7 @@ except ImportError:  # pragma: no cover
 SCHEMES = ("greedy", "sample", "rejection")
 EVAL_TYPES = ("exact_match", "contains", "regex", "script", "llm_judge")
 EXTRACTS = ("last_number", "last_line", "full", "letter", "first_number")
+ICL_STRATEGIES = ("fixed", "random", "round_robin")
 MAX_HTTP_TRIES = 3  # a request is abandoned after its third 5xx failure
 REQUEST_TIMEOUT = 600
 SCRIPT_TIMEOUT = 10
@@ -122,7 +124,7 @@ def _template(value, where, required):
     return value
 
 
-def build_task(name, task, P, args):
+def build_task(name, task, P, args, config_dir="."):
     cfg = {"name": name}
 
     api_url = args.api_url if args.api_url is not None else task.get("api_url")
@@ -188,7 +190,115 @@ def build_task(name, task, P, args):
     if not isinstance(of, str) or not of:
         raise ConfigError(f"{P}.output_field must be a non-empty string")
     cfg["output_field"] = of
+
+    ns = args.num_solutions if getattr(args, "num_solutions", None) is not None else task.get("num_solutions")
+    if ns is None:
+        ns = gen.get("num_solutions", 1)
+    if not _is_int(ns) or ns < 1:
+        raise ConfigError(f"{P}.num_solutions must be a positive integer, got {ns!r}")
+    cfg["num_solutions"] = ns
+
+    cfg["icl"] = build_icl(task.get("icl"), P, cfg, args, config_dir)
+    cfg["list_mode"] = cfg["icl"] is not None or ns > 1
+
+    ma = args.max_attempts if getattr(args, "max_attempts", None) is not None else gen.get("max_attempts")
+    if ma is not None and (not _is_int(ma) or ma < 1):
+        raise ConfigError(f"{P}.generation.max_attempts must be a positive integer, got {ma!r}")
+    if ma is None:
+        ma = 3 * ns
+    cfg["max_attempts"] = ma
     return cfg
+
+
+def _check_example(ex, where):
+    if not isinstance(ex, dict):
+        raise ConfigError(f"{where} must be an object with 'input' and 'output'")
+    if "input" not in ex or "output" not in ex:
+        raise ConfigError(f"{where} must have both 'input' and 'output' keys")
+    if not isinstance(ex["input"], dict):
+        raise ConfigError(f"{where}.input must be an object")
+    if not isinstance(ex["output"], str):
+        raise ConfigError(f"{where}.output must be a string")
+    return {"input": ex["input"], "output": ex["output"]}
+
+
+def _load_icl_file(path, where):
+    examples = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ConfigError(f"{where}: {path} line {lineno} is not valid JSON: {e}")
+                examples.append(_check_example(obj, f"{where}: {path} line {lineno}"))
+    except OSError as e:
+        raise ConfigError(f"{where}: cannot read ICL file {path}: {e}")
+    except UnicodeDecodeError as e:
+        raise ConfigError(f"{where}: ICL file {path} is not valid UTF-8: {e}")
+    return examples
+
+
+def build_icl(icl, P, cfg, args, config_dir):
+    I = f"{P}.icl"
+    if icl is None:
+        return None
+    if not isinstance(icl, dict):
+        raise ConfigError(f"{I} must be a mapping")
+    setups_raw = icl.get("setups")
+    if not isinstance(setups_raw, list) or not setups_raw:
+        raise ConfigError(f"{I}.setups must be a non-empty list")
+    k = args.icl_k if getattr(args, "icl_k", None) is not None else icl.get("k")
+    if k is not None and (not _is_int(k) or k < 1):
+        raise ConfigError(f"{I}.k must be a positive integer, got {k!r}")
+    strategy = args.icl_strategy if getattr(args, "icl_strategy", None) is not None else icl.get("strategy")
+    if strategy is None:
+        strategy = "fixed"
+    if strategy not in ICL_STRATEGIES:
+        raise ConfigError(f"{I}.strategy must be one of {', '.join(ICL_STRATEGIES)}, got {strategy!r}")
+    setups = []
+    seen = set()
+    for i, st in enumerate(setups_raw):
+        W = f"{I}.setups[{i}]"
+        if not isinstance(st, dict):
+            raise ConfigError(f"{W} must be a mapping")
+        name = st.get("name")
+        if not isinstance(name, str) or not name:
+            raise ConfigError(f"{W}.name is required and must be a non-empty string")
+        if name in seen:
+            raise ConfigError(f"{W}: duplicate setup name {name!r}")
+        seen.add(name)
+        has_ex = st.get("examples") is not None
+        has_file = st.get("file") is not None
+        if has_ex == has_file:
+            raise ConfigError(f"{W} ({name}) must have exactly one of 'examples' or 'file'")
+        if has_ex:
+            exs = st["examples"]
+            if not isinstance(exs, list):
+                raise ConfigError(f"{W}.examples must be a list")
+            examples = [_check_example(ex, f"{W}.examples[{j}]") for j, ex in enumerate(exs)]
+        else:
+            fp = st["file"]
+            if not isinstance(fp, str) or not fp:
+                raise ConfigError(f"{W}.file must be a non-empty string")
+            path = fp if os.path.isabs(fp) else os.path.join(config_dir, fp)
+            examples = _load_icl_file(path, f"{W} ({name})")
+        if not examples:
+            raise ConfigError(f"{W} ({name}) has no examples")
+        if k is not None:
+            examples = examples[:k]
+        turns = []
+        for j, ex in enumerate(examples):
+            try:
+                u = render(cfg["user"], ex["input"], j, f"prompt.user template (ICL setup {name!r} example)")
+            except ConfigError as e:
+                raise ConfigError(f"{W} ({name}): example {e}")
+            turns.append({"role": "user", "content": u})
+            turns.append({"role": "assistant", "content": ex["output"]})
+        setups.append({"name": name, "turns": turns})
+    return {"setups": setups, "k": k, "strategy": strategy}
 
 
 def build_evaluation(ev, P, scheme, model, args):
@@ -335,7 +445,16 @@ def prepare(cfg, rows):
                     check_fields(ev["judge_user"], row, idx, "judge_prompt.user")
         except ConfigError as e:
             raise ConfigError(f"{label}{e}")
-        prepared.append(_messages(system, user))
+        if cfg.get("icl") is None:
+            prepared.append(_messages(system, user))
+        else:
+            per_setup = []
+            for st in cfg["icl"]["setups"]:
+                msgs = [] if system is None else [{"role": "system", "content": system}]
+                msgs.extend(copy.deepcopy(st["turns"]))
+                msgs.append({"role": "user", "content": user})
+                per_setup.append(msgs)
+            prepared.append(per_setup)
     return prepared
 
 
@@ -616,11 +735,128 @@ def process_row(client, cfg, row, messages, idx):
             "metas": metas, "api_ok": True}
 
 
+def _evaluate(client, cfg, text, row, idx, meta):
+    ev = cfg["evaluation"]
+    if ev is None:
+        return None
+    if ev["type"] == "script":
+        passed, _ = evaluate_script(ev, text, row, idx)
+    elif ev["type"] == "llm_judge":
+        passed, _, score, jmeta = evaluate_judge(client, cfg, ev, text, row, idx)
+        meta["judge_meta"] = jmeta
+        meta["judge_score"] = score
+    else:
+        passed, _ = evaluate_local(ev, text, row)
+    return bool(passed)
+
+
+def _one_attempt(client, cfg, row, idx, messages, setup_name):
+    """Return (text_or_None, passed, meta)."""
+    ev = cfg["evaluation"]
+    try:
+        ok, text, meta = client.complete(messages)
+    except Exception as e:
+        print(f"warning: task {cfg.get('name')!r} row {idx}: {type(e).__name__}: {e}", file=sys.stderr)
+        ok, text, meta = False, None, None
+    if meta is None:
+        meta = {"model": cfg["model"], "prompt_tokens": 0, "completion_tokens": 0,
+                "total_tokens": 0, "latency_ms": 0, "finish_reason": None}
+    meta["icl_setup"] = setup_name
+    if not ok:
+        meta["evaluation_passed"] = False if ev is not None else None
+        return None, meta["evaluation_passed"], meta
+    try:
+        passed = _evaluate(client, cfg, text, row, idx, meta)
+    except Exception as e:
+        print(f"warning: task {cfg.get('name')!r} row {idx}: evaluation error: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        passed = False
+    meta["evaluation_passed"] = passed
+    return text, passed, meta
+
+
+def process_row_multi(client, cfg, row, prepared, idx):
+    """List-format processing (ICL configured and/or num_solutions > 1)."""
+    ev = cfg["evaluation"]
+    scheme = cfg["scheme"]
+    icl = cfg["icl"]
+    N = cfg["num_solutions"]
+    setups = icl["setups"] if icl is not None else None
+    strategy = icl["strategy"] if icl is not None else None
+    rng = random.Random()
+
+    if scheme == "greedy":
+        if icl is not None and N > 1:
+            strategy = "walk"
+            target, max_att = N, len(setups)
+        else:
+            target, max_att = 1, 1
+    elif scheme == "sample":
+        target, max_att = N, N
+    else:  # rejection
+        target, max_att = N, cfg["max_attempts"]
+
+    def keep(text, passed):
+        if text is None:
+            return False
+        if scheme == "rejection":
+            return passed is True
+        return True
+
+    def choose(i):
+        if setups is None:
+            return None
+        if strategy == "walk":
+            return i
+        if strategy == "round_robin":
+            return i % len(setups)
+        if strategy == "random":
+            return rng.randrange(len(setups))
+        return 0
+
+    attempts = []  # (text, passed, meta, setup_name) in attempt order
+    collected = 0
+    while collected < target and len(attempts) < max_att:
+        batch = min(target - collected, max_att - len(attempts))
+        plan = []
+        for b in range(batch):
+            si = choose(len(attempts) + b)
+            if si is None:
+                plan.append((prepared, None))
+            else:
+                plan.append((prepared[si], setups[si]["name"]))
+        if batch == 1:
+            outs = [_one_attempt(client, cfg, row, idx, plan[0][0], plan[0][1])]
+        else:
+            with ThreadPoolExecutor(max_workers=batch) as ex:
+                futs = [ex.submit(_one_attempt, client, cfg, row, idx, m, nm) for m, nm in plan]
+                outs = [f.result() for f in futs]
+        for (text, passed, meta), (_, nm) in zip(outs, plan):
+            attempts.append((text, passed, meta, nm))
+            if keep(text, passed):
+                collected += 1
+
+    of = cfg["output_field"]
+    output = [{of: text, "icl_setup": nm} for text, passed, _, nm in attempts if keep(text, passed)]
+    n_att = len(attempts)
+    if ev is not None:
+        n_passed = sum(1 for _, passed, _, _ in attempts if passed is True)
+    else:
+        n_passed = len(output)
+    result = {"passed": n_passed, "failed": n_att - n_passed, "attempts": n_att}
+    return {"output": output, "result": result, "metas": [a[2] for a in attempts], "api_ok": True}
+
+
 def _safe_process(client, cfg, row, messages, idx):
     try:
+        if cfg.get("list_mode"):
+            return process_row_multi(client, cfg, row, messages, idx)
         return process_row(client, cfg, row, messages, idx)
     except Exception as e:  # never let a single row kill the run
         print(f"warning: task {cfg.get('name')!r} row {idx}: {type(e).__name__}: {e}", file=sys.stderr)
+        if cfg.get("list_mode"):
+            return {"output": [], "result": {"passed": 0, "failed": 0, "attempts": 0},
+                    "metas": [], "api_ok": False}
         r = {"passed": False if cfg["evaluation"] is not None else None,
              "extracted_answer": None, "attempts": 1}
         if cfg["evaluation"] is not None and cfg["evaluation"]["type"] == "llm_judge":
@@ -638,6 +874,7 @@ def resolve_jobs(args):
     """
     raw = read_config(args.config)
     multi, tasks = parse_config(raw)
+    config_dir = os.path.dirname(os.path.abspath(args.config))
     inputs = args.input or []
     selected = args.task or []
 
@@ -668,7 +905,7 @@ def resolve_jobs(args):
             raise ConfigError("--output is required")
         if os.path.isdir(args.output):
             raise ConfigError(f"--output {args.output} is a directory; single-task configs write a file")
-        cfg = build_task(name, task, prefix, args)
+        cfg = build_task(name, task, prefix, args, config_dir)
         rows = load_input(path)
         prepared = prepare(cfg, rows)
         return False, [{"cfg": cfg, "rows": rows, "prepared": prepared, "output_path": args.output}]
@@ -719,7 +956,7 @@ def resolve_jobs(args):
     jobs = []
     for n in run_names:
         _, task, prefix = by_name[n]
-        cfg = build_task(n, task, prefix, args)
+        cfg = build_task(n, task, prefix, args, config_dir)
         rows = load_input(paths[n])
         prepared = prepare(cfg, rows)
         jobs.append({"cfg": cfg, "rows": rows, "prepared": prepared,
@@ -780,7 +1017,8 @@ def run(args):
     g_passed = g_failed = g_tp = g_tc = g_total = 0
     task_summaries = {}
     for j, job in enumerate(jobs):
-        passed = failed = tp = tc = 0
+        passed = failed = tp = tc = sols = 0
+        list_mode = job["cfg"].get("list_mode")
         with files[j] as out_f:
             for row, res in zip(job["rows"], results[j]):
                 metas = res["metas"]
@@ -791,12 +1029,22 @@ def run(args):
                     if jm:
                         tp += jm["prompt_tokens"]
                         tc += jm["completion_tokens"]
-                rp = res["result"]["passed"]
-                if res["output"] is None or rp is False:
-                    failed += 1
-                elif rp is True or (rp is None and res["api_ok"]):
-                    passed += 1
-                meta_out = metas[0] if len(metas) == 1 else metas
+                if list_mode:
+                    sols += len(res["output"])
+                    if res["result"]["passed"] > 0:
+                        passed += 1
+                    else:
+                        failed += 1
+                    meta_out = metas
+                else:
+                    rp = res["result"]["passed"]
+                    if res["output"] is not None:
+                        sols += 1
+                    if res["output"] is None or rp is False:
+                        failed += 1
+                    elif rp is True or (rp is None and res["api_ok"]):
+                        passed += 1
+                    meta_out = metas[0] if len(metas) == 1 else metas
                 line = {"input": row, "output": res["output"], "result": res["result"], "meta": meta_out}
                 out_f.write(json.dumps(line, ensure_ascii=False) + "\n")
         name = job["cfg"]["name"] or "task"
@@ -804,6 +1052,8 @@ def run(args):
             "total": len(job["rows"]),
             "passed": passed,
             "failed": failed,
+            "total_solutions": sols,
+            "avg_solutions_per_input": (sols / len(job["rows"])) if job["rows"] else 0.0,
             "total_api_calls": clients[j].counter.value,
             "total_prompt_tokens": tp,
             "total_completion_tokens": tc,
@@ -862,6 +1112,10 @@ def main(argv=None):
     r.add_argument("--scheme", choices=SCHEMES)
     r.add_argument("--temperature", type=float)
     r.add_argument("--n", type=int)
+    r.add_argument("--num-solutions", dest="num_solutions", type=int)
+    r.add_argument("--max-attempts", dest="max_attempts", type=int)
+    r.add_argument("--icl-strategy", dest="icl_strategy", choices=ICL_STRATEGIES)
+    r.add_argument("--icl-k", dest="icl_k", type=int)
     args = p.parse_args(argv)
     if args.command != "run":
         p.error("a command is required: run")
