@@ -737,28 +737,7 @@ def normalize_step(step, path, known, ctx=None):
     return ordered, known
 
 
-def validate_request(req):
-    if not isinstance(req, dict):
-        raise schema_err("request must be a JSON object", "")
-    if "pipeline" not in req:
-        raise schema_err("missing required field 'pipeline'", "pipeline")
-    pipeline = req["pipeline"]
-    if not isinstance(pipeline, dict):
-        raise schema_err("'pipeline' must be an object, got %s" % type_name(pipeline), "pipeline")
-    if "steps" not in pipeline:
-        raise schema_err("missing required field 'steps'", "pipeline.steps")
-    steps = pipeline["steps"]
-    if not isinstance(steps, list):
-        raise schema_err("'steps' must be an array, got %s" % type_name(steps), "pipeline.steps")
-    if "dataset" not in req:
-        raise schema_err("missing required field 'dataset'", "dataset")
-    dataset = req["dataset"]
-    if not isinstance(dataset, list):
-        raise schema_err("'dataset' must be an array, got %s" % type_name(dataset), "dataset")
-    for j, row in enumerate(dataset):
-        if not isinstance(row, dict):
-            raise schema_err("dataset rows must be objects, got %s" % type_name(row),
-                             "dataset[%d]" % j)
+def validate_defs(req):
     defs = req.get("defs")
     if defs is None:
         defs = {}
@@ -773,13 +752,147 @@ def validate_request(req):
         if not isinstance(d["steps"], list):
             raise schema_err("'steps' must be an array, got %s" % type_name(d["steps"]),
                              dpath + ".steps")
-    return steps, dataset, defs
+    return defs
 
 
-def normalize_all(steps, defs, known):
-    """Normalize the main pipeline (expanding calls), then every definition."""
+def lib_def_path(ns, name):
+    return "library.%s.defs.%s.steps" % (ns, name)
+
+
+def validate_library(req):
+    """Shape-check the top-level 'library'. Returns {ns: {name: steps}}."""
+    lib = req.get("library")
+    if lib is None:
+        return {}
+    if not isinstance(lib, dict):
+        raise schema_err("'library' must be an object, got %s" % type_name(lib), "library")
+    out = {}
+    for ns, entry in lib.items():
+        npath = "library.%s" % ns
+        if not isinstance(entry, dict):
+            raise schema_err("namespace must be an object, got %s" % type_name(entry), npath)
+        dpath = npath + ".defs"
+        if "defs" not in entry:
+            raise schema_err("missing required field 'defs'", dpath)
+        defs = entry["defs"]
+        if not isinstance(defs, dict):
+            raise schema_err("'defs' must be an object, got %s" % type_name(defs), dpath)
+        out[ns] = {}
+        for name, d in defs.items():
+            ppath = "%s.%s" % (dpath, name)
+            if not isinstance(d, dict):
+                raise schema_err("definition must be an object, got %s" % type_name(d), ppath)
+            if "steps" not in d:
+                raise schema_err("missing required field 'steps'", ppath + ".steps")
+            if not isinstance(d["steps"], list):
+                raise schema_err("'steps' must be an array, got %s" % type_name(d["steps"]),
+                                 ppath + ".steps")
+            out[ns][name] = d["steps"]
+    return out
+
+
+def resolve_compose(compose, library):
+    """Turn 'compose' into segments: list of (raw_steps, base_path, params)."""
+    if not isinstance(compose, list):
+        raise schema_err("'compose' must be an array, got %s" % type_name(compose), "compose")
+    segments = []
+    for i, item in enumerate(compose):
+        ipath = "compose[%d]" % i
+        if not isinstance(item, dict):
+            raise schema_err("compose entry must be an object, got %s" % type_name(item), ipath)
+        has_ref = "ref" in item
+        has_steps = "steps" in item
+        if has_ref and has_steps:
+            raise schema_err("compose entry must have either 'ref' or 'steps', not both",
+                             ipath)
+        if not has_ref and not has_steps:
+            raise schema_err("compose entry requires 'ref' or 'steps'", ipath)
+        if has_steps:
+            steps = item["steps"]
+            if not isinstance(steps, list):
+                raise schema_err("'steps' must be an array, got %s" % type_name(steps),
+                                 ipath + ".steps")
+            if "params" in item:
+                params = item["params"]
+                if not isinstance(params, dict):
+                    raise schema_err("field 'params' must be an object, got %s"
+                                     % type_name(params), ipath + ".params")
+            else:
+                params = {}
+            segments.append((steps, ipath + ".steps", dict(params)))
+            continue
+        rpath = ipath + ".ref"
+        ref = item["ref"]
+        if not isinstance(ref, str):
+            raise schema_err("field 'ref' must be a string, got %s" % type_name(ref), rpath)
+        ref = ref.strip()
+        parts = ref.split(":")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise schema_err("field 'ref' must have the form 'ns:name'", rpath)
+        ns, name = parts
+        if "params" in item:
+            params = item["params"]
+            if not isinstance(params, dict):
+                raise schema_err("field 'params' must be an object, got %s"
+                                 % type_name(params), ipath + ".params")
+        else:
+            params = {}
+        if ns not in library:
+            raise ETLError("UNKNOWN_NAMESPACE", "unknown namespace '%s'" % ns, rpath)
+        if name not in library[ns]:
+            raise ETLError("UNKNOWN_LIB_REF",
+                           "unknown definition '%s' in namespace '%s'" % (name, ns), rpath)
+        segments.append((library[ns][name], lib_def_path(ns, name), dict(params)))
+    return segments
+
+
+def validate_request(req):
+    if not isinstance(req, dict):
+        raise schema_err("request must be a JSON object", "")
+    has_compose = "compose" in req
+    has_pipeline = "pipeline" in req
+    if has_compose and has_pipeline:
+        raise schema_err("'compose' and 'pipeline' are mutually exclusive", "compose")
+    if not has_compose:
+        if not has_pipeline:
+            raise schema_err("missing required field 'pipeline'", "pipeline")
+        pipeline = req["pipeline"]
+        if not isinstance(pipeline, dict):
+            raise schema_err("'pipeline' must be an object, got %s" % type_name(pipeline),
+                             "pipeline")
+        if "steps" not in pipeline:
+            raise schema_err("missing required field 'steps'", "pipeline.steps")
+        steps = pipeline["steps"]
+        if not isinstance(steps, list):
+            raise schema_err("'steps' must be an array, got %s" % type_name(steps),
+                             "pipeline.steps")
+    if "dataset" not in req:
+        raise schema_err("missing required field 'dataset'", "dataset")
+    dataset = req["dataset"]
+    if not isinstance(dataset, list):
+        raise schema_err("'dataset' must be an array, got %s" % type_name(dataset), "dataset")
+    for j, row in enumerate(dataset):
+        if not isinstance(row, dict):
+            raise schema_err("dataset rows must be objects, got %s" % type_name(row),
+                             "dataset[%d]" % j)
+    defs = validate_defs(req)
+    library = validate_library(req)
+    if has_compose:
+        segments = resolve_compose(req["compose"], library)
+    else:
+        segments = [(steps, "pipeline.steps", None)]
+    return segments, dataset, defs, library
+
+
+def normalize_all(segments, defs, library, known):
+    """Normalize the pipeline segments (expanding calls), then every definition."""
     ctx = DefsContext(defs)
-    normalized, _ = normalize_steps(steps, "pipeline.steps", known, ctx)
+    normalized = []
+    seg_norm = []
+    for steps, base, _params in segments:
+        sub, known = normalize_steps(steps, base, known, ctx)
+        seg_norm.append(sub)
+        normalized.extend(sub)
     for name in defs:
         if name not in ctx.normalized:
             ctx.stack.append(name)
@@ -788,18 +901,22 @@ def normalize_all(steps, defs, known):
             finally:
                 ctx.stack.pop()
             ctx.normalized[name] = sub
-    return normalized, ctx
+    # Every library definition must be valid even when it is not referenced.
+    for ns, entries in library.items():
+        for name, steps in entries.items():
+            normalize_steps(steps, lib_def_path(ns, name), None, ctx)
+    return normalized, seg_norm, ctx
 
 
 def process(req):
-    steps, dataset, defs = validate_request(req)
+    segments, dataset, defs, library = validate_request(req)
     known = None
     if dataset:
         known = set()
         for row in dataset:
             known.update(row.keys())
 
-    normalized, ctx = normalize_all(steps, defs, known)
+    normalized, _, ctx = normalize_all(segments, defs, library, known)
     result = {"steps": normalized}
     if "defs" in req and isinstance(req["defs"], dict):
         result["defs"] = {name: {"steps": ctx.normalized[name]} for name in defs}
@@ -929,14 +1046,16 @@ def run_steps(plan, rows, params=None):
 
 
 def execute(req):
-    steps, dataset, defs = validate_request(req)
+    segments, dataset, defs, library = validate_request(req)
 
     # Validate / normalize every step up front (schema + expression syntax).
     # Column existence is checked at run time against the actual rows.
-    normalized, ctx = normalize_all(steps, defs, None)
-    plan = build_plan(normalized, steps, "pipeline.steps", ctx, {})
-
-    rows = run_steps(plan, [dict(r) for r in dataset])
+    _, seg_norm, ctx = normalize_all(segments, defs, library, None)
+    cache = {}
+    rows = [dict(r) for r in dataset]
+    for (steps, base, params), norm in zip(segments, seg_norm):
+        plan = build_plan(norm, steps, base, ctx, cache)
+        rows = run_steps(plan, rows, params)
     return {
         "status": "ok",
         "data": rows,
