@@ -2,9 +2,9 @@
 """sith - a small static Python code-intelligence / completion tool.
 
 Usage:
-    python sith.py complete <file> <line> <col> [--fuzzy]
-    python sith.py infer <file> <line> <col>
-    python sith.py goto <file> <line> <col>
+    python sith.py complete <file> <line> <col> [--fuzzy] [--project DIR]
+    python sith.py infer <file> <line> <col> [--project DIR]
+    python sith.py goto <file> <line> <col> [--follow-imports] [--project DIR]
 """
 import ast
 import builtins
@@ -654,8 +654,11 @@ def star_names(mv):
 def _star_names(mv):
     if isinstance(mv, ModVal):
         if mv.local is not None:
-            return [n for n in mv.local.top_names() if not n.startswith('_')]
+            return mv.local.public_names()
         if mv.real is not None:
+            al = getattr(mv.real, '__all__', None)
+            if isinstance(al, (list, tuple)):
+                return [n for n in al if isinstance(n, str)]
             return [n for n in safe_dir(mv.real) if not n.startswith('_')]
     return []
 
@@ -677,18 +680,25 @@ BUILTIN_RETURNS = {
 _local_modules = {}
 
 
+def _read_text(path):
+    try:
+        with open(path, 'rb') as f:
+            text = f.read().decode('utf-8', errors='replace')
+    except Exception:
+        return None
+    if text.startswith('﻿'):
+        text = text[1:]
+    return text.replace('\x00', '')
+
+
 def load_local_module(path, name):
     path = os.path.abspath(path)
     if path in _local_modules:
         return _local_modules[path]
-    try:
-        with open(path, 'rb') as f:
-            text = f.read().decode('utf-8')
-    except Exception:
+    text = _read_text(path)
+    if text is None:
         _local_modules[path] = None
         return None
-    if text.startswith('﻿'):
-        text = text[1:]
     mi = ModuleInfo(path, name)
     _local_modules[path] = mi
     lines = [l.rstrip('\r') for l in text.split('\n')]
@@ -698,17 +708,112 @@ def load_local_module(path, name):
     return mi
 
 
+def load_namespace(dirpath, name):
+    dirpath = os.path.abspath(dirpath)
+    key = dirpath + os.sep
+    if key in _local_modules:
+        return _local_modules[key]
+    mi = ModuleInfo(dirpath, name, namespace=True)
+    _local_modules[key] = mi
+    mi.lines = []
+    mi.set_tree(ast.parse(''))
+    return mi
+
+
+def _is_ident(s):
+    return s.isidentifier() and not keyword.iskeyword(s)
+
+
+def find_module_in(base, part):
+    """Locate module `part` in directory `base`: (kind, path) or None."""
+    if not part or not os.path.isdir(base):
+        return None
+    d = os.path.join(base, part)
+    init = os.path.join(d, '__init__.py')
+    if os.path.isdir(d) and os.path.isfile(init):
+        return 'package', init
+    f = os.path.join(base, part + '.py')
+    if os.path.isfile(f):
+        return 'module', f
+    if os.path.isdir(d):
+        return 'namespace', d
+    return None
+
+
+def list_modules_in(base):
+    """Names of modules / packages importable from directory `base`."""
+    out = set()
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return out
+    for e in entries:
+        p = os.path.join(base, e)
+        if e.endswith('.py') and os.path.isfile(p):
+            n = e[:-3]
+            if _is_ident(n) and n != '__init__':
+                out.add(n)
+        elif os.path.isdir(p) and _is_ident(e) and e != '__pycache__':
+            out.add(e)
+    return out
+
+
+def _load_found(found, name):
+    kind, p = found
+    if kind == 'namespace':
+        return load_namespace(p, name)
+    return load_local_module(p, name)
+
+
+_STDLIB = None
+
+
+def stdlib_names():
+    global _STDLIB
+    if _STDLIB is None:
+        names = set(getattr(sys, 'stdlib_module_names', ()) or ())
+        names.update(sys.builtin_module_names)
+        if not getattr(sys, 'stdlib_module_names', None):
+            import pkgutil
+            import sysconfig
+            try:
+                std = os.path.normcase(os.path.abspath(sysconfig.get_paths()['stdlib']))
+                for m in pkgutil.iter_modules([std]):
+                    names.add(m.name)
+            except Exception:
+                pass
+        _STDLIB = names
+    return _STDLIB
+
+
+def is_stdlib(dotted):
+    return dotted.split('.')[0] in stdlib_names()
+
+
+def _within_root(path):
+    root = os.path.normcase(_root())
+    p = os.path.normcase(os.path.abspath(path))
+    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
+
+
 class ModuleInfo(object):
-    def __init__(self, path, name):
+    def __init__(self, path, name, namespace=False):
         self.path = path
         self.name = name
-        self.dir = os.path.dirname(os.path.abspath(path))
-        self.is_package = os.path.basename(path) == '__init__.py'
+        self.namespace = namespace
+        if namespace:
+            self.dir = os.path.abspath(path)
+            self.is_package = True
+        else:
+            self.dir = os.path.dirname(os.path.abspath(path))
+            self.is_package = os.path.basename(path) == '__init__.py'
         self.tree = None
         self.scope = None
         self.node_scope = {}
         self.lines = []
         self._by_node = None
+        self._all = False
+        self._busy = False
 
     def set_tree(self, tree):
         self.tree = tree
@@ -735,13 +840,81 @@ class ModuleInfo(object):
         return self._by_node.get(id(node), [])
 
     def top_names(self):
-        return list(self.scope.visible(None).keys())
+        if self.scope is None or self._busy:
+            return []
+        self._busy = True
+        try:
+            return list(self.scope.visible(None).keys())
+        finally:
+            self._busy = False
+
+    def dunder_all(self):
+        """Names listed in __all__ (or None when not defined)."""
+        if self._all is not False:
+            return self._all
+        names = None
+        if self.tree is not None:
+            for st in self.tree.body:
+                tgt = val = None
+                op = None
+                if isinstance(st, ast.Assign) and len(st.targets) == 1:
+                    tgt, val, op = st.targets[0], st.value, '='
+                elif isinstance(st, ast.AnnAssign) and st.value is not None:
+                    tgt, val, op = st.target, st.value, '='
+                elif isinstance(st, ast.AugAssign) and isinstance(st.op, ast.Add):
+                    tgt, val, op = st.target, st.value, '+='
+                elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
+                    f = st.value.func
+                    if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
+                            and f.value.id == '__all__' and f.attr in ('extend', 'append') \
+                            and st.value.args and names is not None:
+                        a = st.value.args[0]
+                        if f.attr == 'append':
+                            if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                                names.append(a.value)
+                        else:
+                            names.extend(_str_elts(a) or [])
+                    continue
+                if not (isinstance(tgt, ast.Name) and tgt.id == '__all__'):
+                    continue
+                elts = _str_elts(val)
+                if elts is None:
+                    continue
+                if op == '=':
+                    names = list(elts)
+                elif names is not None:
+                    names.extend(elts)
+        self._all = names
+        return names
+
+    def public_names(self):
+        al = self.dunder_all()
+        if al is not None:
+            out = []
+            for n in al:
+                if n not in out:
+                    out.append(n)
+            return out
+        return [n for n in self.top_names() if not n.startswith('_')]
+
+    def submodule_names(self):
+        if not self.is_package:
+            return []
+        return sorted(list_modules_in(self.dir))
 
     def attr_defs(self, name):
+        if self.scope is None:
+            return []
         return reaching_defs(self.scope, name, INF_POS, allow_tainted=True)
 
     def attr(self, name):
-        ds = self.attr_defs(name)
+        if self._busy:
+            return False, []
+        self._busy = True
+        try:
+            ds = self.attr_defs(name)
+        finally:
+            self._busy = False
         if ds:
             out = []
             for d in ds:
@@ -749,55 +922,74 @@ class ModuleInfo(object):
             return True, uniq(out)
         # submodule of a local package
         if self.is_package:
-            mv = self._local_module(self.dir, name, name)
+            mv = self.submodule(name)
             if mv is not None:
                 return True, [mv]
         return False, []
 
+    def submodule(self, name):
+        found = find_module_in(self.dir, name)
+        if found is None:
+            return None
+        base = module_name_of(self)
+        mi = _load_found(found, (base + '.' + name) if base else name)
+        return ModVal(name, local=mi) if mi is not None else None
+
     def _local_module(self, base, dotted, display):
         parts = dotted.split('.') if dotted else []
-        p = base
-        for i, part in enumerate(parts):
-            cand_dir = os.path.join(p, part)
-            cand_file = os.path.join(p, part + '.py')
-            last = i == len(parts) - 1
-            if last:
-                if os.path.isfile(cand_file):
-                    mi = load_local_module(cand_file, dotted)
-                    return ModVal(display, local=mi) if mi else None
-                init = os.path.join(cand_dir, '__init__.py')
-                if os.path.isfile(init):
-                    mi = load_local_module(init, dotted)
-                    return ModVal(display, local=mi) if mi else None
-                return None
-            if not os.path.isdir(cand_dir):
-                return None
-            p = cand_dir
         if not parts:
             init = os.path.join(base, '__init__.py')
             if os.path.isfile(init):
                 mi = load_local_module(init, os.path.basename(base))
+            elif os.path.isdir(base):
+                mi = load_namespace(base, os.path.basename(base))
+            else:
+                mi = None
+            return ModVal(display, local=mi) if mi else None
+        p = base
+        for i, part in enumerate(parts):
+            found = find_module_in(p, part)
+            if found is None:
+                return None
+            last = i == len(parts) - 1
+            if last:
+                mi = _load_found(found, '.'.join(parts))
                 return ModVal(display, local=mi) if mi else None
+            if found[0] == 'module':
+                return None
+            p = os.path.join(p, part)
         return None
 
     def resolve_import(self, dotted, level, display=None):
-        display = display or dotted
+        display = display or (dotted.split('.')[-1] if dotted else dotted)
         if level:
             base = self.dir
             for _ in range(level - 1):
                 base = os.path.dirname(base)
-            return self._local_module(base, dotted, display)
-        mv = self._local_module(self.dir, dotted, display)
+            if not _within_root(base):
+                return None
+            mv = self._local_module(base, dotted, display)
+            return mv
+        if not dotted:
+            return None
+        mv = self._local_module(_root(), dotted, display)
         if mv is not None:
             return mv
-        if _PROJECT_ROOT and os.path.abspath(_PROJECT_ROOT) != self.dir:
-            mv = self._local_module(os.path.abspath(_PROJECT_ROOT), dotted, display)
-            if mv is not None:
-                return mv
-        mod = real_import(dotted)
-        if mod is not None:
-            return ModVal(display, real=mod)
+        if is_stdlib(dotted):
+            mod = real_import(dotted)
+            if mod is not None:
+                return ModVal(display, real=mod)
         return None
+
+
+def _str_elts(node):
+    if isinstance(node, (ast.List, ast.Tuple)):
+        out = []
+        for e in node.elts:
+            if isinstance(e, ast.Constant) and isinstance(e.value, str):
+                out.append(e.value)
+        return out
+    return None
 
 
 _PROJECT_ROOT = None
@@ -2408,6 +2600,9 @@ def attributes(v):
     if isinstance(v, ModVal):
         if v.local is not None:
             names = [n for n in v.local.top_names() if not n.startswith('_')]
+            for n in v.local.submodule_names():
+                if n not in names and not n.startswith('_'):
+                    names.append(n)
             res = []
             for n in names:
                 ok, vals = v.local.attr(n)
@@ -2737,6 +2932,193 @@ def describe_def(d, name):
     return describe(v, name)
 
 
+_RX_IMPORT = None
+
+
+def _import_rx():
+    global _RX_IMPORT
+    if _RX_IMPORT is None:
+        import re
+        _RX_IMPORT = (
+            re.compile(r'^\s*import\s+(.*)$', re.S),
+            re.compile(r'^\s*from\s*((?:\.\s*)*)([\w.]*)$', re.S),
+            re.compile(r'^\s*from\s*((?:\.\s*)*)([\w.]*)\s+(\w*)$', re.S),
+            re.compile(r'^\s*from\s*((?:\.\s*)*)([\w.]*)\s+import\b\s*\(?(.*)$', re.S),
+        )
+    return _RX_IMPORT
+
+
+def _stmt_text(lines, line_no, before):
+    """Text of the (simple) statement containing the cursor, up to the cursor."""
+    text = before
+    k = line_no - 1
+    # Continuation lines: backslashes or an open parenthesis of a from-import.
+    while k > 0 and line_no - k < 30:
+        prev = lines[k - 1]
+        if prev.rstrip().endswith('\\'):
+            text = prev.rstrip()[:-1] + ' ' + text
+            k -= 1
+            continue
+        joined = prev + '\n' + text
+        if '(' in joined and joined.count('(') > joined.count(')') and \
+                not text.lstrip().startswith(('from ', 'import ')):
+            text = joined
+            k -= 1
+            continue
+        break
+    text = text.split(';')[-1]
+    return text.replace('\\\n', ' ')
+
+
+def import_context(lines, line_no, before):
+    text = _stmt_text(lines, line_no, before)
+    stripped = text.lstrip()
+    if not (stripped.startswith('import') or stripped.startswith('from')):
+        return None
+    rx_imp, rx_from_mod, rx_from_kw, rx_from_names = _import_rx()
+    m = rx_from_names.match(text)
+    if m:
+        dots = m.group(1).replace(' ', '').replace('\t', '').replace('\n', '')
+        rest = m.group(3)
+        if ')' in rest:
+            return ('none',)
+        seg = rest.split(',')[-1].strip()
+        if not all(is_ident_char(c) for c in seg) or ' ' in seg:
+            return ('none',)
+        if not m.group(2) and not dots:
+            return ('none',)
+        return ('names', len(dots), m.group(2))
+    m = rx_from_mod.match(text)
+    if m:
+        dots = m.group(1).replace(' ', '').replace('\t', '')
+        return ('modules', len(dots), m.group(2))
+    m = rx_from_kw.match(text)
+    if m:
+        return ('keyword_import',)
+    m = rx_imp.match(text)
+    if m:
+        seg = m.group(1).split(',')[-1].strip()
+        if not seg or all(is_ident_char(c) or c == '.' for c in seg.replace(' ', '')):
+            if ' ' in seg.strip() and not seg.replace(' ', '').count('.'):
+                return ('none',)
+            return ('modules', 0, seg.replace(' ', ''))
+        return ('none',)
+    if stripped in ('import', 'from'):
+        return None
+    return None
+
+
+def _module_entry_list(mi, level, dotted):
+    """List of (name, kind) of modules visible for `[.*]dotted.<prefix>`."""
+    parts = dotted.split('.')
+    base_parts = parts[:-1]
+    names = set()
+    if level:
+        base = mi.dir
+        for _ in range(level - 1):
+            base = os.path.dirname(base)
+        if not _within_root(base):
+            return []
+        if base_parts:
+            mv = mi._local_module(base, '.'.join(base_parts), base_parts[-1])
+            if mv is None or mv.local is None or not mv.local.is_package:
+                return []
+            names |= list_modules_in(mv.local.dir)
+        else:
+            names |= list_modules_in(base)
+        return sorted(names)
+    if not base_parts:
+        names |= list_modules_in(_root())
+        names |= set(n for n in stdlib_names() if _is_ident(n))
+        return sorted(names)
+    mv = mi.resolve_import('.'.join(base_parts), 0)
+    if mv is None:
+        return []
+    if mv.local is not None:
+        if mv.local.is_package:
+            names |= list_modules_in(mv.local.dir)
+    elif mv.real is not None:
+        for n in safe_dir(mv.real):
+            ok, o = safe_getattr(mv.real, n)
+            if ok and inspect.ismodule(o) and (getattr(o, '__name__', '').startswith(mv.real.__name__ + '.')
+                                               or sys.modules.get(mv.real.__name__ + '.' + n) is o):
+                names.add(n)
+        mpath = getattr(mv.real, '__path__', None)
+        if mpath:
+            import pkgutil
+            try:
+                for m in pkgutil.iter_modules(list(mpath)):
+                    if _is_ident(m.name):
+                        names.add(m.name)
+            except Exception:
+                pass
+    return sorted(names)
+
+
+def import_completions(path, imp, prefix, fuzzy):
+    kind = imp[0]
+    results = []
+    if kind == 'none':
+        return []
+    if kind == 'keyword_import':
+        if matches('import', prefix, fuzzy):
+            results.append(('import', 'keyword', 'import', True))
+    else:
+        mi = ModuleInfo(os.path.abspath(path), '__main__')
+        if kind == 'modules':
+            for n in _module_entry_list(mi, imp[1], imp[2]):
+                if matches(n, prefix, fuzzy):
+                    results.append((n, 'module', 'module %s' % n, False))
+            if not imp[2] and imp[1] and matches('import', prefix, fuzzy):
+                results.append(('import', 'keyword', 'import', True))
+        else:
+            level, dotted = imp[1], imp[2]
+            mv = mi.resolve_import(dotted, level)
+            seen = set()
+            if mv is not None:
+                if mv.local is not None:
+                    loc = mv.local
+                    al = loc.dunder_all()
+                    names = list(loc.public_names())
+                    if al is None:
+                        names += [n for n in loc.submodule_names() if not n.startswith('_')]
+                    for n in names:
+                        if n in seen or not matches(n, prefix, fuzzy):
+                            continue
+                        seen.add(n)
+                        ok, vals = loc.attr(n)
+                        val = same_val(vals) if ok else None
+                        if val is None and ok and vals:
+                            val = vals[0]
+                        typ, desc = describe(val, n)
+                        results.append((n, typ, desc, False))
+                elif mv.real is not None:
+                    names = list(star_names(mv))
+                    al = getattr(mv.real, '__all__', None)
+                    if not isinstance(al, (list, tuple)):
+                        mpath = getattr(mv.real, '__path__', None)
+                        if mpath:
+                            import pkgutil
+                            try:
+                                names += [m.name for m in pkgutil.iter_modules(list(mpath))
+                                          if not m.name.startswith('_')]
+                            except Exception:
+                                pass
+                    for n in names:
+                        if n in seen or not matches(n, prefix, fuzzy):
+                            continue
+                        seen.add(n)
+                        ok, o = safe_getattr(mv.real, n)
+                        if ok:
+                            typ, desc = describe(wrap_real(o, n), n)
+                        else:
+                            typ, desc = 'module', 'module %s' % n
+                        results.append((n, typ, desc, False))
+    results.sort(key=lambda r: (group_of(r[0], r[3]), r[0].lower(), r[0]))
+    return [{'name': n, 'complete': n[len(prefix):], 'type': t, 'description': d}
+            for n, t, d, _ in results]
+
+
 def complete(path, line_no, col, fuzzy):
     reset_state()
     if not os.path.exists(path):
@@ -2771,6 +3153,9 @@ def complete(path, line_no, col, fuzzy):
         return []
     if in_string_or_comment(lines, line_no, col, '\n'.join(lines)):
         return []
+    imp = import_context(lines, line_no, before)
+    if imp is not None:
+        return import_completions(path, imp, prefix, fuzzy)
     is_attr = i > 0 and before[i - 1] == '.'
     receiver = None
     if is_attr:
@@ -2977,9 +3362,12 @@ def rel_module_path(path):
     if not path:
         return ''
     path = os.path.abspath(path)
-    rel = os.path.relpath(path, _root())
-    if rel.startswith('..'):
-        return path
+    try:
+        rel = os.path.relpath(path, _root())
+    except ValueError:
+        rel = '..'
+    if rel == '..' or rel.startswith('..' + os.sep):
+        return path.replace(os.sep, '/')
     return rel.replace(os.sep, '/')
 
 
@@ -3210,8 +3598,83 @@ def alias_name_pos(mi, stmt, alias, which):
     return start
 
 
-def def_out(d):
+_FOLLOW = [False]
+
+
+def _alias_target(d):
+    """For an import definition: (dotted module, level, imported name or None)."""
+    if d.kind == 'import':
+        name, asname = d.extra
+        return (name if asname else name.split('.')[0]), 0, None
+    modname, name, level = d.extra
+    return modname or '', level or 0, name
+
+
+def follow_def(d, seen=None):
+    """Follow an import chain to the final definitions; None if unresolvable."""
+    if seen is None:
+        seen = set()
+    if isinstance(d, StarHit):
+        key = ('star', id(d.star), d.name)
+        if key in seen:
+            return None
+        seen.add(key)
+        mv = d.star.module_value()
+        if mv is None or mv.local is None:
+            return None
+        return follow_module_attr(mv.local, d.name, seen)
+    if isinstance(d, AttrDef) or d.kind not in ('import', 'importfrom'):
+        return def_out(d, follow=False)
+    key = (id(d.node), d.name)
+    if key in seen:
+        return None
+    seen.add(key)
+    mi = d.scope.module
+    dotted, level, name = _alias_target(d)
+    if name is None:
+        mv = mi.resolve_import(dotted, level)
+        if mv is None or mv.local is None:
+            return None
+        o = module_out(mv)
+        return [o] if o else None
+    mv = mi.resolve_import(dotted, level)
+    if mv is not None and mv.local is not None:
+        res = follow_module_attr(mv.local, name, seen)
+        if res:
+            return res
+    sub = (dotted + '.' + name) if dotted else name
+    mv2 = mi.resolve_import(sub, level)
+    if mv2 is not None and mv2.local is not None:
+        o = module_out(mv2)
+        return [o] if o else None
+    return None
+
+
+def follow_module_attr(local, name, seen):
+    ds = local.attr_defs(name)
+    if ds:
+        out = []
+        for x in ds:
+            r = follow_def(x, seen)
+            if r:
+                out.extend(r)
+        return out or None
+    if local.is_package:
+        mv = local.submodule(name)
+        if mv is not None and mv.local is not None:
+            o = module_out(mv)
+            return [o] if o else None
+    return None
+
+
+def def_out(d, follow=None):
     """Output dict(s) for a definition site (goto)."""
+    if follow is None:
+        follow = _FOLLOW[0]
+    if follow and (isinstance(d, StarHit) or (isinstance(d, Def) and d.kind in ('import', 'importfrom'))):
+        r = follow_def(d)
+        if r:
+            return r
     if isinstance(d, StarHit):
         mv = d.star.module_value()
         if mv is None:
@@ -3651,15 +4114,9 @@ def navigate(mi, occ, parents, mode):
         a = occ.extra
         level = stmt.level or 0
         mv = mi.resolve_import(stmt.module or '', level)
-        if mode == 'goto':
-            if mv is not None:
-                outs = attr_def_outs(mv, a.name)
-                if outs:
-                    return outs
-            sub = ((stmt.module + '.') if stmt.module else '') + a.name
-            mv2 = mi.resolve_import(sub, level)
-            return [module_out(mv2)] if mv2 is not None else []
         ds = [d for d in mi.defs_by_node(stmt) if d.name == (a.asname or a.name)]
+        if mode == 'goto':
+            return _defs_outs(ds[:1])
         out = []
         for d in ds[:1]:
             out.extend(infer_def_vals(d))
@@ -3761,7 +4218,7 @@ def navigate_file(path, line_no, col, mode):
 
 USAGE = ('usage: sith.py complete <file> <line> <col> [--fuzzy] [--project DIR]\n'
          '       sith.py infer <file> <line> <col> [--project DIR]\n'
-         '       sith.py goto <file> <line> <col> [--project DIR]\n')
+         '       sith.py goto <file> <line> <col> [--follow-imports] [--project DIR]\n')
 
 
 def _emit(obj):
@@ -3785,6 +4242,8 @@ def main(argv):
         a = args[i]
         if a == '--fuzzy':
             fuzzy = True
+        elif a == '--follow-imports':
+            _FOLLOW[0] = True
         elif a == '--project':
             if i + 1 >= len(args):
                 sys.stderr.write(USAGE)
