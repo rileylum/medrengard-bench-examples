@@ -421,10 +421,296 @@ def management_details(name, spec):
     return None
 
 
+# ---------------------------------------------------------------- multi-region / policies
+
+REGION_EXPOSE_TYPES = ("Internal", "DirectPort", "Balancer", "Gateway")
+REGION_PROTOCOLS = ("TLSv1.2", "TLSv1.3")
+KEYSTORE_FIELDS = ("secretRef", "alias", "filename")
+AFFINITY_TYPES = ("preferred", "required")
+AFFINITY_SCOPES = ("node", "zone")
+TELEMETRY_LABEL_TAGS = (("mesh.io/targetLabels", "targetLabels"),
+                        ("mesh.io/probeTargetLabels", "probeTargetLabels"),
+                        ("mesh.io/instanceLabels", "instanceLabels"))
+
+
+def validate_tags(tags, errors):
+    if tags is None:
+        return None
+    if not isinstance(tags, dict):
+        errors.append(err("metadata.tags", "tags must be a mapping of string to string", "invalid"))
+        return None
+    res = {}
+    for k, v in tags.items():
+        if not isinstance(k, str):
+            errors.append(err("metadata.tags", "tag keys must be strings", "invalid"))
+            continue
+        if not isinstance(v, str):
+            errors.append(err("metadata.tags.%s" % k, "tag value must be a string", "invalid"))
+            continue
+        res[k] = v
+    return res
+
+
+def validate_keystore(store_in, path, errors):
+    if not isinstance(store_in, dict):
+        errors.append(err(path, "key store must be a mapping", "invalid"))
+        return None
+    res = {}
+    for f in KEYSTORE_FIELDS:
+        v = store_in.get(f)
+        if v is None or v == "":
+            errors.append(err("%s.%s" % (path, f), "%s is required" % f, "required"))
+        elif not isinstance(v, str):
+            errors.append(err("%s.%s" % (path, f), "%s must be a string" % f, "invalid"))
+        else:
+            res[f] = v
+    return res
+
+
+def validate_regions(reg_in, errors, warnings):
+    base = "spec.regions"
+    if not isinstance(reg_in, dict):
+        errors.append(err(base, "regions must be a mapping", "invalid"))
+        return None
+    regions = {}
+    local_in = reg_in.get("local")
+    lb = base + ".local"
+    if local_in is None:
+        errors.append(err(lb, "local region is required", "required"))
+    elif not isinstance(local_in, dict):
+        errors.append(err(lb, "local region must be a mapping", "invalid"))
+    else:
+        local = {}
+        nm = local_in.get("name")
+        if nm is None or nm == "":
+            errors.append(err(lb + ".name", "local region name is required", "required"))
+        elif not isinstance(nm, str):
+            errors.append(err(lb + ".name", "local region name must be a string", "invalid"))
+        else:
+            local["name"] = nm
+        expose_in = local_in.get("expose")
+        etype = None
+        if expose_in is not None and not isinstance(expose_in, dict):
+            errors.append(err(lb + ".expose", "expose must be a mapping", "invalid"))
+        else:
+            etype = (expose_in or {}).get("type")
+            if etype is None or etype == "":
+                errors.append(err(lb + ".expose.type", "expose type is required", "required"))
+                etype = None
+            elif etype not in REGION_EXPOSE_TYPES:
+                errors.append(err(lb + ".expose.type",
+                                  "expose type must be one of %s, got %r"
+                                  % (", ".join(REGION_EXPOSE_TYPES), etype), "invalid"))
+                etype = None
+            else:
+                local["expose"] = {"type": etype}
+        if "maxRelayNodes" in local_in:
+            mr = local_in["maxRelayNodes"]
+            if not is_int(mr) or mr <= 0:
+                errors.append(err(lb + ".maxRelayNodes",
+                                  "maxRelayNodes must be an integer greater than 0, got %r" % (mr,),
+                                  "invalid"))
+            else:
+                local["maxRelayNodes"] = mr
+        # encryption
+        eb = lb + ".encryption"
+        enc_in = local_in.get("encryption")
+        has_transport = False
+        if enc_in is not None:
+            if not isinstance(enc_in, dict):
+                errors.append(err(eb, "encryption must be a mapping", "invalid"))
+            else:
+                enc = {}
+                proto = enc_in.get("protocol")
+                if proto is None:
+                    enc["protocol"] = "TLSv1.3"
+                elif proto not in REGION_PROTOCOLS:
+                    errors.append(err(eb + ".protocol",
+                                      "protocol must be one of %s, got %r"
+                                      % (", ".join(REGION_PROTOCOLS), proto), "invalid"))
+                else:
+                    enc["protocol"] = proto
+                for sname in ("transportKeyStore", "relayKeyStore", "trustStore"):
+                    sv = enc_in.get(sname)
+                    if sv is None:
+                        continue
+                    if sname == "transportKeyStore":
+                        has_transport = True
+                    ks = validate_keystore(sv, "%s.%s" % (eb, sname), errors)
+                    if ks is not None:
+                        enc[sname] = ks
+                if enc_in.get("trustStore") is None:
+                    warnings.append({"field": eb + ".trustStore",
+                                     "message": "trustStore is not set; remote region "
+                                                "certificates will not be verified"})
+                local["encryption"] = enc
+        if etype == "Gateway" and not has_transport:
+            errors.append(err(eb + ".transportKeyStore",
+                              "transportKeyStore is required when expose type is 'Gateway'",
+                              "required"))
+        # discovery
+        db = lb + ".discovery"
+        disc_in = local_in.get("discovery")
+        disc = {"type": "relay", "heartbeat": {"enabled": True, "interval": 10000,
+                                               "timeout": 30000}}
+        if disc_in is not None:
+            if not isinstance(disc_in, dict):
+                errors.append(err(db, "discovery must be a mapping", "invalid"))
+            else:
+                dt = disc_in.get("type")
+                if dt is not None and dt != "relay":
+                    errors.append(err(db + ".type", "discovery type must be 'relay', got %r"
+                                      % (dt,), "invalid"))
+                hb_in = disc_in.get("heartbeat")
+                if hb_in is not None:
+                    if not isinstance(hb_in, dict):
+                        errors.append(err(db + ".heartbeat", "heartbeat must be a mapping",
+                                          "invalid"))
+                    else:
+                        hb = disc["heartbeat"]
+                        ok = True
+                        en = hb_in.get("enabled")
+                        if en is not None:
+                            if not isinstance(en, bool):
+                                errors.append(err(db + ".heartbeat.enabled",
+                                                  "enabled must be a boolean", "invalid"))
+                            else:
+                                hb["enabled"] = en
+                        for f in ("interval", "timeout"):
+                            v = hb_in.get(f)
+                            if v is None:
+                                continue
+                            if not is_int(v) or v <= 0:
+                                errors.append(err("%s.heartbeat.%s" % (db, f),
+                                                  "%s must be a positive integer" % f, "invalid"))
+                                ok = False
+                            else:
+                                hb[f] = v
+                        if ok and hb["interval"] >= hb["timeout"]:
+                            errors.append(err(db + ".heartbeat",
+                                              "heartbeat interval (%d) must be less than "
+                                              "timeout (%d)" % (hb["interval"], hb["timeout"]),
+                                              "invalid"))
+        local["discovery"] = disc
+        regions["local"] = local
+    # remotes
+    rb = base + ".remotes"
+    rem_in = reg_in.get("remotes")
+    if rem_in is not None:
+        if not isinstance(rem_in, list):
+            errors.append(err(rb, "remotes must be a list", "invalid"))
+        else:
+            remotes = []
+            seen = set()
+            for i, r in enumerate(rem_in):
+                p = "%s[%d]" % (rb, i)
+                if not isinstance(r, dict):
+                    errors.append(err(p, "remote must be a mapping", "invalid"))
+                    continue
+                entry = {}
+                for f in ("name", "url"):
+                    v = r.get(f)
+                    if v is None or v == "":
+                        errors.append(err("%s.%s" % (p, f), "%s is required" % f, "required"))
+                    elif not isinstance(v, str):
+                        errors.append(err("%s.%s" % (p, f), "%s must be a string" % f, "invalid"))
+                    else:
+                        entry[f] = v
+                if "name" in entry:
+                    if entry["name"] in seen:
+                        errors.append(err(p + ".name", "duplicate remote name %r" % entry["name"],
+                                          "duplicate"))
+                    seen.add(entry["name"])
+                for f in ("credentialRef", "namespace", "clusterRef"):
+                    v = r.get(f)
+                    if v is None:
+                        continue
+                    if not isinstance(v, str):
+                        errors.append(err("%s.%s" % (p, f), "%s must be a string" % f, "invalid"))
+                    else:
+                        entry[f] = v
+                remotes.append(entry)
+            regions["remotes"] = remotes
+    return regions
+
+
+def validate_placement(pl_in, errors):
+    placement = {"affinity": {"type": "preferred", "scope": "node"}}
+    if pl_in is None:
+        return placement
+    if not isinstance(pl_in, dict):
+        errors.append(err("spec.placement", "placement must be a mapping", "invalid"))
+        return placement
+    aff_in = pl_in.get("affinity")
+    if aff_in is None:
+        return placement
+    if not isinstance(aff_in, dict):
+        errors.append(err("spec.placement.affinity", "affinity must be a mapping", "invalid"))
+        return placement
+    aff = placement["affinity"]
+    for f, allowed in (("type", AFFINITY_TYPES), ("scope", AFFINITY_SCOPES)):
+        v = aff_in.get(f)
+        if v is None:
+            continue
+        if v not in allowed:
+            errors.append(err("spec.placement.affinity.%s" % f,
+                              "affinity %s must be one of %s, got %r"
+                              % (f, ", ".join(allowed), v), "invalid"))
+        else:
+            aff[f] = v
+    return placement
+
+
+def validate_extensions(ext_in, errors):
+    if not isinstance(ext_in, list):
+        errors.append(err("spec.extensions", "extensions must be a list", "invalid"))
+        return None
+    res = []
+    for i, e in enumerate(ext_in):
+        p = "spec.extensions[%d]" % i
+        if not isinstance(e, dict):
+            errors.append(err(p, "exactly one of 'url' or 'artifact' must be set", "invalid"))
+            continue
+        has_url = e.get("url") is not None
+        has_art = e.get("artifact") is not None
+        if has_url == has_art:
+            errors.append(err(p, "exactly one of 'url' or 'artifact' must be set", "invalid"))
+            continue
+        entry = {}
+        for f in ("url", "artifact", "integrity"):
+            v = e.get(f)
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                errors.append(err("%s.%s" % (p, f), "%s must be a string" % f, "invalid"))
+            else:
+                entry[f] = v
+        res.append(entry)
+    return res
+
+
+def telemetry_probe(tags):
+    tags = tags if isinstance(tags, dict) else {}
+    t = tags.get("mesh.io/telemetry")
+    if isinstance(t, str) and t.strip().lower() == "false":
+        return {"enabled": False}
+    probe = {"enabled": True}
+    labels = {}
+    for key, cat in TELEMETRY_LABEL_TAGS:
+        v = tags.get(key)
+        if isinstance(v, str):
+            labels[cat] = [x.strip() for x in v.split(",") if x.strip() != ""]
+    if labels:
+        probe["labels"] = labels
+    return probe
+
+
+
 def validate(doc, update=False):
     """Validate a document. With update=True the spec is an already-merged spec
     (stored values + provided fields) and instances may be 0."""
     errors = []
+    warnings = []
     result = {}
 
     metadata = doc.get("metadata")
@@ -442,6 +728,9 @@ def validate(doc, update=False):
     else:
         name = raw_name
     result["metadata"] = {"name": raw_name}
+    tags = validate_tags(metadata.get("tags"), errors)
+    if tags is not None:
+        result["metadata"]["tags"] = tags
 
     spec_in = doc.get("spec")
     if spec_in is None:
@@ -530,13 +819,36 @@ def validate(doc, update=False):
     spec["migration"] = {"strategy": strategy}
 
     # regions (multi-region topology)
-    regions = spec_in.get("regions")
-    if regions is not None:
-        spec["regions"] = regions
-        if strategy == "LiveMigration" and regions not in ([], {}, ""):
+    reg_in = spec_in.get("regions")
+    if reg_in is not None:
+        regions = validate_regions(reg_in, errors, warnings)
+        if regions is not None:
+            spec["regions"] = regions
+        if strategy == "LiveMigration":
             errors.append(err("spec.migration.strategy",
                               "LiveMigration strategy is not supported with multi-region topology",
                               "invalid"))
+
+    # placement
+    spec["placement"] = validate_placement(spec_in.get("placement"), errors)
+
+    # config bundle reference
+    if "configBundleRef" in spec_in:
+        cbr = spec_in["configBundleRef"]
+        if update and cbr is None:
+            pass
+        elif not isinstance(cbr, str):
+            errors.append(err("spec.configBundleRef", "configBundleRef must be a string",
+                              "invalid"))
+        else:
+            spec["configBundleRef"] = cbr
+
+    # extensions
+    ext_in = spec_in.get("extensions")
+    if ext_in is not None:
+        exts = validate_extensions(ext_in, errors)
+        if exts is not None:
+            spec["extensions"] = exts
 
     # network
     net_in = spec_in.get("network")
@@ -616,6 +928,7 @@ def validate(doc, update=False):
     spec["management"] = management
 
     result["spec"] = spec
+    result["_warnings"] = warnings
     return result, name, errors
 
 
@@ -642,6 +955,20 @@ def cond_status(status, ctype):
         if c.get("type") == ctype:
             return c.get("status")
     return None
+
+
+REGION_CONDITIONS = ("DiscoveryRelayReady", "RegionViewFormed")
+
+
+def sync_region_conditions(status, spec):
+    if isinstance(spec.get("regions"), dict):
+        for c in REGION_CONDITIONS:
+            if not has_condition(status, c):
+                set_condition(status, c, "False", "")
+    else:
+        for c in REGION_CONDITIONS:
+            if has_condition(status, c):
+                clear_condition(status, c)
 
 
 def compute_stable(status):
@@ -693,6 +1020,9 @@ def render(resource):
     r["status"] = {k: st[k] for k in order if k in st}
     name = (r.get("metadata") or {}).get("name")
     spec = r.get("spec", {})
+    if isinstance(spec, dict) and "placement" not in spec:
+        spec["placement"] = {"affinity": {"type": "preferred", "scope": "node"}}
+    r["status"]["telemetryProbe"] = telemetry_probe((r.get("metadata") or {}).get("tags"))
     cd = connection_details(name, spec)
     if cd is not None:
         r["status"]["connectionDetails"] = cd
@@ -798,6 +1128,7 @@ def cmd_create(args):
     if code is not None:
         return code
     resource, name, errors = validate(doc)
+    warnings = resource.pop("_warnings", [])
     store = load_store()
     if name is not None and name in store:
         errors.append(err("metadata.name", "mesh %r already exists" % name, "duplicate"))
@@ -812,11 +1143,12 @@ def cmd_create(args):
     }
     set_condition(status, "Healthy")
     set_condition(status, "PrechecksPassed")
+    sync_region_conditions(status, resource["spec"])
     status["stable"] = compute_stable(status)
     resource["status"] = status
     store[name] = resource
     save_store(store)
-    out(with_warnings(render(resource), runtime_warnings(resource["spec"])))
+    out(with_warnings(render(resource), runtime_warnings(resource["spec"]) + warnings))
     return 0
 
 
@@ -860,7 +1192,35 @@ def cmd_update(args):
     merged_spec = deep_merge(stored["spec"], spec_patch)
     reconcile_access(merged_spec, spec_patch)
     reconcile_exposure(merged_spec, stored["spec"], spec_patch)
-    resource, _, errors = validate({"metadata": {"name": raw_name}, "spec": merged_spec}, update=True)
+    if "configBundleRef" in spec_patch and spec_patch["configBundleRef"] is None:
+        merged_spec.pop("configBundleRef", None)
+    pre_errors = []
+    preg = spec_patch.get("regions")
+    if isinstance(preg, dict) and isinstance(preg.get("local"), dict) \
+            and "maxRelayNodes" in preg["local"] and preg["local"]["maxRelayNodes"] is None:
+        pre_errors.append(err("spec.regions.local.maxRelayNodes",
+                              "maxRelayNodes must be an integer greater than 0, got None",
+                              "invalid"))
+    if isinstance(preg, dict) and isinstance(merged_spec.get("regions"), dict) \
+            and "remotes" in preg and preg["remotes"] is not None:
+        merged_spec["regions"]["remotes"] = preg["remotes"]
+    tags = stored.get("metadata", {}).get("tags")
+    ptags = metadata.get("tags")
+    if isinstance(ptags, dict) and isinstance(tags, dict):
+        tags = dict(tags)
+        for k, v in ptags.items():
+            if v is None:
+                tags.pop(k, None)
+            else:
+                tags[k] = v
+    elif ptags is not None:
+        tags = ptags
+    new_meta = {"name": raw_name}
+    if tags is not None:
+        new_meta["tags"] = tags
+    resource, _, errors = validate({"metadata": new_meta, "spec": merged_spec}, update=True)
+    errors = pre_errors + errors
+    warnings = resource.pop("_warnings", [])
 
     # immutable management endpoint flag
     old_mg = (stored["spec"].get("management") or {}).get("enabled", False)
@@ -971,11 +1331,18 @@ def cmd_update(args):
     elif mig_action == "rollback":
         clear_condition(status, "Migration")
         status.pop("migration", None)
+    sync_region_conditions(status, resource["spec"])
     status["stable"] = bool(status.get("stable", True)) and compute_stable(status)
     resource["status"] = status
     store[raw_name] = resource
     save_store(store)
-    out(with_warnings(render(resource), runtime_warnings(resource["spec"])))
+    rendered = render(resource)
+    old_ref = stored["spec"].get("configBundleRef")
+    new_ref = resource["spec"].get("configBundleRef")
+    if old_ref != new_ref:
+        rendered["status"]["configRefresh"] = {"currentRef": new_ref, "pending": True,
+                                               "previousRef": old_ref}
+    out(with_warnings(rendered, runtime_warnings(resource["spec"]) + warnings))
     return 0
 
 
