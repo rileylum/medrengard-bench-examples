@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Tiny local runner HTTP API: POST /v1/execute, GET /v1/stats/execution."""
 import argparse
+import bz2
+import csv
 import glob
+import gzip
+import io
 import json
 import math
 import os
@@ -17,6 +21,14 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_TIMEOUT = 10
+
+try:  # optional; JSON is valid YAML so we can fall back to it
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
+
+COMPRESSION_EXTS = {".gz": "gzip", ".bz2": "bz2"}
+STRUCTURED_EXTS = {".json", ".yaml", ".yml", ".jsonl", ".ndjson", ".csv", ".tsv"}
 
 
 class ApiError(Exception):
@@ -85,12 +97,13 @@ def validate(body):
         files = {}
     if not isinstance(files, dict):
         raise ApiError(400, "INVALID_FIELD", "'files' must be an object of strings")
+    encoded_files = {}
     for path, content in files.items():
-        if not isinstance(content, str):
-            raise ApiError(400, "INVALID_FIELD", f"content for file {path!r} must be a string")
         if (not path or "\x00" in path or os.path.isabs(path)
                 or any(p == ".." for p in path.replace("\\", "/").split("/"))):
             raise ApiError(400, "INVALID_FIELD", f"invalid file path: {path!r}")
+        encoded_files[path] = encode_file(path, content)
+    files = encoded_files
 
     stdin = body.get("stdin", "")
     if stdin is None:
@@ -124,6 +137,113 @@ def validate(body):
             track = None
 
     return command, env, files, stdin, float(timeout), track
+
+
+def _split_exts(path):
+    """Return (base_ext, compression) for a file path; 400 on multiple compressions."""
+    name = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    parts = name.split(".")
+    suffixes = ["." + p for p in parts[1:]] if len(parts) > 1 else []
+    if parts and parts[0] == "" and len(parts) == 2:
+        # dotfile like ".gz" or ".json" has no extension
+        suffixes = []
+    comps = [s for s in suffixes if s in COMPRESSION_EXTS]
+    if len(comps) > 1:
+        raise ApiError(400, "INVALID_FIELD",
+                       f"multiple compression extensions in file path: {path!r}")
+    compression = None
+    if suffixes and suffixes[-1] in COMPRESSION_EXTS:
+        compression = COMPRESSION_EXTS[suffixes[-1]]
+        suffixes = suffixes[:-1]
+    base = suffixes[-1] if suffixes else ""
+    return base, compression
+
+
+def _json_dump(value):
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return _json_dump(value)
+
+
+def _table_rows(path, value):
+    """Return (header, rows) for a dict-of-columns or list-of-rows value."""
+    if value is None or value == "" or value == [] or value == {}:
+        return [], []
+    if isinstance(value, dict):
+        columns = sorted(value.keys())
+        cols = []
+        for c in columns:
+            v = value[c]
+            cols.append(list(v) if isinstance(v, list) else [v])
+        n = max((len(c) for c in cols), default=0)
+        rows = [[_cell(col[i]) if i < len(col) else "" for col in cols] for i in range(n)]
+        return columns, rows
+    if isinstance(value, list):
+        if all(isinstance(r, dict) for r in value):
+            columns = sorted({k for r in value for k in r.keys()})
+            rows = [[_cell(r[c]) if c in r else "" for c in columns] for r in value]
+            return columns, rows
+        if all(isinstance(r, list) for r in value):
+            return None, [[_cell(x) for x in r] for r in value]
+        raise ApiError(400, "INVALID_FIELD",
+                       f"content for file {path!r} must be a list of rows or a dict of columns")
+    raise ApiError(400, "INVALID_FIELD",
+                   f"content for file {path!r} must be a list of rows or a dict of columns")
+
+
+def _serialize_table(path, value, delimiter):
+    header, rows = _table_rows(path, value)
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
+    if header is not None:
+        writer.writerow(header)
+    for r in rows:
+        writer.writerow(r)
+    return buf.getvalue()
+
+
+def _serialize(path, base, content):
+    if isinstance(content, str):
+        if content == "" and base in (".csv", ".tsv"):
+            return _serialize_table(path, content, "," if base == ".csv" else "\t")
+        return content
+    if base == ".json":
+        return _json_dump(content) + "\n"
+    if base in (".yaml", ".yml"):
+        if yaml is not None:
+            return yaml.safe_dump(content, sort_keys=False, default_flow_style=False,
+                                  allow_unicode=True)
+        return _json_dump(content) + "\n"
+    if base in (".jsonl", ".ndjson"):
+        items = content if isinstance(content, list) else [content]
+        return "".join(_json_dump(item) + "\n" for item in items)
+    if base == ".csv":
+        return _serialize_table(path, content, ",")
+    if base == ".tsv":
+        return _serialize_table(path, content, "\t")
+    # unknown extension with a structured value: write its JSON text
+    return _json_dump(content) + "\n"
+
+
+def encode_file(path, content):
+    """Turn a request file value into the bytes written to disk."""
+    base, compression = _split_exts(path)
+    data = _serialize(path, base, content).encode("utf-8")
+    if compression == "gzip":
+        data = gzip.compress(data, mtime=0)
+    elif compression == "bz2":
+        data = bz2.compress(data)
+    return data
 
 
 def collect_tracked(workdir, patterns):
@@ -172,7 +292,7 @@ def execute(command, env, files, stdin, timeout, track=None):
             parent = os.path.dirname(target)
             try:
                 os.makedirs(parent, exist_ok=True)
-                with open(target, "w", encoding="utf-8") as fh:
+                with open(target, "wb") as fh:
                     fh.write(content)
             except (IsADirectoryError, NotADirectoryError, FileExistsError) as e:
                 raise ApiError(400, "INVALID_FIELD", f"cannot create file {rel!r}: {e}")
