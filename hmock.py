@@ -2487,6 +2487,14 @@ class Parser:
                         raise TemplateError("unexpected %r in %s" % (toks[1].value, kw))
                     nodes.append((kw,))
                     continue
+                if kw == "template":
+                    if len(toks) < 2 or toks[1].type != "CONST" or not isinstance(toks[1].value, str):
+                        raise TemplateError("template name must be a string constant")
+                    pipe = None
+                    if len(toks) > 2:
+                        pipe = self.parse_pipe(toks, 2, None, "template")[0]
+                    nodes.append(("template", toks[1].value, pipe))
+                    continue
                 raise TemplateError("unsupported action %r" % kw)
             pipe = self.parse_pipe(toks, 0, None, "command")[0]
             nodes.append(("action", pipe))
@@ -2634,6 +2642,7 @@ class Executor:
     def __init__(self, root, funcs):
         self.vars = [["$", root]]
         self.funcs = funcs
+        self.depth = 0
 
     # variables
     def mark(self):
@@ -2681,6 +2690,14 @@ class Executor:
                 self.pop(mark)
             elif k == "range":
                 self.walk_range(dot, node, out)
+            elif k == "template":
+                val = self.eval_pipeline(dot, node[2]) if node[2] is not None else None
+                sub = lookup_named_template(node[1])
+                if self.depth >= 1000:
+                    raise TemplateError("exceeded maximum template depth (1000)")
+                ex = Executor(val, self.funcs)
+                ex.depth = self.depth + 1
+                ex.walk(val, sub, out)
             elif k == "break":
                 raise _Break()
             elif k == "continue":
@@ -2896,6 +2913,31 @@ class Template:
 
 _CACHE = {}
 _CACHE_MAX = 2048
+
+# named templates registered by `kind: Template` mocks
+NAMED_TEMPLATES = {}
+_NAMED_PARSED = {}
+
+
+def set_named_templates(mapping):
+    global NAMED_TEMPLATES, _NAMED_PARSED
+    NAMED_TEMPLATES = dict(mapping)
+    _NAMED_PARSED = {}
+
+
+def lookup_named_template(name):
+    nodes = _NAMED_PARSED.get(name)
+    if nodes is not None:
+        return nodes
+    src = NAMED_TEMPLATES.get(name)
+    if src is None:
+        raise TemplateError('no such template "%s"' % name)
+    try:
+        nodes = Parser(lex(preprocess(src)), FUNCS).parse()
+    except RecursionError:
+        raise TemplateError("template too deeply nested")
+    _NAMED_PARSED[name] = nodes
+    return nodes
 
 
 def preprocess(src):
@@ -3224,6 +3266,89 @@ def _compile_path(path):
     return re.compile("".join(out), re.S), names
 
 
+_KIND_FIELDS = {
+    "Behavior": {"key", "kind", "extend", "expect", "actions", "values"},
+    "AbstractBehavior": {"key", "kind", "expect", "actions", "values"},
+    "Template": {"key", "kind", "template"},
+}
+_ALL_FIELDS = {"key", "kind", "extend", "expect", "actions", "values", "template"}
+
+
+def _is_zero(v):
+    return v is None or v == "" or (isinstance(v, (dict, list)) and len(v) == 0)
+
+
+def _check_fields(raw, kind):
+    allowed = _KIND_FIELDS[kind]
+    for f in _ALL_FIELDS:
+        if f not in allowed and f in raw and not _is_zero(raw[f]):
+            raise ValidationError("field %r is not allowed for kind %s" % (f, kind))
+
+
+def _action_order(a):
+    o = a.get("order", 0)
+    if o is None:
+        return 0
+    if isinstance(o, bool):
+        raise ValidationError("action order must be an integer")
+    if isinstance(o, float) and o.is_integer():
+        o = int(o)
+    if isinstance(o, str):
+        try:
+            o = int(o.strip())
+        except ValueError:
+            raise ValidationError("action order must be an integer")
+    if not isinstance(o, int):
+        raise ValidationError("action order must be an integer")
+    return o
+
+
+def _deep_merge(parent, child):
+    if isinstance(parent, dict) and isinstance(child, dict):
+        out = dict(parent)
+        for k, v in child.items():
+            if k in out:
+                out[k] = _deep_merge(out[k], v)
+            else:
+                out[k] = v
+        return out
+    if _is_zero(child):
+        return parent
+    return child
+
+
+def _merge_raw(parent, child):
+    out = {}
+    for k in set(parent) | set(child):
+        if k == "extend":
+            continue
+        pv, cv = parent.get(k), child.get(k)
+        if k == "values":
+            m = dict(pv) if isinstance(pv, dict) else {}
+            if isinstance(cv, dict):
+                m.update(cv)
+            elif cv is not None:
+                m = cv  # invalid; let validation reject it
+            out[k] = m
+        elif k == "actions":
+            pa = pv if isinstance(pv, list) else ([] if pv is None else pv)
+            ca = cv if isinstance(cv, list) else ([] if cv is None else cv)
+            if isinstance(pa, list) and isinstance(ca, list):
+                out[k] = list(pa) + list(ca)
+            else:
+                out[k] = cv if not isinstance(ca, list) else pv
+        elif k == "expect":
+            if isinstance(pv, dict) and isinstance(cv, dict):
+                out[k] = _deep_merge(pv, cv)
+            elif _is_zero(cv):
+                out[k] = pv
+            else:
+                out[k] = cv
+        else:
+            out[k] = pv if _is_zero(cv) else cv
+    return out
+
+
 class Behavior:
     def __init__(self, raw, source, templates_dir=None):
         if not isinstance(raw, dict):
@@ -3239,6 +3364,15 @@ class Behavior:
         if kind is None or kind == "":
             kind = "Behavior"
         self.kind = str(kind)
+        if self.kind not in ("Behavior", "AbstractBehavior"):
+            raise ValidationError("invalid kind %r" % self.kind)
+        _check_fields(raw, self.kind)
+        values = raw.get("values")
+        if values is None:
+            values = {}
+        if not isinstance(values, dict):
+            raise ValidationError("values must be a mapping")
+        self.values = values
         expect = raw.get("expect") or {}
         if not isinstance(expect, dict):
             raise ValidationError("expect must be a mapping")
@@ -3262,9 +3396,13 @@ class Behavior:
             raise ValidationError("actions must be a list")
         self.actions = []
         replies = 0
+        ordered = []
         for a in actions:
             if not isinstance(a, dict):
                 raise ValidationError("each action must be a mapping")
+            ordered.append((_action_order(a), a))
+        ordered.sort(key=lambda t: t[0])  # stable
+        for _, a in ordered:
             for name, spec in a.items():
                 if name == "reply_http":
                     replies += 1
@@ -3335,25 +3473,94 @@ def load_mocks(templates_dir):
                 count += 1
         LOG.debug("loaded mock file", file=path, count=count)
 
-    behaviors = []
+    # first pass: per-item structural validation, split templates/behaviors
+    templates = {}
+    entries = []  # (item, path) of Behavior / AbstractBehavior
     for item, path in raw:
         try:
-            b = Behavior(item, path, templates_dir)
+            if not isinstance(item, dict):
+                raise ValidationError("mock must be a mapping")
+            key = item.get("key")
+            if not isinstance(key, str) or key == "":
+                raise ValidationError("key is required and must be a non-empty string")
+            kind = item.get("kind")
+            if kind is None or kind == "":
+                kind = "Behavior"
+            if not isinstance(kind, str) or kind not in _KIND_FIELDS:
+                raise ValidationError("invalid kind %r" % (kind,))
+            _check_fields(item, kind)
+            if kind == "Template":
+                src = item.get("template")
+                if src is None:
+                    raise ValidationError("template is required")
+                src = _to_text(src)
+                try:
+                    Parser(lex(preprocess(src)), FUNCS).parse()
+                except RecursionError:
+                    raise ValidationError("template too deeply nested")
+                except TemplateError as e:
+                    raise ValidationError("invalid template: %s" % e)
+                if key in templates:
+                    LOG.warn("duplicate template key; overriding previous definition", key=key)
+                templates[key] = src
+                continue
+            ext = item.get("extend")
+            if ext is not None and not isinstance(ext, str):
+                raise ValidationError("extend must be a string")
+            if item.get("values") is not None and not isinstance(item.get("values"), dict):
+                raise ValidationError("values must be a mapping")
+            if item.get("actions") is not None and not isinstance(item.get("actions"), list):
+                raise ValidationError("actions must be a list")
+            if item.get("expect") is not None and not isinstance(item.get("expect"), dict):
+                raise ValidationError("expect must be a mapping")
         except ValidationError as e:
             key = item.get("key") if isinstance(item, dict) else None
             LOG.error("invalid mock rejected", file=path, key=_to_text(key), err=str(e))
             continue
-        behaviors.append(b)
+        entries.append((item, path))
+    set_named_templates(templates)
 
     # duplicate keys: the last loaded mock wins
     last_index = {}
-    for i, b in enumerate(behaviors):
-        if b.key in last_index:
-            prev = behaviors[last_index[b.key]]
+    for i, (item, path) in enumerate(entries):
+        k = item["key"]
+        if k in last_index:
+            prev = entries[last_index[k]]
             LOG.warn("duplicate mock key; overriding previous definition",
-                     key=b.key, previous_file=prev.source, file=b.source)
-        last_index[b.key] = i
-    result = [b for i, b in enumerate(behaviors) if last_index[b.key] == i]
+                     key=k, previous_file=prev[1], file=path)
+        last_index[k] = i
+    entries = [e for i, e in enumerate(entries) if last_index[e[0]["key"]] == i]
+    defs = {item["key"]: item for item, _ in entries}
+
+    resolved = {}
+
+    def resolve(key, stack):
+        if key in resolved:
+            return resolved[key]
+        item = defs[key]
+        ext = item.get("extend")
+        if ext:
+            if ext in defs and ext not in stack:
+                parent = resolve(ext, stack | {key})
+                merged = _merge_raw(parent, item)
+            else:
+                LOG.warn("extend target not found; extension skipped", key=key, extend=ext)
+                merged = {k: v for k, v in item.items() if k != "extend"}
+        else:
+            merged = {k: v for k, v in item.items() if k != "extend"}
+        if key not in stack:
+            resolved[key] = merged
+        return merged
+
+    result = []
+    for item, path in entries:
+        merged = resolve(item["key"], frozenset())
+        try:
+            b = Behavior(merged, path, templates_dir)
+        except ValidationError as e:
+            LOG.error("invalid mock rejected", file=path, key=_to_text(item.get("key")), err=str(e))
+            continue
+        result.append(b)
     LOG.info("mocks loaded", count=len(result), dir=templates_dir)
     return result
 
@@ -4025,6 +4232,7 @@ class MockHandler(BaseHTTPRequestHandler):
             "HTTPPath": uri,
             "HTTPQueryString": query,
             "HTTPPathParams": {},
+            "Values": {},
         }
 
         status, resp_headers, resp_body = 404, [("Content-Type", "text/plain; charset=utf-8")], "not found"
@@ -4034,6 +4242,7 @@ class MockHandler(BaseHTTPRequestHandler):
             if params is None:
                 continue
             ctx["HTTPPathParams"] = params
+            ctx["Values"] = b.values
             if b.condition:
                 try:
                     out = render(b.condition, ctx)
