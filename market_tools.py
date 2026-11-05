@@ -1084,6 +1084,382 @@ def handle_reprocess(state, headers, body):
 
 
 # --------------------------------------------------------------------------
+# Compression optimizer
+# --------------------------------------------------------------------------
+
+VARIANT_KEYS = ("base", "plus5", "plus10", "plus15")
+_COMPRESS_PREFIXES = ("Batch Compressed ", "Compressed ")
+
+
+def _strip_compressed(name):
+    for p in _COMPRESS_PREFIXES:
+        if name.startswith(p):
+            return name[len(p):]
+    return name
+
+
+def ore_variant_map(sde):
+    """Map ore type_id -> variant key, derived from material ratios per family."""
+    cached = getattr(sde, "_variant_map", None)
+    if cached is not None:
+        return cached
+    fams = {}
+    for tid, gid in sde.type_group.items():
+        if gid in GAS_GROUPS or sde.group_category.get(gid) != ORE_CATEGORY:
+            continue
+        mats = sde.materials.get(tid)
+        if not mats:
+            continue
+        key = (gid, frozenset(m for m, _ in mats))
+        fams.setdefault(key, []).append(tid)
+    names = set(sde.type_exact)
+    out = {}
+    for tids in fams.values():
+        totals = {t: sum(q for _, q in sde.materials[t]) for t in tids}
+        # Reference members: compressed ores or ores with compressed counterparts.
+        ref = [t for t in tids
+               if sde.types[t] != _strip_compressed(sde.types[t])
+               or any(p + sde.types[t] in names for p in _COMPRESS_PREFIXES)]
+        base_total = min(totals[t] for t in (ref or tids))
+        for t in tids:
+            r = totals[t] / base_total if base_total > 0 else 1.0
+            if r < 1.025:
+                out[t] = "base"
+            elif r < 1.075:
+                out[t] = "plus5"
+            elif r < 1.125:
+                out[t] = "plus10"
+            else:
+                out[t] = "plus15"
+    sde._variant_map = out
+    return out
+
+
+def _err400(details, error="INVALID_VALUE"):
+    return ApiError(400, error, details)
+
+
+def _num(v, path, lo=None, hi=None):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+        raise _err400("%s must be a number, got %s" % (path, json.dumps(v)))
+    if (lo is not None and v < lo) or (hi is not None and v > hi):
+        raise _err400("%s is out of range: %s" % (path, json.dumps(v)))
+    return float(v)
+
+
+def _parse_compress(data):
+    if not isinstance(data, dict):
+        raise _err400("Request body must be a JSON object")
+    mats = data.get("materials")
+    if not isinstance(mats, dict) or not mats:
+        raise _err400("materials must be a non-empty object mapping names to quantities")
+    for name, q in mats.items():
+        if isinstance(q, bool) or not isinstance(q, (int, float)) or \
+                (isinstance(q, float) and q != int(q)) or q < 0:
+            raise _err400("Quantity for '%s' must be a non-negative integer, got %s"
+                          % (name, json.dumps(q)))
+    hubs = data.get("hubs")
+    if hubs is None:
+        hubs = ["jita"]
+    if isinstance(hubs, str):
+        hubs = [hubs]
+    if not isinstance(hubs, list) or not hubs:
+        raise _err400("hubs must be a non-empty list of hub names")
+    hub_keys = []
+    for h in hubs:
+        if not isinstance(h, str) or h.strip().lower() not in MARKET_KEYS:
+            raise _err400("Unknown hub %s; expected one of: %s"
+                          % (json.dumps(h), ", ".join(MARKET_KEYS)))
+        k = h.strip().lower()
+        if k not in hub_keys:
+            hub_keys.append(k)
+    cost_m3 = data.get("cost_per_m3")
+    cost_m3 = 0.0 if cost_m3 is None else _num(cost_m3, "cost_per_m3", lo=0)
+    tax = data.get("collateral_tax")
+    tax = 0.0 if tax is None else _num(tax, "collateral_tax", lo=0)
+    eff_in = data.get("efficiencies")
+    if eff_in is None:
+        eff_in = data.get("efficiency") or {}
+    if not isinstance(eff_in, dict):
+        raise _err400("efficiencies must be an object")
+    eff = dict(DEFAULT_EFF)
+    for k in ("ore", "gas", "scrap"):
+        if eff_in.get(k) is not None:
+            eff[k] = _num(eff_in[k], "efficiencies.%s" % k, lo=0, hi=1)
+    var_in = data.get("ore_variants")
+    if var_in is None:
+        var_in = {}
+    if not isinstance(var_in, dict):
+        raise _err400("ore_variants must be an object")
+    variants = {}
+    for k in VARIANT_KEYS:
+        v = var_in.get(k, True)
+        if v is None:
+            v = True
+        if not isinstance(v, bool):
+            raise _err400("ore_variants.%s must be a boolean" % k)
+        variants[k] = v
+    return mats, hub_keys, cost_m3, tax, eff, variants
+
+
+def _solve_milp(cands, orders_by_type, targets, cost_m3, tax, rhs_extra):
+    import numpy as np
+    from scipy.optimize import milp, LinearConstraint, Bounds
+    from scipy.sparse import lil_matrix
+
+    nt = len(cands)
+    order_list = []
+    for i, c in enumerate(cands):
+        for o in orders_by_type[c["tid"]]:
+            order_list.append((i, o))
+    no = len(order_list)
+    nv = nt + no
+    cost = np.zeros(nv)
+    lb = np.zeros(nv)
+    ub = np.full(nv, np.inf)
+    integrality = np.zeros(nv)
+    for i, c in enumerate(cands):
+        cost[i] = c["portion"] * c["volume"] * cost_m3
+        integrality[i] = 1
+        ub[i] = c["max_portions"]
+    for j, (i, o) in enumerate(order_list):
+        cost[nt + j] = o["price"] * (1.0 + tax)
+        ub[nt + j] = o["volume_remain"]
+    mids = list(targets)
+    A = lil_matrix((nt + len(mids), nv))
+    lo = np.zeros(nt + len(mids))
+    hi = np.zeros(nt + len(mids))
+    for i, c in enumerate(cands):
+        A[i, i] = -float(c["portion"])
+    for j, (i, _o) in enumerate(order_list):
+        A[i, nt + j] = 1.0
+    # sum(x) - portion*n in [0, portion-1] keeps purchases tied to whole portions.
+    for i, c in enumerate(cands):
+        lo[i] = 0.0
+        hi[i] = 0.0
+    for r, m in enumerate(mids):
+        for i, c in enumerate(cands):
+            a = c["yield"].get(m)
+            if a:
+                A[nt + r, i] = a
+        lo[nt + r] = targets[m] + rhs_extra.get(m, 0)
+        hi[nt + r] = np.inf
+    res = milp(cost, constraints=LinearConstraint(A.tocsr(), lo, hi),
+               integrality=integrality, bounds=Bounds(lb, ub),
+               options={"time_limit": 60, "mip_rel_gap": 1e-9, "presolve": True})
+    if res.x is None:
+        return None
+    return [int(round(res.x[i])) for i in range(nt)]
+
+
+def handle_compress(state, body):
+    data = _json_body(body)
+    try:
+        mats, hub_keys, cost_m3, tax, eff, variants = _parse_compress(data)
+    except ValueApiError as e:
+        raise ApiError(400, "INVALID_VALUE", e.message)
+    sde = state.sde
+
+    targets = {}
+    unknown = []
+    for name, q in mats.items():
+        tid = sde.type_exact.get(name)
+        if tid is None:
+            tid = sde.type_by_name.get(name.strip().lower())
+        if tid is None:
+            unknown.append(name)
+            continue
+        targets[tid] = targets.get(tid, 0) + int(q)
+    if unknown:
+        raise ApiError(404, "UNKNOWN_ITEMS", sorted(unknown))
+
+    # Gather hub orders.
+    with state.lock:
+        hub_order_lists = []
+        for hk in hub_keys:
+            lst = hub_orders(state, hk)
+            if lst:
+                hub_order_lists.append(lst)
+    all_hub = {}
+    for lst in hub_order_lists:
+        for o in lst:
+            all_hub[o["order_id"]] = o
+    hub_list = list(all_hub.values())
+    by_type = {}
+    for o in hub_list:
+        by_type.setdefault(o["type_id"], []).append(o)
+
+    model = YieldModel(sde, efficiency=eff)
+    vmap = ore_variant_map(sde)
+    need = {m for m, q in targets.items() if q > 0}
+
+    cands = []
+    orders_by_type = {}
+    for tid, lst in by_type.items():
+        sells = [o for o in lst if not o["is_buy_order"] and o["volume_remain"] > 0
+                 and o["price"] >= 0]
+        if not sells:
+            continue
+        mats_t = sde.materials.get(tid)
+        if not mats_t:
+            continue
+        kind = model.kind(tid)
+        if kind == "scrap":
+            continue
+        if kind == "ore" and not variants.get(vmap.get(tid, "base"), True):
+            continue
+        base = {}
+        for mid, q in mats_t:
+            base[mid] = base.get(mid, 0) + q
+        if not any(m in need for m in base):
+            continue
+        mult = eff[kind]
+        portion = sde.type_portion.get(tid, 1)
+        avail = sum(o["volume_remain"] for o in sells)
+        if avail < portion:
+            continue
+        cands.append({
+            "tid": tid, "kind": kind, "portion": portion, "mult": mult,
+            "base": base, "volume": item_volume(sde, tid),
+            "yield": {m: q * mult for m, q in base.items()},
+            "max_portions": avail // portion,
+        })
+        orders_by_type[tid] = sorted(sells, key=lambda o: (o["price"], o["order_id"]))
+    if need and not cands:
+        raise ApiError(404, "NO_CANDIDATES",
+                       "No ore or gas with sell orders in the selected hubs yields the requested materials")
+    cands.sort(key=lambda c: c["tid"])
+
+    def actual_yields(ns):
+        out = {}
+        for c, n in zip(cands, ns):
+            if n <= 0:
+                continue
+            for mid, q in c["base"].items():
+                v = int(math.floor(n * q * c["mult"] + EPS))
+                if v > 0:
+                    out[mid] = out.get(mid, 0) + v
+        return out
+
+    # Quick feasibility check on volume.
+    for m in need:
+        cap = sum(c["yield"].get(m, 0) * c["max_portions"] for c in cands)
+        if cap + EPS < targets[m]:
+            raise ApiError(400, "INFEASIBLE",
+                           "Cannot meet target for %s with available market volume "
+                           "(max %d of %d)" % (sde.types[m], int(cap), targets[m]))
+
+    ns = [0] * len(cands)
+    if need:
+        extra = {}
+        ns = None
+        for _ in range(50):
+            sol = _solve_milp(cands, orders_by_type, {m: targets[m] for m in need},
+                              cost_m3, tax, extra)
+            if sol is None:
+                raise ApiError(400, "INFEASIBLE",
+                               "Cannot meet material targets with available market volume")
+            got = actual_yields(sol)
+            short = {m: targets[m] - got.get(m, 0) for m in need if got.get(m, 0) < targets[m]}
+            if not short:
+                ns = sol
+                break
+            for m, d in short.items():
+                extra[m] = extra.get(m, 0) + d
+        if ns is None:
+            raise ApiError(400, "INFEASIBLE", "Could not find a solution meeting all targets")
+
+    # Build purchases (cheapest orders first for each chosen type).
+    buy_list = {}
+    items_total = 0.0
+    volume_total = 0.0
+    for c, n in zip(cands, ns):
+        if n <= 0:
+            continue
+        qty = n * c["portion"]
+        remaining = qty
+        per_station = {}
+        cost = 0.0
+        for o in orders_by_type[c["tid"]]:
+            if remaining <= 0:
+                break
+            take = min(remaining, o["volume_remain"])
+            remaining -= take
+            st = state.station_name(o["location_id"])
+            ps = per_station.setdefault(st, [0, 0.0])
+            ps[0] += take
+            ps[1] += take * o["price"]
+            cost += take * o["price"]
+        vol = qty * c["volume"]
+        items_total += cost
+        volume_total += vol
+        buy_list[sde.types[c["tid"]]] = {
+            "quantity": qty,
+            "cost": round(cost, 2),
+            "volume": round(vol, 2),
+            "category": c["kind"],
+            "purchases": {
+                st: {"quantity": q, "total": round(t, 2),
+                     "avg_price": round(t / q, 2) if q else 0.0}
+                for st, (q, t) in sorted(per_station.items())
+            },
+        }
+    buy_list = dict(sorted(buy_list.items()))
+
+    shipping = volume_total * cost_m3
+    collateral = items_total * tax
+    total = items_total + shipping + collateral
+
+    got = actual_yields(ns)
+    stats_cache = {}
+
+    def stats(tid):
+        if tid not in stats_cache:
+            lst = by_type.get(tid)
+            stats_cache[tid] = type_stats(lst) if lst else None
+        return stats_cache[tid]
+
+    def price(tid, field):
+        st = stats(tid)
+        return st[field] if st and st[field] is not None else None
+
+    raw_ship = sum(q * item_volume(sde, m) for m, q in targets.items()) * cost_m3
+    material_value = 0.0
+    for m, q in targets.items():
+        p = price(m, "sell_5pct")
+        if p is not None:
+            material_value += q * p
+    excess_value = 0.0
+    yields = {}
+    for m in sorted(set(got) | set(targets), key=lambda t: sde.types.get(t, "")):
+        actual = got.get(m, 0)
+        tgt = targets.get(m)
+        s5 = price(m, "sell_5pct")
+        b5 = price(m, "buy_5pct")
+        excess = actual - (tgt or 0)
+        if s5 is not None and excess > 0:
+            excess_value += excess * s5
+        yields[sde.types.get(m, str(m))] = {
+            "target": tgt,
+            "actual": actual,
+            "buy": round(actual * b5, 2) if b5 is not None else None,
+            "sell": round(actual * s5, 2) if s5 is not None else None,
+        }
+
+    return 200, {
+        "buy_list": buy_list,
+        "total": round(total, 2),
+        "shipping": round(shipping, 2),
+        "collateral_tax": round(collateral, 2),
+        "items": round(items_total, 2),
+        "raw_ship": round(raw_ship, 2),
+        "material_value": round(material_value, 2),
+        "excess_value": round(excess_value, 2),
+        "yields": yields,
+    }
+
+
+# --------------------------------------------------------------------------
 # HTTP plumbing
 # --------------------------------------------------------------------------
 
@@ -1146,6 +1522,8 @@ def make_handler(state):
                         return self._send(*handle_config(state, body))
                     if method == "POST" and route == "reprocess" and len(parts) == 2:
                         return self._send(*handle_reprocess(state, headers, body))
+                    if method == "POST" and route == "compress" and len(parts) == 2:
+                        return self._send(*handle_compress(state, body))
                     if method == "GET" and route == "hub-compare" and len(parts) == 3:
                         return self._send(*handle_hub_compare(state, parts[2]))
                 self._send(404, {"error": "NOT_FOUND", "details": "No route for %s %s" % (method, parsed.path)})
