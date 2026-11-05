@@ -475,7 +475,7 @@ def cmd_alloc_delete(data_dir, args):
 
 
 UNIT_FILE = "units.json"
-UNIT_SYSTEM_FIELDS = ("uuid", "status", "module_uuids", "created_at")
+UNIT_SYSTEM_FIELDS = ("uuid", "status", "module_uuids", "created_at", "reserved_capacity")
 
 
 def load_units(data_dir):
@@ -509,6 +509,13 @@ def unit_view(u):
     out = dict(u)
     mods = out.get("module_uuids")
     out["module_uuids"] = sorted(mods) if isinstance(mods, list) else []
+    caps = out.get("capabilities")
+    out["capabilities"] = sorted(set(caps)) if isinstance(caps, list) else []
+    cap = out.get("capacity")
+    if out.get("status") == "inactive":
+        out["reserved_capacity"] = cap if isinstance(cap, int) and not isinstance(cap, bool) else 0
+    else:
+        out["reserved_capacity"] = 0
     return out
 
 
@@ -550,6 +557,15 @@ def cmd_unit_create(data_dir, args):
             errors.append("parent_uuid: must be a string, got %s" % type_name(p))
         elif p == "":
             errors.append("parent_uuid: must be a non-empty string")
+    if "capabilities" in doc:
+        caps = doc["capabilities"]
+        if not isinstance(caps, list):
+            errors.append("capabilities: must be an array of strings, got %s" % type_name(caps))
+        else:
+            for j, cap in enumerate(caps):
+                if not isinstance(cap, str):
+                    errors.append("capabilities[%d]: must be a string, got %s"
+                                  % (j, type_name(cap)))
     for k in UNIT_SYSTEM_FIELDS:
         if k in doc:
             errors.append("%s: is system-assigned and must not be provided" % k)
@@ -570,6 +586,8 @@ def cmd_unit_create(data_dir, args):
         "parent_uuid": parent,
         "module_uuids": [],
         "capacity": doc["capacity"],
+        "capabilities": sorted(set(doc.get("capabilities") or [])),
+        "reserved_capacity": 0,
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     units.append(unit)
@@ -630,11 +648,53 @@ def cmd_unit_get(data_dir, args):
     raise ForgeError("not_found", "unit '%s' not found" % ident)
 
 
+def _unit_transition(data_dir, args, name, frm, to):
+    if len(args) != 1:
+        raise ForgeError("validation_error", "%s requires exactly one argument: <uuid>" % name)
+    ident = args[0]
+    units = load_units(data_dir)
+    for u in units:
+        if u.get("uuid") == ident:
+            if u.get("status") != frm:
+                raise ForgeError("invalid_transition",
+                                 "cannot %s unit '%s': status is '%s', expected '%s'"
+                                 % (name, ident, u.get("status"), frm))
+            u["status"] = to
+            cap = u.get("capacity")
+            u["reserved_capacity"] = (cap if to == "inactive" and isinstance(cap, int)
+                                      and not isinstance(cap, bool) else 0)
+            if not isinstance(u.get("capabilities"), list):
+                u["capabilities"] = []
+            save_units(data_dir, units)
+            return unit_view(u)
+    raise ForgeError("not_found", "unit '%s' not found" % ident)
+
+
+def cmd_unit_activate(data_dir, args):
+    return _unit_transition(data_dir, args, "activate", "inactive", "active")
+
+
+def cmd_unit_deactivate(data_dir, args):
+    return _unit_transition(data_dir, args, "deactivate", "active", "inactive")
+
+
+def cmd_ledger_capabilities(data_dir, args):
+    if args:
+        raise ForgeError("validation_error", "ledger capabilities takes no arguments")
+    caps = set()
+    for u in load_units(data_dir):
+        if u.get("status") == "active" and isinstance(u.get("capabilities"), list):
+            caps.update(c for c in u["capabilities"] if isinstance(c, str))
+    return sorted(caps)
+
+
 GROUPS = {
     "blueprint": COMMANDS,
     "allocation": {"create": cmd_alloc_create, "list": cmd_alloc_list, "get": cmd_alloc_get,
                    "bind": cmd_alloc_bind, "delete": cmd_alloc_delete},
-    "unit": {"create": cmd_unit_create, "list": cmd_unit_list, "get": cmd_unit_get},
+    "unit": {"create": cmd_unit_create, "list": cmd_unit_list, "get": cmd_unit_get,
+             "activate": cmd_unit_activate, "deactivate": cmd_unit_deactivate},
+    "ledger": {"capabilities": cmd_ledger_capabilities},
 }
 
 
@@ -660,7 +720,7 @@ def parse_argv(argv):
         raise ForgeError("validation_error", "--data-dir is required")
     if not rest or rest[0] not in GROUPS:
         raise ForgeError("validation_error",
-                         "usage: forge.py --data-dir <path> {blueprint|allocation|unit} <command> [args]")
+                         "usage: forge.py --data-dir <path> {blueprint|allocation|unit|ledger} <command> [args]")
     group = rest[0]
     if len(rest) < 2:
         raise ForgeError("validation_error", "missing %s command" % group)
