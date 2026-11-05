@@ -1891,6 +1891,336 @@ def collect_parent_refs(configs, patterns):
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint 5: validation rules
+# ---------------------------------------------------------------------------
+
+VALIDATION_RULE_TYPES = ("require_keys", "validate_type", "validate_value",
+                         "unique_array_values")
+VALIDATION_TYPES = ("string", "number", "boolean", "array", "object", "null")
+
+
+def is_validation_rule(rule):
+    if not isinstance(rule, dict):
+        return False
+    if rule.get("scope") == "validation":
+        return True
+    return rule.get("type") in VALIDATION_RULE_TYPES and "scope" not in rule
+
+
+def _is_path(value):
+    return isinstance(value, str) or (
+        isinstance(value, list) and all(isinstance(p, str) for p in value))
+
+
+def _is_num(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def validate_validation_rule(name, rule):
+    rtype = rule.get("type")
+    if rtype not in VALIDATION_RULE_TYPES:
+        return "unknown validation rule type '%s'" % rtype
+    if rtype == "require_keys":
+        keys = rule.get("keys")
+        if "keys" not in rule:
+            return "missing required field 'keys'"
+        if isinstance(keys, str):
+            keys = [keys]
+        if not isinstance(keys, list) or not all(_is_path(k) for k in keys):
+            return "field 'keys' must be an array of key paths"
+    elif rtype == "validate_type":
+        if "key" not in rule:
+            return "missing required field 'key'"
+        if not _is_path(rule["key"]):
+            return "field 'key' must be a string"
+        if "expected_type" not in rule:
+            return "missing required field 'expected_type'"
+        if rule["expected_type"] not in VALIDATION_TYPES:
+            return "unsupported expected_type '%s'" % (rule["expected_type"],)
+    elif rtype == "validate_value":
+        if "key" not in rule:
+            return "missing required field 'key'"
+        if not _is_path(rule["key"]):
+            return "field 'key' must be a string"
+        c = rule.get("constraint")
+        if not isinstance(c, dict):
+            return "field 'constraint' must be an object"
+        if "enum" in c and not isinstance(c["enum"], list):
+            return "constraint 'enum' must be an array"
+        for k in ("min", "max"):
+            if k in c and not _is_num(c[k]):
+                return "constraint '%s' must be a number" % k
+        for k in ("length_min", "length_max"):
+            if k in c and not _is_num(c[k]):
+                return "constraint '%s' must be a number" % k
+        if "pattern" in c:
+            if not isinstance(c["pattern"], str):
+                return "constraint 'pattern' must be a string"
+            try:
+                re.compile(c["pattern"])
+            except re.error as exc:
+                return "invalid regex in 'pattern': %s" % exc
+    elif rtype == "unique_array_values":
+        if "array_path" not in rule:
+            return "missing required field 'array_path'"
+        if not _is_path(rule["array_path"]):
+            return "field 'array_path' must be a string"
+        if "field" not in rule:
+            return "missing required field 'field'"
+        if not _is_path(rule["field"]):
+            return "field 'field' must be a string"
+    return None
+
+
+_INI_INT_RE = re.compile(r"^[-+]?\d+$")
+_INI_FLOAT_RE = re.compile(r"^[-+]?(\d+\.\d*|\.\d+|\d+)([eE][-+]?\d+)?$")
+
+
+def _infer_ini(value):
+    if isinstance(value, dict):
+        return {k: _infer_ini(v) for k, v in value.items()}
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    low = s.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if _INI_INT_RE.match(s):
+        try:
+            return int(s)
+        except ValueError:
+            return value
+    if _INI_FLOAT_RE.match(s):
+        try:
+            return float(s)
+        except ValueError:
+            return value
+    return value
+
+
+def _render_comp(comp):
+    if isinstance(comp, tuple):
+        if comp[0] == "all":
+            return "[*]"
+        if comp[0] == "idx":
+            return "[%d]" % comp[1]
+        return None
+    return comp
+
+
+def _join_concrete(prefix, comp):
+    """Append a concrete component (str key or int index) to a path string."""
+    if isinstance(comp, int):
+        return "%s[%d]" % (prefix, comp)
+    if prefix == "":
+        return comp
+    return prefix + "." + comp
+
+
+def find_concrete(data, path):
+    """Resolve `path` against plain `data`.
+
+    Returns (matches, missing): matches is [(concrete_path, value)];
+    missing is [concrete_path] for selector-expanded elements where the
+    remainder of the path does not exist.  When the path has no selectors,
+    the original path string is used as the concrete path."""
+    if isinstance(path, list):
+        orig = ".".join(path)
+        comps = [str(p) for p in path]
+    else:
+        orig = path
+        comps = parse_path(path)
+    if not has_selector(comps):
+        parts = split_path(path) if isinstance(path, str) else comps
+        found, _, _, value = resolve_path(data, parts)
+        if found:
+            return [(orig, value)], []
+        return [], [orig]
+    matches = []
+    missing = []
+
+    def walk(node, idx, prefix, expanded):
+        if idx == len(comps):
+            matches.append((prefix, node))
+            return
+        comp = comps[idx]
+        if isinstance(comp, tuple):
+            for i in _selector_indices(node, comp):
+                walk(node[i], idx + 1, _join_concrete(prefix, i), True)
+            return
+        found, child = _child(node, comp)
+        if not found:
+            if expanded:
+                rest = [_render_comp(c) for c in comps[idx:]]
+                if any(r is None for r in rest):
+                    missing.append(orig)
+                    return
+                p = prefix
+                for r in rest:
+                    if r.startswith("["):
+                        p = p + r
+                    else:
+                        p = _join_concrete(p, r)
+                missing.append(p)
+            else:
+                missing.append(orig)
+            return
+        if is_sequence(node):
+            walk(child, idx + 1, _join_concrete(prefix, int(comp)), expanded)
+        else:
+            walk(child, idx + 1, _join_concrete(prefix, comp), expanded)
+
+    walk(data, 0, "", False)
+    return matches, missing
+
+
+def _type_name(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "string"
+
+
+def _fmt_num(value):
+    if isinstance(value, float) and value.is_integer() and abs(value) < 1e16:
+        # keep float formatting as given (e.g. 1.0)
+        return repr(value)
+    return str(value)
+
+
+def _fmt_value(value):
+    if isinstance(value, str):
+        return "'%s'" % value
+    if _is_num(value):
+        return _fmt_num(value)
+    return stringify(value)
+
+
+def _fmt_list_item(value):
+    if isinstance(value, str):
+        return value
+    return stringify(value)
+
+
+def _check_constraints(path, value, c):
+    errors = []
+    if "enum" in c:
+        allowed = c["enum"]
+        if not any(strict_equal(value, a) for a in allowed):
+            errors.append("value %s at key '%s' not in allowed values: [%s]" % (
+                _fmt_value(value), path,
+                ", ".join(_fmt_list_item(a) for a in allowed)))
+    if ("min" in c or "max" in c):
+        if _is_num(value):
+            if "min" in c and value < c["min"]:
+                errors.append("value %s at key '%s' is less than min: %s" % (
+                    _fmt_num(value), path, _fmt_num(c["min"])))
+            if "max" in c and value > c["max"]:
+                errors.append("value %s at key '%s' exceeds max: %s" % (
+                    _fmt_num(value), path, _fmt_num(c["max"])))
+        else:
+            errors.append("expected type number at key '%s', got %s" % (
+                path, _type_name(value)))
+    if "pattern" in c:
+        s = stringify(value)
+        if re.search(c["pattern"], s) is None:
+            errors.append("value '%s' at key '%s' does not match pattern: %s" % (
+                s, path, c["pattern"]))
+    if "length_min" in c or "length_max" in c:
+        if isinstance(value, (str, list)):
+            n = len(value)
+            if "length_min" in c and n < c["length_min"]:
+                errors.append("value at key '%s' length %d is less than min length: %s"
+                              % (path, n, _fmt_num(c["length_min"])))
+            if "length_max" in c and n > c["length_max"]:
+                errors.append("value at key '%s' length %d exceeds max length: %s"
+                              % (path, n, _fmt_num(c["length_max"])))
+    return errors
+
+
+def _hashable(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def run_validation_rule(data, rule):
+    """Return a list of error messages for `rule` applied to plain `data`."""
+    rtype = rule.get("type")
+    errors = []
+    if rtype == "require_keys":
+        keys = rule.get("keys")
+        if isinstance(keys, str):
+            keys = [keys]
+        for key in keys:
+            _, missing = find_concrete(data, key)
+            seen = set()
+            for p in missing:
+                if p in seen:
+                    continue
+                seen.add(p)
+                errors.append("missing required key: %s" % p)
+    elif rtype == "validate_type":
+        expected = rule["expected_type"]
+        matches, _ = find_concrete(data, rule["key"])
+        for path, value in matches:
+            got = _type_name(value)
+            if got != expected:
+                errors.append("expected type %s at key '%s', got %s"
+                              % (expected, path, got))
+    elif rtype == "validate_value":
+        matches, _ = find_concrete(data, rule["key"])
+        for path, value in matches:
+            errors.extend(_check_constraints(path, value, rule["constraint"]))
+    elif rtype == "unique_array_values":
+        field = rule["field"]
+        matches, _ = find_concrete(data, rule["array_path"])
+        for path, arr in matches:
+            if not isinstance(arr, list) or not arr:
+                continue
+            counts = {}
+            order = []
+            for elem in arr:
+                found, value = get_path_value(elem, field) if isinstance(field, str) \
+                    else resolve_path(elem, field)[::3]
+                if not found:
+                    continue
+                h = _hashable(value)
+                if h not in counts:
+                    counts[h] = [0, value]
+                    order.append(h)
+                counts[h][0] += 1
+            dups = [counts[h][1] for h in order if counts[h][0] > 1]
+            if dups:
+                errors.append("duplicate values for field '%s' in array at '%s': %s" % (
+                    field if isinstance(field, str) else ".".join(field), path,
+                    ", ".join(_fmt_list_item(d) for d in dups)))
+    return errors
+
+
+def validation_data(cfg, inheritance_patterns):
+    """Plain merged data of `cfg` (after inheritance) used for validation."""
+    if inheritance_patterns is not None:
+        fresh = ConfigFile(cfg.path, cfg.rel, cfg.fmt, cfg.label)
+        Inheritance(inheritance_patterns).resolve(fresh)
+        data = to_plain(fresh.data)
+    else:
+        data = to_plain(cfg.data)
+    if cfg.fmt == "ini":
+        data = _infer_ini(data)
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1960,6 +2290,11 @@ def main(argv):
 
     for name in sorted(rules.keys()):
         rule = rules[name]
+        if is_validation_rule(rule):
+            msg = validate_validation_rule(name, rule)
+            if msg is not None:
+                error("invalid rule '%s': %s" % (name, msg))
+            continue
         if is_file_rule(rule):
             msg = validate_file_rule(name, rule)
             if msg is not None:
@@ -1970,9 +2305,12 @@ def main(argv):
             error("invalid rule '%s': %s" % (name, msg))
 
     rule_names = sorted(rules.keys())
-    file_rule_names = [n for n in rule_names if is_file_rule(rules[n])]
+    validation_rule_names = [n for n in rule_names if is_validation_rule(rules[n])]
+    file_rule_names = [n for n in rule_names
+                       if not is_validation_rule(rules[n]) and is_file_rule(rules[n])]
     content_rule_names = [n for n in rule_names
-                          if isinstance(rules[n], dict) and not is_file_rule(rules[n])]
+                          if isinstance(rules[n], dict) and not is_file_rule(rules[n])
+                          and not is_validation_rule(rules[n])]
     has_file_rules = bool(file_rule_names)
 
     inheritance = None
@@ -1994,6 +2332,28 @@ def main(argv):
             configs.append(ConfigFile(full, rel, fmt, label))
         except (ParseError, OSError):
             error("failed to parse %s" % label)
+
+    if validation_rule_names:
+        failures = []
+        for cfg in configs:
+            try:
+                data = validation_data(
+                    cfg, inheritance.patterns if inheritance is not None else None)
+            except InheritanceError as exc:
+                error(str(exc))
+            except (ParseError, OSError):
+                error("failed to parse %s" % cfg.label)
+            for name in validation_rule_names:
+                for msg in run_validation_rule(data, rules[name]):
+                    failures.append({
+                        "event": "validation_failed",
+                        "file": cfg.rel,
+                        "rule": name,
+                        "error": msg,
+                    })
+        if failures:
+            emit(failures)
+            sys.exit(1)
 
     parent_refs = set()
     if inheritance is not None and has_file_rules:
