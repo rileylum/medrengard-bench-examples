@@ -521,7 +521,10 @@ class ConfigFile:
 
     def _dump_toml(self):
         import tomlkit
-        return tomlkit.dumps(self.data)
+        text = tomlkit.dumps(self.data)
+        if getattr(self, "toml_fix_spacing", False):
+            text = _fix_toml_spacing(text)
+        return text
 
     # INI ----------------------------------------------------------------
     def _load_ini(self):
@@ -643,6 +646,17 @@ def apply_replace_value(cfg, rule):
     key = rule.get("key")
     if key is None or "value" not in rule:
         return False
+    if has_selector(parse_path(key)):
+        value = rule["value"]
+        if not cfg.value_supported(value):
+            return False
+        changed = False
+        for parent, k in find_targets(cfg.data, key):
+            if not _values_differ(cfg, parent[k], value):
+                continue
+            _set_child(cfg, parent, k, value)
+            changed = True
+        return changed
     parts = split_path(key)
     if not parts:
         return False
@@ -723,11 +737,36 @@ def _clear_display_names(item):
             _clear_display_names(t)
 
 
+def _rename_with_selectors(cfg, old_comps, new_comps):
+    if len(old_comps) != len(new_comps) or old_comps[:-1] != new_comps[:-1]:
+        return False
+    old_last, new_last = old_comps[-1], new_comps[-1]
+    if isinstance(old_last, tuple) or isinstance(new_last, tuple):
+        return False
+    if old_last == new_last:
+        return False
+    if len(old_comps) == 1:
+        parents = [cfg.data]
+    else:
+        parents = [p[k] for p, k, _ in match_pattern(cfg.data, old_comps[:-1], literal=True)]
+    changed = False
+    for parent in parents:
+        if not is_mapping(parent) or old_last not in parent:
+            continue
+        _rename_in_place(cfg, parent, old_last, new_last)
+        changed = True
+    return changed
+
+
 def apply_rename_key(cfg, rule):
     old_key = rule.get("old_key")
     new_key = rule.get("new_key")
     if old_key is None or new_key is None:
         return False
+    old_comps = parse_path(old_key)
+    new_comps = parse_path(new_key)
+    if has_selector(old_comps) or has_selector(new_comps):
+        return _rename_with_selectors(cfg, old_comps, new_comps)
     old_parts = split_path(old_key)
     new_parts = split_path(new_key)
     if not old_parts or not new_parts:
@@ -925,14 +964,190 @@ def _values_differ(cfg, current, value):
     return True
 
 
-def match_pattern(data, pattern_parts):
-    """Yield (parent, key, captures) for every path matching the pattern."""
+# ---------------------------------------------------------------------------
+# Checkpoint 3: array selectors in paths
+# ---------------------------------------------------------------------------
+
+_INT_RE = re.compile(r"^-?\d+$")
+_FLOAT_RE = re.compile(r"^-?(\d+\.\d*|\.\d+|\d+)([eE][-+]?\d+)?$")
+
+
+def _parse_filter_value(raw):
+    """Return (value, raw_string_or_None)."""
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1], None
+    low = raw
+    if low == "true":
+        return True, raw
+    if low == "false":
+        return False, raw
+    if low in ("null", "None", "~"):
+        return None, raw
+    if _INT_RE.match(raw):
+        return int(raw), raw
+    if _FLOAT_RE.match(raw) and any(ch.isdigit() for ch in raw):
+        try:
+            return float(raw), raw
+        except ValueError:
+            pass
+    return raw, None
+
+
+def _parse_selector(inner):
+    s = inner.strip()
+    if s == "*":
+        return ("all",)
+    if _INT_RE.match(s):
+        return ("idx", int(s))
+    if s.startswith("?"):
+        body = s[1:].strip()
+        if body.startswith("(") and body.endswith(")"):
+            body = body[1:-1]
+        conds = []
+        for part in body.split("&"):
+            part = part.strip()
+            if part == "":
+                continue
+            neg = False
+            if "!=" in part and part.index("!=") < part.index("=") + 1:
+                k, v = part.split("!=", 1)
+                neg = True
+            elif "=" in part:
+                k, v = part.split("=", 1)
+                if v.startswith("="):
+                    v = v[1:]
+            else:
+                return None
+            k = k.strip()
+            if not k:
+                return None
+            value, raw = _parse_filter_value(v)
+            conds.append((k, value, raw, neg))
+        if not conds:
+            return None
+        return ("filter", tuple(conds))
+    return None
+
+
+def parse_path(path):
+    """Split a key path into components.
+
+    String components are mapping keys (or numeric indices / wildcards as in
+    checkpoint 2); tuple components are array selectors:
+    ("all",), ("idx", n), ("filter", ((key, value, raw, negated), ...)).
+    """
+    if isinstance(path, list):
+        return [str(p) for p in path]
+    s = str(path)
+    comps = []
+    buf = []
+    after_sel = False
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == ".":
+            if not after_sel:
+                comps.append("".join(buf))
+            buf = []
+            after_sel = False
+            i += 1
+            continue
+        if c == "[":
+            j = s.find("]", i + 1)
+            sel = _parse_selector(s[i + 1:j]) if j != -1 else None
+            if sel is None:
+                buf.append(c)
+                after_sel = False
+                i += 1
+                continue
+            if buf:
+                comps.append("".join(buf))
+                buf = []
+            comps.append(sel)
+            after_sel = True
+            i = j + 1
+            continue
+        if after_sel:
+            after_sel = False
+        buf.append(c)
+        i += 1
+    if buf or not after_sel:
+        comps.append("".join(buf))
+    return comps
+
+
+def has_selector(comps):
+    return any(isinstance(c, tuple) for c in comps)
+
+
+def _filter_matches(elem, conds):
+    if not is_mapping(elem):
+        return False
+    for key, value, raw, neg in conds:
+        if key in elem:
+            cur = elem[key]
+            ok = strict_equal(cur, value)
+            if not ok and raw is not None:
+                plain = to_plain(cur)
+                ok = isinstance(plain, str) and plain == raw
+        else:
+            ok = False
+        if neg:
+            ok = not ok
+        if not ok:
+            return False
+    return True
+
+
+def _selector_indices(node, sel):
+    if not is_sequence(node):
+        return []
+    if sel[0] == "all":
+        return list(range(len(node)))
+    if sel[0] == "idx":
+        idx = sel[1]
+        if idx < 0:
+            idx += len(node)
+        if 0 <= idx < len(node):
+            return [idx]
+        return []
+    if sel[0] == "filter":
+        return [i for i in range(len(node)) if _filter_matches(node[i], sel[1])]
+    return []
+
+
+def match_pattern(data, pattern_parts, literal=False):
+    """Return [(parent, key, captures)] for every path matching the pattern.
+
+    With literal=True, string components are plain keys (no '*' / '$var'
+    wildcards); array selectors always apply.
+    """
     results = []
 
     def walk(node, idx, captures):
         if idx == len(pattern_parts):
             return
         comp = pattern_parts[idx]
+        last = idx == len(pattern_parts) - 1
+        if isinstance(comp, tuple):
+            for i in _selector_indices(node, comp):
+                if last:
+                    results.append((node, i, captures))
+                else:
+                    walk(node[i], idx + 1, captures)
+            return
+        if literal:
+            found, _ = _child(node, comp)
+            if not found:
+                return
+            key = int(comp) if is_sequence(node) else comp
+            if last:
+                results.append((node, key, captures))
+            else:
+                walk(node[key], idx + 1, captures)
+            return
         if is_mapping(node):
             children = [(str(k), k) for k in list(node.keys())]
         elif is_sequence(node):
@@ -955,7 +1170,7 @@ def match_pattern(data, pattern_parts):
                     new_caps[var] = name
             elif comp != name:
                 continue
-            if idx == len(pattern_parts) - 1:
+            if last:
                 results.append((node, key, new_caps))
             else:
                 walk(node[key], idx + 1, new_caps)
@@ -964,11 +1179,28 @@ def match_pattern(data, pattern_parts):
     return results
 
 
+def find_targets(data, path):
+    """Return [(parent, key)] for a (possibly array-selecting) key path."""
+    comps = parse_path(path)
+    if not has_selector(comps):
+        found, parent, key, _ = resolve_path(data, split_path(path))
+        return [(parent, key)] if found else []
+    return [(p, k) for p, k, _ in match_pattern(data, comps, literal=True)]
+
+
+def lookup_value(data, path):
+    targets = find_targets(data, path)
+    if not targets:
+        return False, None
+    parent, key = targets[0]
+    return True, parent[key]
+
+
 def apply_pattern_replace(cfg, rule):
     pattern = rule.get("key_pattern")
     if pattern is None or "value" not in rule:
         return False
-    parts = split_path(pattern)
+    parts = parse_path(pattern)
     if not parts:
         return False
     matches = match_pattern(cfg.data, parts)
@@ -990,22 +1222,24 @@ def apply_template_string(cfg, rule):
     variables = rule.get("variables") or {}
     if key is None or not isinstance(template, str) or not isinstance(variables, dict):
         return False
-    found, parent, k, current = resolve_path(cfg.data, split_path(key))
-    if not found:
-        return False
-    if not isinstance(to_plain(current), str):
+    targets = find_targets(cfg.data, key)
+    targets = [(p, k) for p, k in targets if isinstance(to_plain(p[k]), str)]
+    if not targets:
         return False
     values = {}
     for name, path in variables.items():
-        ok, val = get_path_value(cfg.data, path)
+        ok, val = lookup_value(cfg.data, path)
         if not ok:
             return False
         values[name] = val
     result = render_template(template, values)
-    if to_plain(current) == result:
-        return False
-    _set_child(cfg, parent, k, result)
-    return True
+    changed = False
+    for parent, k in targets:
+        if to_plain(parent[k]) == result:
+            continue
+        _set_child(cfg, parent, k, result)
+        changed = True
+    return changed
 
 
 def _condition_holds(current, condition):
@@ -1026,18 +1260,19 @@ def apply_conditional_replace(cfg, rule):
     condition = rule.get("condition")
     if key is None or "value" not in rule or not isinstance(condition, dict):
         return False
-    found, parent, k, current = resolve_path(cfg.data, split_path(key))
-    if not found:
-        return False
-    if not _condition_holds(current, condition):
-        return False
     value = rule["value"]
-    if not _values_differ(cfg, current, value):
-        return False
     if not cfg.value_supported(value):
         return False
-    _set_child(cfg, parent, k, value)
-    return True
+    changed = False
+    for parent, k in find_targets(cfg.data, key):
+        current = parent[k]
+        if not _condition_holds(current, condition):
+            continue
+        if not _values_differ(cfg, current, value):
+            continue
+        _set_child(cfg, parent, k, value)
+        changed = True
+    return changed
 
 
 CONDITION_TYPES = ("current_value_equals", "current_value_not_equals",
@@ -1097,6 +1332,162 @@ RULE_HANDLERS = {
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint 3: config inheritance
+# ---------------------------------------------------------------------------
+
+INHERIT_FORMATS = {"json": "json", "yaml": "yaml", "yml": "yaml",
+                   "toml": "toml", "ini": "ini"}
+
+
+def load_inheritance_config(path):
+    """Return {fmt: [path parts]} or None if invalid."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (ValueError, UnicodeDecodeError, OSError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    result = {}
+    for ext, spec in raw.items():
+        if not isinstance(spec, dict):
+            return None
+        pattern = spec.get("pattern")
+        if not isinstance(pattern, str) or pattern.strip() == "":
+            return None
+        parts = pattern.split(".")
+        if any(p == "" for p in parts):
+            return None
+        fmt = INHERIT_FORMATS.get(str(ext).lower().lstrip("."))
+        if fmt is None:
+            continue
+        # explicit "yaml" wins over "yml" alias
+        if fmt in result and str(ext).lower().lstrip(".") == "yml":
+            continue
+        result[fmt] = parts
+    return result
+
+
+class InheritanceError(Exception):
+    pass
+
+
+def _get_directive(data, parts):
+    node = data
+    for p in parts:
+        if not is_mapping(node) or p not in node:
+            return _MISSING
+        node = node[p]
+    return node
+
+
+def _remove_directive(data, parts):
+    """Delete the directive key and any parent mappings left empty."""
+    chain = [data]
+    node = data
+    for p in parts[:-1]:
+        node = node[p]
+        chain.append(node)
+    del chain[-1][parts[-1]]
+    for i in range(len(parts) - 2, -1, -1):
+        if len(chain[i + 1]) == 0:
+            del chain[i][parts[i]]
+        else:
+            break
+
+
+def _merge_parent(cfg, target, parent):
+    """Deep merge plain `parent` into `target`; target values win."""
+    added_top = []
+    for k, v in parent.items():
+        if k in target:
+            cur = target[k]
+            if isinstance(v, dict) and is_mapping(cur):
+                _merge_parent(cfg, cur, v)
+            continue
+        if not cfg.value_supported(v):
+            if isinstance(v, dict):
+                v = _strip_none(v)
+            else:
+                continue
+        if cfg.fmt == "ini" and isinstance(v, dict) and target is not cfg.data:
+            continue
+        target[k] = cfg.convert(v)
+        added_top.append(k)
+    return added_top
+
+
+def _fix_toml_spacing(text):
+    """Ensure a blank line separates top-level keys from the first table."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("["):
+            if i > 0 and lines[i - 1].strip() != "":
+                lines.insert(i, "")
+            break
+    return "\n".join(lines)
+
+
+class Inheritance:
+    def __init__(self, patterns):
+        self.patterns = patterns
+        self.cache = {}
+
+    def _pattern_for(self, fmt):
+        return self.patterns.get(fmt)
+
+    def resolve(self, cfg):
+        """Resolve inheritance for target config `cfg` in place.
+
+        Returns True when the config was modified."""
+        parts = self._pattern_for(cfg.fmt)
+        if parts is None or not is_mapping(cfg.data):
+            return False
+        start = os.path.realpath(cfg.path)
+        return self._resolve_into(cfg, parts, [start], [cfg.rel])
+
+    def _resolve_into(self, cfg, parts, chain, names):
+        ref = _get_directive(cfg.data, parts)
+        if ref is _MISSING:
+            return False
+        ref_plain = to_plain(ref)
+        if not isinstance(ref_plain, str) or ref_plain == "":
+            return False
+        base_dir = os.path.dirname(os.path.abspath(cfg.path))
+        parent_path = os.path.normpath(os.path.join(base_dir, ref_plain))
+        real = os.path.realpath(parent_path)
+        if real in chain:
+            raise InheritanceError("circular dependency detected: %s"
+                                   % " -> ".join(names + [ref_plain]))
+        if not os.path.isfile(parent_path):
+            return False  # leave directive in place
+        ext = os.path.splitext(parent_path)[1].lower()
+        pfmt = EXTENSIONS.get(ext, cfg.fmt)
+        try:
+            pcfg = ConfigFile(parent_path, ref_plain, pfmt, ref_plain)
+        except (ParseError, OSError):
+            raise InheritanceError("failed to parse parent config: %s" % ref_plain)
+        if pcfg.data is None and pfmt == "yaml":
+            pcfg.data = {}
+        if not is_mapping(pcfg.data):
+            raise InheritanceError("failed to parse parent config: %s" % ref_plain)
+        pparts = self._pattern_for(pfmt)
+        if pparts is not None:
+            self._resolve_into(pcfg, pparts, chain + [real], names + [ref_plain])
+            # an unresolved directive in the parent is not propagated
+            if _get_directive(pcfg.data, pparts) is not _MISSING:
+                _remove_directive(pcfg.data, pparts)
+        parent_data = to_plain(pcfg.data)
+        _remove_directive(cfg.data, parts)
+        added = _merge_parent(cfg, cfg.data, parent_data)
+        if cfg.fmt == "toml" and any(not isinstance(parent_data[k], (dict, list))
+                                     for k in added):
+            cfg.toml_fix_spacing = True
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1122,11 +1513,37 @@ def find_config_files(target):
     return found
 
 
+def parse_args(argv):
+    positional = []
+    inheritance = None
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--inheritance":
+            if i + 1 >= len(args):
+                return None
+            inheritance = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--inheritance="):
+            inheritance = a[len("--inheritance="):]
+            i += 1
+            continue
+        positional.append(a)
+        i += 1
+    if len(positional) != 2:
+        return None
+    return positional[0], positional[1], inheritance
+
+
 def main(argv):
-    if len(argv) != 3:
-        sys.stderr.write("Usage: python migrate.py rules.json /path/to/configs\n")
+    parsed = parse_args(argv)
+    if parsed is None:
+        sys.stderr.write("Usage: python migrate.py rules.json /path/to/configs "
+                         "[--inheritance inheritance.json]\n")
         sys.exit(1)
-    rules_path, target = argv[1], argv[2]
+    rules_path, target, inheritance_path = parsed
 
     if not os.path.isfile(rules_path):
         error("rules file not found: %s" % rules_path)
@@ -1143,6 +1560,13 @@ def main(argv):
         if msg is not None:
             error("invalid rule '%s': %s" % (name, msg))
 
+    inheritance = None
+    if inheritance_path is not None:
+        patterns = load_inheritance_config(inheritance_path)
+        if patterns is None:
+            error("invalid inheritance config: %s" % inheritance_path)
+        inheritance = Inheritance(patterns)
+
     if not os.path.isdir(target):
         error("target directory not found: %s" % target)
 
@@ -1154,8 +1578,17 @@ def main(argv):
         except (ParseError, OSError):
             error("failed to parse %s" % label)
 
+    inherited = set()
+    if inheritance is not None:
+        for idx, cfg in enumerate(configs):
+            try:
+                if inheritance.resolve(cfg):
+                    inherited.add(idx)
+            except InheritanceError as exc:
+                error(str(exc))
+
     rule_names = sorted(rules.keys())
-    for cfg in configs:
+    for idx, cfg in enumerate(configs):
         applied = []
         for name in rule_names:
             rule = rules[name]
@@ -1170,7 +1603,7 @@ def main(argv):
                 ok = False
             if ok:
                 applied.append(name)
-        if applied:
+        if applied or idx in inherited:
             cfg.save()
             sys.stdout.write(json.dumps({
                 "event": "file_updated",
