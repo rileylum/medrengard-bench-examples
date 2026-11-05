@@ -1031,7 +1031,7 @@ def _json_script(obj, elem_id):
     return f"<script type=\"application/json\" id=\"{elem_id}\">{data}</script>"
 
 
-def detail_html(v, category, e):
+def detail_html(v, category, e, seek=None):
     qn = _quote(v.name, safe="")
     eid = str(e["id"])
     title = _latest(e.get("title"), v.version)
@@ -1066,14 +1066,25 @@ def detail_html(v, category, e):
     if media:
         murl = f"/vault/{qn}/media/{_quote(media, safe='')}"
         poster = f" poster=\"{_esc(prev_url)}\"" if prev_url else ""
-        body.append(f"<div class=\"media\"><video controls preload=\"metadata\" "
-                    f"src=\"{_esc(murl)}\"{poster}></video>"
+        frag = f"#t={seek}" if seek is not None else ""
+        sattr = f" data-timecode=\"{seek}\"" if seek is not None else ""
+        body.append(f"<div class=\"media\"><video id=\"player\" controls preload=\"metadata\" "
+                    f"src=\"{_esc(murl + frag)}\"{poster}{sattr}></video>"
                     f"<p><a class=\"media-link\" href=\"{_esc(murl)}\">{_esc(media)}</a></p></div>")
     else:
         body.append("<p class=\"no-media\">Media not downloaded.</p>")
         if prev_url:
             body.append(f"<p><img class=\"preview\" alt=\"preview\" src=\"{_esc(prev_url)}\" "
                         f"style=\"max-width:480px\"></p>")
+    if seek is not None:
+        body.append(f"<p class=\"seek\" id=\"seek\" data-timecode=\"{seek}\">"
+                    f"Playback position: {_esc(format_timecode(seek))} ({seek} s)</p>")
+        body.append("<script>(function(){var v=document.getElementById('player');"
+                    f"if(!v)return;var t={seek};"
+                    "function s(){try{v.currentTime=t;}catch(e){}}"
+                    "if(v.readyState>=1)s();else v.addEventListener('loadedmetadata',s);"
+                    "})();</script>")
+    body.append(annotations_html(v, category, e))
     charts = {}
     for f in ("views", "likes"):
         pts = _hist_points(e.get(f), v.version)
@@ -1091,6 +1102,176 @@ def detail_html(v, category, e):
         body.append(f"<table class=\"history {f}\"><tr><th>Timestamp</th><th>{f}</th></tr>"
                     f"{rows}</table>")
     return _page(f"{title_s} - {v.name}", "\n".join(body))
+
+
+# ---------------------------------------------------------------- annotations
+
+_TIMECODE_RE = re.compile(r"^\d+(?::\d+){0,2}$")
+
+
+def parse_timecode(text):
+    """Parse SS, MM:SS or HH:MM:SS into whole seconds; ValueError if invalid."""
+    if is_int(text) and text >= 0:
+        return text
+    if not isinstance(text, str):
+        raise ValueError("timecode must be a string")
+    s = text.strip()
+    if not s.isascii() or not _TIMECODE_RE.match(s):
+        raise ValueError(f"invalid timecode {text!r}")
+    total = 0
+    for p in s.split(":"):
+        total = total * 60 + int(p)
+    return total
+
+
+def format_timecode(sec):
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def annotations_html(v, category, e):
+    anns = e.get("annotations")
+    if not isinstance(anns, list):
+        anns = []
+    anns = [a for a in anns if isinstance(a, dict)]
+    qn = _quote(v.name, safe="")
+    base = f"/catalog/{qn}/{_quote(category, safe='')}/{_quote(str(e['id']), safe='')}"
+    parts = ["<h2>Annotations</h2>"]
+    items = []
+    for a in anns:
+        aid = str(a.get("id", ""))
+        tc = a.get("timecode")
+        tc_i = tc if is_int(tc) else None
+        title = a.get("title")
+        body = a.get("body")
+        tc_txt = format_timecode(tc_i) if tc_i is not None else _esc(tc)
+        link = f"{base}?timecode={tc_i}" if tc_i is not None else base
+        body_html = ("<p class=\"annotation-body\"></p>" if body is None else
+                     f"<p class=\"annotation-body\">{_esc(body)}</p>")
+        items.append(
+            f"<li class=\"annotation\" id=\"annotation-{_esc(aid)}\" data-id=\"{_esc(aid)}\" "
+            f"data-timecode=\"{_esc('' if tc_i is None else tc_i)}\">"
+            f"<a class=\"annotation-timecode\" href=\"{_esc(link)}\">{_esc(tc_txt)}</a> "
+            f"<span class=\"annotation-title\">{_esc('' if title is None else title)}</span>"
+            f"{body_html}</li>")
+    if items:
+        parts.append("<ol class=\"annotations\" id=\"annotations\">" + "".join(items) + "</ol>")
+    else:
+        parts.append("<p class=\"no-annotations\">No annotations.</p>")
+    parts.append(_json_script(anns, "annotation-data"))
+    return "\n".join(parts)
+
+
+def _new_annotation_id(anns):
+    import uuid
+    used = {str(a.get("id")) for a in anns if isinstance(a, dict)}
+    while True:
+        aid = uuid.uuid4().hex[:12]
+        if aid not in used:
+            return aid
+
+
+def annotation_request(method, name, category, eid, raw):
+    """Handle an annotation mutation. Returns (status, location_or_message)."""
+    if (not name or name in (".", "..") or "/" in name or "\\" in name or "\0" in name
+            or not os.path.isdir(name)):
+        return 404, f"vault '{name}' does not exist"
+    try:
+        cat = read_raw_catalog(name)
+    except MVaultError as e:
+        return 500, str(e)
+    ver = cat["version"]
+    cats = ("entries",) if ver == 1 else CATEGORIES
+    if category not in cats or not isinstance(cat.get(category), list):
+        return 404, f"category '{category}' not found in vault '{name}'"
+    idx = None
+    for i, e in enumerate(cat[category]):
+        if isinstance(e, dict) and str(e.get("id")) == eid:
+            idx = i
+            break
+    if idx is None:
+        return 404, f"entry '{eid}' not found in {category}"
+
+    # parse and validate the request body before touching the catalog
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else None
+    except (ValueError, UnicodeDecodeError) as e:
+        return 400, f"malformed JSON body: {e}"
+    if not isinstance(data, dict):
+        return 400, "malformed JSON body: expected a JSON object"
+    if method == "POST":
+        for f in ("title", "timecode"):
+            if f not in data or data[f] is None:
+                return 400, f"missing required field: {f}"
+        if not isinstance(data["title"], str):
+            return 400, "invalid field: title must be a string"
+        try:
+            seconds = parse_timecode(data["timecode"])
+        except ValueError:
+            return 400, (f"invalid timecode format: {data['timecode']!r} "
+                         "(expected SS, MM:SS or HH:MM:SS)")
+        body = data.get("body")
+        if body is not None and not isinstance(body, str):
+            return 400, "invalid field: body must be a string or null"
+    else:
+        if "id" not in data or data["id"] is None:
+            return 400, "missing required field: id"
+        if not isinstance(data["id"], (str, int)) or isinstance(data["id"], bool):
+            return 400, "invalid field: id must be a string"
+        aid = str(data["id"])
+        if method == "PATCH":
+            if "title" not in data and "body" not in data:
+                return 400, "missing field: at least one of title or body is required"
+            if "title" in data and not isinstance(data["title"], str):
+                return 400, "invalid field: title must be a string"
+            if "body" in data and data["body"] is not None and not isinstance(data["body"], str):
+                return 400, "invalid field: body must be a string or null"
+
+    # migrate to v3 if needed (in memory only)
+    new_cat = category
+    try:
+        if ver != NATIVE_VERSION:
+            cat = migrate_catalog(name, cat, now_ts(cat))
+            if ver == 1:
+                new_cat = "episodes"
+        validate_v3(name, cat)
+    except MVaultError as e:
+        return 500, f"migration failed: {e}"
+    except Exception as e:
+        return 500, f"migration failed: {type(e).__name__}: {e}"
+    entry = next((e for e in cat[new_cat] if str(e.get("id")) == eid), None)
+    if entry is None:
+        return 500, f"entry '{eid}' missing after migration"
+    anns = entry.get("annotations")
+    if anns is None:
+        anns = []
+        entry["annotations"] = anns
+    if not isinstance(anns, list):
+        return 500, f"invalid vault '{name}': malformed annotations for entry '{eid}'"
+
+    qn = _quote(name, safe="")
+    location = f"/catalog/{qn}/{_quote(new_cat, safe='')}/{_quote(eid, safe='')}"
+    if method == "POST":
+        anns.append({"id": _new_annotation_id(anns), "timecode": seconds,
+                     "title": data["title"], "body": body})
+        location += f"?timecode={seconds}"
+    else:
+        target = next((a for a in anns if isinstance(a, dict) and str(a.get("id")) == aid), None)
+        if target is None:
+            return 404, f"annotation '{aid}' not found"
+        if method == "PATCH":
+            if "title" in data:
+                target["title"] = data["title"]
+            if "body" in data:
+                target["body"] = data["body"]
+        else:
+            anns.remove(target)
+    try:
+        write_catalog(name, cat)
+    except MVaultError as e:
+        return 500, str(e)
+    return 303, location
 
 
 def _svg_chart(pts):
@@ -1210,6 +1391,45 @@ def make_handler():
         def do_POST(self):
             self._safe(self._post)
 
+        def do_PATCH(self):
+            self._safe(lambda: self._annotation("PATCH"))
+
+        def do_DELETE(self):
+            self._safe(lambda: self._annotation("DELETE"))
+
+        def _send_json(self, status, obj, headers=None):
+            data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            for k, val in (headers or []):
+                self.send_header(k, val)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+
+        def _read_body(self):
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            return self.rfile.read(length) if length > 0 else b""
+
+        def _annotation(self, method, raw=None):
+            path, parts = self._path_parts()
+            if raw is None:
+                raw = self._read_body()
+            if len(parts) < 4 or parts[0] != "catalog":
+                self._send_json(404, {"error": "not found"})
+                return
+            status, result = annotation_request(
+                method, parts[1], parts[2], "/".join(parts[3:]), raw)
+            if status in (301, 302, 303, 307, 308):
+                self._redirect(result, 303)
+            else:
+                self._send_json(status, {"error": result})
+
         def _path_parts(self):
             path = self.path.split("?", 1)[0].split("#", 1)[0]
             return path, [_unquote(p) for p in path.split("/") if p != ""]
@@ -1259,7 +1479,14 @@ def make_handler():
             eid = "/".join(parts[3:])
             match = [e for e in v.entries(category) if str(e["id"]) == eid]
             if match:
-                self._send(200, detail_html(v, category, match[0]), cookies)
+                seek = None
+                tc = self._query().get("timecode", [None])[0]
+                if tc is not None:
+                    try:
+                        seek = parse_timecode(tc)
+                    except ValueError:
+                        seek = None
+                self._send(200, detail_html(v, category, match[0], seek), cookies)
             else:
                 self._send(404, listing_html(v, category, eid), cookies)
 
@@ -1362,11 +1589,10 @@ def make_handler():
 
         def _post(self):
             path, parts = self._path_parts()
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                length = 0
-            raw = self.rfile.read(length) if length > 0 else b""
+            raw = self._read_body()
+            if len(parts) >= 4 and parts[0] == "catalog":
+                self._annotation("POST", raw)
+                return
             if parts:
                 self._send(404, _page("Not found", "<h1>404 Not Found</h1>"))
                 return
