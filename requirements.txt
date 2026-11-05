@@ -1,1 +1,1 @@
-# No third-party dependencies required; uses the Python standard library only.
+pyarrow>=14
