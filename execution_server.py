@@ -12,8 +12,10 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import tempfile
@@ -107,8 +109,9 @@ class ResultCache:
         self._data = {}
 
     @staticmethod
-    def key(command, env, files, stdin, timeout, track, coe):
+    def key(command, env, files, stdin, timeout, track, coe, environment=None):
         canon = {
+            "environment": environment,
             "command": command,
             "env": sorted(env.items()),
             "files": sorted((k, base64.b64encode(v).decode("ascii"))
@@ -130,6 +133,7 @@ class ResultCache:
         stored = copy.deepcopy(result)
         stored.pop("id", None)
         stored.pop("cached", None)
+        stored.pop("environment", None)
         with self._lock:
             self._data[key] = stored
 
@@ -148,6 +152,29 @@ def _check_cmd(cmd, where):
         raise ClientError(f"{where} must be a non-empty string", "INVALID_FIELD")
     if "\x00" in cmd:
         raise ClientError(f"{where} must not contain NUL bytes", "INVALID_FIELD")
+
+
+def validate_files(files, originals=None):
+    if files is None:
+        files = {}
+    if not isinstance(files, dict):
+        raise ClientError("'files' must be an object of path to string", "INVALID_FIELD")
+    clean_files = {}
+    for path, content in files.items():
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise ClientError(f"invalid file path: {path!r}", "INVALID_FIELD")
+        if os.path.isabs(path) or path.startswith("/") or path.startswith("\\"):
+            raise ClientError(f"file path must be relative: {path!r}", "INVALID_FIELD")
+        norm = os.path.normpath(path)
+        parts = norm.replace("\\", "/").split("/")
+        if norm in (".", "") or ".." in parts:
+            raise ClientError(f"file path escapes working directory: {path!r}", "INVALID_FIELD")
+        if path.endswith("/"):
+            raise ClientError(f"file path must name a file: {path!r}", "INVALID_FIELD")
+        clean_files[norm] = encode_file(path, content)
+        if originals is not None:
+            originals[path] = norm
+    return clean_files
 
 
 def validate(body):
@@ -204,24 +231,7 @@ def validate(body):
         if not isinstance(v, str) or "\x00" in v:
             raise ClientError(f"env value for {k!r} must be a string", "INVALID_FIELD")
 
-    files = body.get("files")
-    if files is None:
-        files = {}
-    if not isinstance(files, dict):
-        raise ClientError("'files' must be an object of path to string", "INVALID_FIELD")
-    clean_files = {}
-    for path, content in files.items():
-        if not isinstance(path, str) or not path or "\x00" in path:
-            raise ClientError(f"invalid file path: {path!r}", "INVALID_FIELD")
-        if os.path.isabs(path) or path.startswith("/") or path.startswith("\\"):
-            raise ClientError(f"file path must be relative: {path!r}", "INVALID_FIELD")
-        norm = os.path.normpath(path)
-        parts = norm.replace("\\", "/").split("/")
-        if norm in (".", "") or ".." in parts:
-            raise ClientError(f"file path escapes working directory: {path!r}", "INVALID_FIELD")
-        if path.endswith("/"):
-            raise ClientError(f"file path must name a file: {path!r}", "INVALID_FIELD")
-        clean_files[norm] = encode_file(path, content)
+    clean_files = validate_files(body.get("files"))
 
     stdin = body.get("stdin")
     if stdin is None:
@@ -490,19 +500,36 @@ def run_one(command, workdir, run_env, stdin, timeout):
     }, duration
 
 
-def execute(command, env, files, stdin, timeout, track=None, continue_on_error=False):
-    """Returns (response, total_duration, per-command durations, command count)."""
-    workdir = tempfile.mkdtemp(prefix="run-")
+def write_files(workdir, files):
+    root = os.path.realpath(workdir)
+    for rel, content in files.items():
+        full = os.path.join(root, rel)
+        d = os.path.dirname(full)
+        try:
+            os.makedirs(d, exist_ok=True)
+            real_d = os.path.realpath(d)
+            if real_d != root and not real_d.startswith(root + os.sep):
+                raise ClientError(f"file path escapes working directory: {rel!r}",
+                                  "INVALID_FIELD")
+            if os.path.islink(full):
+                os.unlink(full)
+            with open(full, "wb") as f:
+                f.write(content)
+        except (IsADirectoryError, NotADirectoryError, FileExistsError) as e:
+            raise ClientError(f"cannot create file {rel!r}: {e.strerror}", "INVALID_FIELD")
+
+
+def execute(command, env, files, stdin, timeout, track=None, continue_on_error=False,
+            workdir=None):
+    """Returns (response, total_duration, per-command durations, command count).
+
+    If ``workdir`` is given it is used (and left in place) instead of a fresh
+    temporary directory."""
+    own = workdir is None
+    if own:
+        workdir = tempfile.mkdtemp(prefix="run-")
     try:
-        for rel, content in files.items():
-            full = os.path.join(workdir, rel)
-            d = os.path.dirname(full)
-            try:
-                os.makedirs(d, exist_ok=True)
-                with open(full, "wb") as f:
-                    f.write(content)
-            except (IsADirectoryError, NotADirectoryError, FileExistsError) as e:
-                raise ClientError(f"cannot create file {rel!r}: {e.strerror}", "INVALID_FIELD")
+        write_files(workdir, files)
 
         run_env = dict(os.environ)
         run_env.update(env)
@@ -550,7 +577,214 @@ def execute(command, env, files, stdin, timeout, track=None, continue_on_error=F
         }
         return result, total, durations, len(command)
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        if own:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Persistent environments
+# ---------------------------------------------------------------------------
+
+CONCURRENCY_MODES = ("fork", "base", "never")
+ENV_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def tree_hash(root):
+    """Content hash of a directory tree (paths, types, modes, contents)."""
+    h = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        rel_dir = os.path.relpath(dirpath, root)
+        entries = sorted(dirnames + filenames)
+        for name in entries:
+            full = os.path.join(dirpath, name)
+            rel = os.path.normpath(os.path.join(rel_dir, name))
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            h.update(rel.encode("utf-8", "surrogateescape") + b"\0")
+            if stat.S_ISLNK(st.st_mode):
+                h.update(b"L" + os.readlink(full).encode("utf-8", "surrogateescape"))
+            elif stat.S_ISDIR(st.st_mode):
+                h.update(b"D%o" % stat.S_IMODE(st.st_mode))
+            elif stat.S_ISREG(st.st_mode):
+                h.update(b"F%o:%d:" % (stat.S_IMODE(st.st_mode), st.st_size))
+                try:
+                    with open(full, "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                except OSError:
+                    pass
+            else:
+                h.update(b"O")
+            h.update(b"\0")
+    return h.hexdigest()
+
+
+def copy_tree(src, dst):
+    shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+
+
+class Environment:
+    def __init__(self, name, mode, snapshot_dir):
+        self.name = name
+        self.mode = mode
+        self.lock = threading.Lock()      # guards snapshot swaps / copies / busy
+        self.snapshot = snapshot_dir      # current state (base state for "base")
+        self.hash = tree_hash(snapshot_dir)
+        self.busy = False                 # an exclusive execution is running
+
+
+class EnvironmentStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._envs = {}
+        self._root = None
+
+    def root(self):
+        with self._lock:
+            if self._root is None or not os.path.isdir(self._root):
+                self._root = tempfile.mkdtemp(prefix="envs-")
+            return self._root
+
+    def new_dir(self, prefix):
+        return tempfile.mkdtemp(prefix=prefix, dir=self.root())
+
+    def get(self, name):
+        with self._lock:
+            return self._envs.get(name)
+
+    def create(self, name, mode, files):
+        with self._lock:
+            if name in self._envs:
+                raise ClientError("Environment already exists", "ENVIRONMENT_EXISTS", 409)
+        d = self.new_dir("snap-")
+        try:
+            write_files(d, files)
+            env = Environment(name, mode, d)
+        except BaseException:
+            shutil.rmtree(d, ignore_errors=True)
+            raise
+        with self._lock:
+            if name in self._envs:
+                shutil.rmtree(d, ignore_errors=True)
+                raise ClientError("Environment already exists", "ENVIRONMENT_EXISTS", 409)
+            self._envs[name] = env
+        return env
+
+
+ENVS = EnvironmentStore()
+
+
+def validate_environment_create(body):
+    if not isinstance(body, dict):
+        raise ClientError("request body must be a JSON object", "INVALID_REQUEST")
+    name = body.get("name")
+    if name is None:
+        raise ClientError("Missing required field: name", "INVALID_ENVIRONMENT")
+    if not isinstance(name, str) or not ENV_NAME_RE.match(name) or name in (".", ".."):
+        raise ClientError("Invalid environment name", "INVALID_ENVIRONMENT")
+    mode = body.get("concurrency_mode")
+    if mode is None:
+        mode = "never"
+    if not isinstance(mode, str) or mode not in CONCURRENCY_MODES:
+        raise ClientError("Invalid concurrency_mode: must be one of fork, base, never",
+                          "INVALID_ENVIRONMENT")
+    originals = {}
+    files = validate_files(body.get("files"), originals)
+    return name, mode, files, originals
+
+
+def validate_environment_ref(body):
+    if not isinstance(body, dict):
+        raise ClientError("request body must be a JSON object", "INVALID_REQUEST")
+    name = body.get("environment")
+    if name is None or name == "":
+        raise ClientError("Missing required field: environment", "MISSING_ENVIRONMENT")
+    if not isinstance(name, str):
+        raise ClientError("'environment' must be a string", "INVALID_ENVIRONMENT")
+    env = ENVS.get(name)
+    if env is None:
+        raise ClientError("Environment not found", "ENVIRONMENT_NOT_FOUND", 404)
+    return env
+
+
+class EnvSession:
+    """Acquires an environment for one execution according to its mode."""
+
+    def __init__(self, env):
+        self.env = env
+        self.source = None
+        self.workdir = None
+        self.pre_hash = None
+        self.released = False
+
+    def acquire(self):
+        env = self.env
+        with env.lock:
+            if env.mode == "never":
+                if env.busy:
+                    raise ClientError("Environment is in use", "ENVIRONMENT_LOCKED", 423)
+                env.busy = True
+                self.source = "exclusive"
+            elif env.mode == "fork":
+                if env.busy:
+                    self.source = "current"
+                else:
+                    env.busy = True
+                    self.source = "exclusive"
+            else:
+                self.source = "base"
+            self.pre_hash = env.hash
+            snap = env.snapshot
+            # Copy while holding the lock so commits can't swap it mid-copy.
+            if self.workdir is None:
+                self.workdir = ENVS.new_dir("run-")
+                try:
+                    copy_tree(snap, self.workdir)
+                except BaseException:
+                    self._release_locked()
+                    raise
+        return self
+
+    @property
+    def commits(self):
+        return self.env.mode in ("never", "fork")
+
+    def meta(self):
+        return {"name": self.env.name, "snapshot_source": self.source,
+                "committed": self.commits}
+
+    def _release_locked(self):
+        if self.released:
+            return
+        self.released = True
+        if self.source == "exclusive":
+            self.env.busy = False
+
+    def finish(self, commit):
+        """Commit the workdir (if requested) and release. Returns new hash."""
+        env = self.env
+        new_hash = None
+        old = None
+        try:
+            if commit and self.commits and self.workdir is not None:
+                new_hash = tree_hash(self.workdir)
+                with env.lock:
+                    old = env.snapshot
+                    env.snapshot = self.workdir
+                    env.hash = new_hash
+                    self.workdir = None
+        finally:
+            with env.lock:
+                self._release_locked()
+            if old is not None:
+                shutil.rmtree(old, ignore_errors=True)
+            if self.workdir is not None:
+                shutil.rmtree(self.workdir, ignore_errors=True)
+                self.workdir = None
+        return new_hash
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -599,53 +833,94 @@ class Handler(BaseHTTPRequestHandler):
             raise ClientError("request body too large", "PAYLOAD_TOO_LARGE", 413)
         return self.rfile.read(n)
 
+    def _json_body(self):
+        raw = self._read_body()
+        if not raw.strip():
+            raise ClientError("request body is required", "INVALID_JSON")
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise ClientError("malformed JSON body", "INVALID_JSON")
+
     def do_POST(self):
         path = self._path()
+        if path == "/v1/environment":
+            return self._create_environment()
         if path != "/v1/execute":
             if path == "/v1/stats/execution":
                 return self._error(405, "METHOD_NOT_ALLOWED", "method not allowed")
             return self._error(404, "NOT_FOUND", "not found")
         try:
-            raw = self._read_body()
-            if not raw.strip():
-                raise ClientError("request body is required", "INVALID_JSON")
-            try:
-                body = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                raise ClientError("malformed JSON body", "INVALID_JSON")
+            body = self._json_body()
             args, force = validate(body)
-            key = ResultCache.key(*args)
-            if not force:
-                cached = CACHE.get(key)
+            env = validate_environment_ref(body)
+            session = EnvSession(env).acquire()
+            hit = False
+            try:
+                key = ResultCache.key(*args, environment=[env.name, env.mode,
+                                                          session.pre_hash])
+                cached = None if force else CACHE.get(key)
                 if cached is not None:
+                    hit = True
                     result = {"id": str(uuid.uuid4())}
                     result.update(cached)
                     result["cached"] = True
-                    STATS.hit()
-                    return self._send(201, result)
-            result, duration, cmd_durs, cmd_total = execute(*args)
-            result["cached"] = False
-            CACHE.put(key, result)
+                    session.finish(commit=False)
+                else:
+                    try:
+                        result, duration, cmd_durs, cmd_total = execute(
+                            *args, workdir=session.workdir)
+                    except BaseException:
+                        session.finish(commit=False)
+                        raise
+                    result["cached"] = False
+                    post_hash = session.finish(commit=True)
+                    if not session.commits or post_hash == session.pre_hash:
+                        CACHE.put(key, result)
+            finally:
+                if session.workdir is not None:
+                    session.finish(commit=False)
+            result["environment"] = session.meta()
         except ClientError as e:
             self.close_connection = True if e.status == 413 else self.close_connection
             return self._error(e.status, e.code, e.message)
         except Exception as e:  # unexpected
             return self._error(500, "INTERNAL_ERROR", f"internal error: {e}")
-        STATS.miss()
-        STATS.add(duration, cmd_durs, cmd_total)
+        if hit:
+            STATS.hit()
+        else:
+            STATS.miss()
+            STATS.add(duration, cmd_durs, cmd_total)
         self._send(201, result)
+
+    def _create_environment(self):
+        try:
+            body = self._json_body()
+            name, mode, files, originals = validate_environment_create(body)
+            ENVS.create(name, mode, files)
+        except ClientError as e:
+            self.close_connection = True if e.status == 413 else self.close_connection
+            return self._error(e.status, e.code, e.message)
+        except Exception as e:  # unexpected
+            return self._error(500, "INTERNAL_ERROR", f"internal error: {e}")
+        self._send(201, {
+            "name": name,
+            "concurrency_mode": mode,
+            "files": {orig: {"written_bytes": len(files[norm])}
+                      for orig, norm in originals.items()},
+        })
 
     def do_GET(self):
         path = self._path()
         if path == "/v1/stats/execution":
             return self._send(200, STATS.snapshot())
-        if path == "/v1/execute":
+        if path in ("/v1/execute", "/v1/environment"):
             return self._error(405, "METHOD_NOT_ALLOWED", "method not allowed")
         return self._error(404, "NOT_FOUND", "not found")
 
     def _other(self):
         path = self._path()
-        if path in ("/v1/execute", "/v1/stats/execution"):
+        if path in ("/v1/execute", "/v1/stats/execution", "/v1/environment"):
             return self._error(405, "METHOD_NOT_ALLOWED", "method not allowed")
         return self._error(404, "NOT_FOUND", "not found")
 
