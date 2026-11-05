@@ -23,6 +23,7 @@ def err(field, message, etype):
 
 
 def fail(errors):
+    errors = sorted(errors, key=lambda e: (e.get("field", ""), e.get("type", "")))
     out({"errors": errors})
     return 1
 
@@ -128,6 +129,170 @@ def as_qstr(v):
     return str(v) if is_int(v) else v
 
 
+DIGEST_ALGORITHMS = ("SHA-256", "SHA-384", "SHA-512")
+ENC_SOURCES = ("None", "Secret", "Service")
+CLIENT_MODES = ("None", "Authenticate", "Validate")
+
+
+def sub_mapping(parent, key, path, errors):
+    v = parent.get(key)
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        errors.append(err(path, "%s must be a mapping" % key, "invalid"))
+        return {}
+    return v
+
+
+def is_set(v):
+    return v is not None and v != ""
+
+
+def validate_access(acc_in, errors):
+    access = {}
+    base = "spec.access"
+
+    # authentication
+    auth_in = sub_mapping(acc_in, "authentication", base + ".authentication", errors)
+    auth_enabled = True
+    en = auth_in.get("enabled")
+    if en is not None:
+        if not isinstance(en, bool):
+            errors.append(err(base + ".authentication.enabled", "enabled must be a boolean", "invalid"))
+        else:
+            auth_enabled = en
+    auth = {"enabled": auth_enabled}
+    dig = auth_in.get("digestAlgorithm")
+    dpath = base + ".authentication.digestAlgorithm"
+    cref = acc_in.get("credentialRef")
+    cpath = base + ".credentialRef"
+    if not auth_enabled:
+        if dig is not None:
+            errors.append(err(dpath, "digestAlgorithm is forbidden when authentication is disabled",
+                              "forbidden"))
+        if cref is not None:
+            errors.append(err(cpath, "credentialRef is forbidden when authentication is disabled",
+                              "forbidden"))
+    else:
+        if dig is None:
+            auth["digestAlgorithm"] = "SHA-256"
+        elif dig not in DIGEST_ALGORITHMS:
+            errors.append(err(dpath, "digestAlgorithm must be one of %s, got %r"
+                              % (", ".join(DIGEST_ALGORITHMS), dig), "invalid"))
+        else:
+            auth["digestAlgorithm"] = dig
+        if cref is not None:
+            if not isinstance(cref, str):
+                errors.append(err(cpath, "credentialRef must be a string", "invalid"))
+            else:
+                access["credentialRef"] = cref
+    access["authentication"] = auth
+
+    # encryption
+    epath = base + ".encryption"
+    enc_in = sub_mapping(acc_in, "encryption", epath, errors)
+    enc = {}
+    source = enc_in.get("source")
+    source_ok = True
+    if source is None:
+        source = "None"
+    elif source not in ENC_SOURCES:
+        errors.append(err(epath + ".source", "source must be one of %s, got %r"
+                          % (", ".join(ENC_SOURCES), source), "invalid"))
+        source_ok = False
+    enc["source"] = source
+    cert = enc_in.get("certRef")
+    svc = enc_in.get("certServiceRef")
+    for fname, val in (("certRef", cert), ("certServiceRef", svc)):
+        if val is not None and not isinstance(val, str):
+            errors.append(err(epath + "." + fname, "%s must be a string" % fname, "invalid"))
+    if source_ok:
+        need = {"None": None, "Secret": "certRef", "Service": "certServiceRef"}[source]
+        for fname, val in (("certRef", cert), ("certServiceRef", svc)):
+            if fname == need:
+                if not is_set(val):
+                    errors.append(err(epath + "." + fname,
+                                      "%s is required when source is %r" % (fname, source),
+                                      "required"))
+                elif isinstance(val, str):
+                    enc[fname] = val
+            elif val is not None:
+                errors.append(err(epath + "." + fname,
+                                  "%s is forbidden when source is %r" % (fname, source),
+                                  "forbidden"))
+    cm = enc_in.get("clientMode")
+    if cm is None:
+        cm = "None"
+        enc["clientMode"] = cm
+    elif cm not in CLIENT_MODES:
+        errors.append(err(epath + ".clientMode", "clientMode must be one of %s, got %r"
+                          % (", ".join(CLIENT_MODES), cm), "invalid"))
+    elif source_ok and source == "None" and cm != "None":
+        errors.append(err(epath + ".clientMode",
+                          "clientMode %r requires an encryption source other than \"None\"" % cm,
+                          "invalid"))
+    else:
+        enc["clientMode"] = cm
+    access["encryption"] = enc
+
+    # permissions
+    ppath = base + ".permissions"
+    perm_in = sub_mapping(acc_in, "permissions", ppath, errors)
+    p_enabled = False
+    pen = perm_in.get("enabled")
+    if pen is not None:
+        if not isinstance(pen, bool):
+            errors.append(err(ppath + ".enabled", "enabled must be a boolean", "invalid"))
+        else:
+            p_enabled = pen
+    perms = {"enabled": p_enabled}
+    if p_enabled:
+        rpath = ppath + ".roles"
+        roles_in = perm_in.get("roles")
+        if roles_in is None or (isinstance(roles_in, list) and len(roles_in) == 0):
+            errors.append(err(rpath, "roles is required when permissions are enabled", "required"))
+        elif not isinstance(roles_in, list):
+            errors.append(err(rpath, "roles must be an array", "invalid"))
+        else:
+            roles = []
+            seen = set()
+            dup = []
+            for i, role in enumerate(roles_in):
+                ip = "%s[%d]" % (rpath, i)
+                if not isinstance(role, dict):
+                    errors.append(err(ip, "role must be an object with name and permissions", "invalid"))
+                    continue
+                rname = role.get("name")
+                rperms = role.get("permissions")
+                ok = True
+                if rname is None or rname == "":
+                    errors.append(err(ip + ".name", "role name is required", "required"))
+                    ok = False
+                elif not isinstance(rname, str):
+                    errors.append(err(ip + ".name", "role name must be a string", "invalid"))
+                    ok = False
+                if rperms is None or (isinstance(rperms, list) and len(rperms) == 0):
+                    errors.append(err(ip + ".permissions", "role permissions are required", "required"))
+                    ok = False
+                elif not isinstance(rperms, list) or not all(
+                        isinstance(p, str) and p != "" for p in rperms):
+                    errors.append(err(ip + ".permissions",
+                                      "role permissions must be an array of non-empty strings",
+                                      "invalid"))
+                    ok = False
+                if isinstance(rname, str) and rname != "":
+                    if rname in seen and rname not in dup:
+                        dup.append(rname)
+                    seen.add(rname)
+                if ok:
+                    roles.append({"name": rname, "permissions": list(rperms)})
+            if dup:
+                errors.append(err(rpath, "duplicate role name(s): %s" % ", ".join(dup), "duplicate"))
+            perms["roles"] = roles
+    access["permissions"] = perms
+    return access
+
+
 def validate(doc, update=False):
     """Validate a document. With update=True the spec is an already-merged spec
     (stored values + provided fields) and instances may be 0."""
@@ -205,24 +370,10 @@ def validate(doc, update=False):
     acc_in = spec_in.get("access")
     if acc_in is None:
         acc_in = {}
-    auth_enabled = True
     if not isinstance(acc_in, dict):
         errors.append(err("spec.access", "access must be a mapping", "invalid"))
-    else:
-        auth_in = acc_in.get("authentication")
-        if auth_in is None:
-            auth_in = {}
-        if not isinstance(auth_in, dict):
-            errors.append(err("spec.access.authentication", "authentication must be a mapping", "invalid"))
-        else:
-            en = auth_in.get("enabled")
-            if en is None:
-                pass
-            elif not isinstance(en, bool):
-                errors.append(err("spec.access.authentication.enabled", "enabled must be a boolean", "invalid"))
-            else:
-                auth_enabled = en
-    spec["access"] = {"authentication": {"enabled": auth_enabled}}
+        acc_in = {}
+    spec["access"] = validate_access(acc_in, errors)
 
     # migration
     mig_in = spec_in.get("migration")
@@ -349,6 +500,33 @@ def render(resource):
     return r
 
 
+def reconcile_access(merged, patch):
+    """Drop stored access fields that the patch made inapplicable and did not set."""
+    acc = merged.get("access")
+    pacc = patch.get("access")
+    if not isinstance(acc, dict) or not isinstance(pacc, dict):
+        return
+    def sub(d, k):
+        v = d.get(k)
+        return v if isinstance(v, dict) else {}
+    pauth = sub(pacc, "authentication")
+    if pauth.get("enabled") is False:
+        auth = acc.get("authentication")
+        if isinstance(auth, dict) and "digestAlgorithm" not in pauth:
+            auth.pop("digestAlgorithm", None)
+        if "credentialRef" not in pacc:
+            acc.pop("credentialRef", None)
+    penc = sub(pacc, "encryption")
+    enc = acc.get("encryption")
+    if "source" in penc and isinstance(enc, dict):
+        src = penc.get("source")
+        for fname, keep in (("certRef", "Secret"), ("certServiceRef", "Service")):
+            if src != keep and fname not in penc:
+                enc.pop(fname, None)
+        if src == "None" and "clientMode" not in penc:
+            enc.pop("clientMode", None)
+
+
 def deep_merge(base, patch):
     if not isinstance(base, dict) or not isinstance(patch, dict):
         return patch
@@ -465,6 +643,7 @@ def cmd_update(args):
             resuming = True
 
     merged_spec = deep_merge(stored["spec"], spec_patch)
+    reconcile_access(merged_spec, spec_patch)
     resource, _, errors = validate({"metadata": {"name": raw_name}, "spec": merged_spec}, update=True)
 
     # immutable storage size
