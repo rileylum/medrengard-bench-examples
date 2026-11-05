@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """babel_code_goat: translate Python test files (any ``.py`` under <tests_dir>) into a tester for
-python / javascript / typescript and run it against a solution.
+python / javascript / typescript / cpp / rust and run it against a solution.
 
 Commands:
-    generate <tests_dir> --entrypoint <name> --lang <python|javascript|typescript>
-    test <solution_path> <tests_dir> --lang <python|javascript|typescript> [--timeout SECONDS] [--tol FLOAT]
+    generate <tests_dir> --entrypoint <name> --lang <python|javascript|typescript|cpp|rust>
+    test <solution_path> <tests_dir> --lang <python|javascript|typescript|cpp|rust> [--timeout SECONDS] [--tol FLOAT]
+
+C++ / Rust: ``generate`` writes tester.cpp / tester.rs; ``test`` compiles it together with the
+solution (a single .cpp / .rs file; g++/clang++ with C++17 or later, rustc 2021 edition) and
+requires the tester to exist. Arguments are converted into the entrypoint's parameter types
+(std::optional / Option for None, vectors, maps, sets, tuples, long double / f64 for Decimal,
+...); results, post-call arguments, exceptions / panics and output are checked with the same
+Python semantics as the interpreted targets.
 
 Each test (assertion / raises block) must be traceable to exactly one entrypoint call.
 The call may be wrapped in primitive operations (arithmetic, comparisons, indexing,
@@ -41,7 +48,8 @@ import tempfile
 import time
 import tokenize
 
-LANGS = {"python": "tester.py", "javascript": "tester.js", "typescript": "tester.ts"}
+LANGS = {"python": "tester.py", "javascript": "tester.js", "typescript": "tester.ts",
+         "cpp": "tester.cpp", "rust": "tester.rs"}
 META_MARKER = "BABEL_CODE_GOAT_META:"
 DEFAULT_TIMEOUT = 10.0
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -2313,10 +2321,29 @@ def _match_unordered(actual, expected):
     return not rest
 
 
+_NATIVE = [False]
+_SEQS = (list, tuple, collections.deque)
+
+
 def _deq(a, e):
     """Compare an actual value with an expected value (container semantics, float tolerance)."""
     if e is None or a is None:
         return a is e
+    if _NATIVE[0]:
+        # values produced by statically typed targets: sequence kinds are interchangeable,
+        # bytes may come back as a list of ints or a string, sets may come back as sequences
+        if isinstance(e, (bytes, bytearray)) and not isinstance(a, (bytes, bytearray)):
+            if isinstance(a, str):
+                return a.encode("utf-8", "surrogateescape") == bytes(e)
+            if isinstance(a, _SEQS) and all(isinstance(x, int) and not isinstance(x, bool) and 0 <= x < 256 for x in a):
+                return bytes(a) == bytes(e)
+            return False
+        if isinstance(e, _SEQS) and isinstance(a, _SEQS):
+            return len(a) == len(e) and all(_deq(x, y) for x, y in zip(a, e))
+        if isinstance(e, (set, frozenset)) and isinstance(a, _SEQS):
+            return len(a) == len(e) and _match_unordered(list(a), list(e))
+        if isinstance(e, _SEQS) and isinstance(a, (set, frozenset)):
+            return len(a) == len(e) and _match_unordered(list(a), list(e))
     try:
         if type(a) is type(e) and not isinstance(e, (float, decimal.Decimal)) and a == e:
             return True
@@ -2394,7 +2421,7 @@ def _deq(a, e):
 
 
 def _exc_match(exc, names):
-    if names is None:
+    if names is None or _NATIVE[0]:
         return isinstance(exc, Exception)
     mro = [c.__name__ for c in type(exc).__mro__]
     return any(n in mro for n in names)
@@ -2441,6 +2468,12 @@ def _run_one(t, factory, cap):
             raised = e
     finally:
         out = cap.stop()
+    return _judge(t, result, raw, raised, out)
+
+
+def _judge(t, result, raw, raised, out):
+    kind = t["kind"]
+    extra = t.get("extra") or {}
     if kind == "raises":
         if raised is None:
             return False, "expected an exception, none raised"
@@ -4173,6 +4206,2441 @@ def render_js(tests, entrypoint, lang):
     return "\n".join(header) + "\n" + JS_RUNTIME
 
 
+CPP_RUNTIME = r'''
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <list>
+#include <map>
+#include <memory>
+#include <optional>
+#include <queue>
+#include <set>
+#include <sstream>
+#include <stack>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <typeinfo>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <variant>
+#include <vector>
+#include <cxxabi.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+namespace bcg {
+
+// ---- dynamic value (Python value model) --------------------------------------------
+// tags: N none, T/F bool, O opaque, i int, f float, d decimal, s str, b bytes,
+//       l list, q deque, t tuple, S set, z frozenset, m dict, c Counter, o OrderedDict, D defaultdict
+struct Value {
+  char tag = 'N';
+  std::string s;
+  std::vector<Value> items;
+  bool is_seq() const { return tag == 'l' || tag == 'q' || tag == 't'; }
+  bool is_set() const { return tag == 'S' || tag == 'z'; }
+  bool is_dict() const { return tag == 'm' || tag == 'c' || tag == 'o' || tag == 'D'; }
+};
+
+inline Value mk(char tag, std::string s = std::string()) {
+  Value v;
+  v.tag = tag;
+  v.s = std::move(s);
+  return v;
+}
+
+struct ConvError : std::exception {
+  std::string m;
+  explicit ConvError(std::string msg) : m(std::move(msg)) {}
+  const char* what() const noexcept override { return m.c_str(); }
+};
+
+inline std::string desc(const Value& v) {
+  switch (v.tag) {
+    case 'N': return "None";
+    case 'T': case 'F': return "bool";
+    case 'O': return "object";
+    case 'i': return "int " + v.s;
+    case 'f': return "float " + v.s;
+    case 'd': return "Decimal " + v.s;
+    case 's': return "str";
+    case 'b': return "bytes";
+    case 'l': case 'q': return "list";
+    case 't': return "tuple";
+    case 'S': case 'z': return "set";
+    default: return "dict";
+  }
+}
+
+inline int hexval(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return 0;
+}
+
+inline std::string hex(const std::string& s) {
+  static const char* d = "0123456789abcdef";
+  std::string o;
+  o.reserve(s.size() * 2);
+  for (unsigned char c : s) { o.push_back(d[c >> 4]); o.push_back(d[c & 15]); }
+  return o;
+}
+
+struct Parser {
+  const char* p;
+  Value parse() {
+    Value v;
+    v.tag = *p++;
+    switch (v.tag) {
+      case 'N': case 'T': case 'F': case 'O': return v;
+      case 'i': case 'f': case 'd': {
+        const char* e = std::strchr(p, ';');
+        v.s.assign(p, e);
+        p = e + 1;
+        return v;
+      }
+      case 's': case 'b': {
+        while (*p != ';') { v.s.push_back((char)(hexval(p[0]) * 16 + hexval(p[1]))); p += 2; }
+        ++p;
+        return v;
+      }
+      default: {
+        ++p;  // '['
+        while (*p != ']') v.items.push_back(parse());
+        ++p;
+        return v;
+      }
+    }
+  }
+};
+
+inline Value parse_value(const char* src) { Parser ps{src}; return ps.parse(); }
+
+inline void encode(const Value& v, std::string& o) {
+  o.push_back(v.tag);
+  switch (v.tag) {
+    case 'N': case 'T': case 'F': case 'O': return;
+    case 'i': case 'f': case 'd': o += v.s; o.push_back(';'); return;
+    case 's': case 'b': o += hex(v.s); o.push_back(';'); return;
+    default:
+      o.push_back('[');
+      for (const auto& x : v.items) encode(x, o);
+      o.push_back(']');
+  }
+}
+
+inline std::string encode(const Value& v) { std::string o; encode(v, o); return o; }
+
+// strict mode: used while choosing a std::variant alternative (exact Python kinds only)
+inline bool& strict() { static bool s = false; return s; }
+struct StrictGuard {
+  bool old;
+  explicit StrictGuard(bool v) : old(strict()) { strict() = v; }
+  ~StrictGuard() { strict() = old; }
+};
+
+inline bool parse_i128(const std::string& s, __int128& out) {
+  size_t i = 0;
+  bool neg = false;
+  if (i < s.size() && (s[i] == '-' || s[i] == '+')) { neg = s[i] == '-'; ++i; }
+  if (i >= s.size()) return false;
+  unsigned __int128 x = 0;
+  const unsigned __int128 lim = ((unsigned __int128)1 << 127);
+  for (; i < s.size(); ++i) {
+    if (s[i] < '0' || s[i] > '9') return false;
+    x = x * 10 + (unsigned)(s[i] - '0');
+    if (x > lim) return false;
+  }
+  if (!neg && x == lim) return false;
+  out = neg ? (__int128)(0 - x) : (__int128)x;
+  return true;
+}
+
+inline std::string i128_str(__int128 x) {
+  if (x == 0) return "0";
+  bool neg = x < 0;
+  unsigned __int128 u = neg ? (unsigned __int128)0 - (unsigned __int128)x : (unsigned __int128)x;
+  std::string s;
+  while (u) { s.push_back((char)('0' + (int)(u % 10))); u /= 10; }
+  if (neg) s.push_back('-');
+  std::reverse(s.begin(), s.end());
+  return s;
+}
+
+inline std::string u128_str(unsigned __int128 u) {
+  if (u == 0) return "0";
+  std::string s;
+  while (u) { s.push_back((char)('0' + (int)(u % 10))); u /= 10; }
+  std::reverse(s.begin(), s.end());
+  return s;
+}
+
+inline long double to_ld(const Value& v) {
+  if (v.tag == 'T') return 1;
+  if (v.tag == 'F') return 0;
+  const std::string& s = v.s;
+  std::string t;
+  for (char c : s) t.push_back((char)std::tolower((unsigned char)c));
+  if (t == "nan" || t == "-nan" || t == "+nan" || t == "snan" || t == "-snan") return std::numeric_limits<long double>::quiet_NaN();
+  if (t == "inf" || t == "+inf" || t == "infinity" || t == "+infinity") return std::numeric_limits<long double>::infinity();
+  if (t == "-inf" || t == "-infinity") return -std::numeric_limits<long double>::infinity();
+  return std::strtold(s.c_str(), nullptr);
+}
+
+inline std::string fmt_double(double d) {
+  if (std::isnan(d)) return "nan";
+  if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%.17g", d);
+  return buf;
+}
+
+inline std::string fmt_float(float d) {
+  if (std::isnan(d)) return "nan";
+  if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
+  char buf[64];
+  for (int prec = 1; prec <= 9; ++prec) {
+    std::snprintf(buf, sizeof buf, "%.*g", prec, (double)d);
+    if (std::strtof(buf, nullptr) == d) break;
+  }
+  return buf;
+}
+
+inline std::string fmt_ld(long double d) {
+  if (std::isnan(d)) return "nan";
+  if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
+  char buf[96];
+  std::snprintf(buf, sizeof buf, "%.21Lg", d);
+  return buf;
+}
+
+template <class T>
+std::string type_name() {
+  int st = 0;
+  char* n = abi::__cxa_demangle(typeid(T).name(), nullptr, nullptr, &st);
+  std::string r = (st == 0 && n) ? n : typeid(T).name();
+  std::free(n);
+  return r;
+}
+
+// ---- conversions between Value and C++ types ---------------------------------------
+template <class T, class = void>
+struct Conv {
+  static constexpr bool supported = false;
+  static T from(const Value&) { throw ConvError("unsupported parameter type " + type_name<T>()); }
+  static Value to(const T&) { return mk('O'); }
+};
+
+template <class T> T from_value(const Value& v) { return Conv<T>::from(v); }
+template <class T> Value to_value(const T& x) { return Conv<T>::to(x); }
+
+template <class T>
+struct Conv<T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool> && !std::is_same_v<T, char>>> {
+  static constexpr bool supported = true;
+  static T from(const Value& v) {
+    __int128 x = 0;
+    if (v.tag == 'i') {
+      if (!parse_i128(v.s, x)) throw ConvError("integer " + v.s + " out of range for " + type_name<T>());
+    } else if (!strict() && (v.tag == 'T' || v.tag == 'F')) {
+      x = v.tag == 'T';
+    } else if (!strict() && (v.tag == 'f' || v.tag == 'd')) {
+      long double d = to_ld(v);
+      if (!std::isfinite(d) || d != std::floor(d) || std::fabs(d) > 1.7e38L) throw ConvError("expected int, got " + desc(v));
+      x = (__int128)d;
+    } else {
+      throw ConvError("expected int, got " + desc(v));
+    }
+    if constexpr (sizeof(T) < 16) {
+      if (x < (__int128)std::numeric_limits<T>::min() || x > (__int128)std::numeric_limits<T>::max())
+        throw ConvError("integer " + i128_str(x) + " out of range for " + type_name<T>());
+    } else if constexpr (std::is_unsigned_v<T>) {
+      if (x < 0) throw ConvError("negative integer for unsigned type");
+    }
+    return (T)x;
+  }
+  static Value to(const T& x) {
+    if constexpr (std::is_unsigned_v<T>) return mk('i', u128_str((unsigned __int128)x));
+    else return mk('i', i128_str((__int128)x));
+  }
+};
+
+template <>
+struct Conv<bool> {
+  static constexpr bool supported = true;
+  static bool from(const Value& v) {
+    if (v.tag == 'T') return true;
+    if (v.tag == 'F') return false;
+    if (!strict() && v.tag == 'i') return v.s != "0";
+    throw ConvError("expected bool, got " + desc(v));
+  }
+  static Value to(const bool& b) { return mk(b ? 'T' : 'F'); }
+};
+
+template <>
+struct Conv<char> {
+  static constexpr bool supported = true;
+  static char from(const Value& v) {
+    if ((v.tag == 's' || v.tag == 'b') && v.s.size() == 1) return v.s[0];
+    if (!strict() && v.tag == 'i') return (char)Conv<int>::from(v);
+    throw ConvError("expected single character, got " + desc(v));
+  }
+  static Value to(const char& c) { return mk('s', std::string(1, c)); }
+};
+
+template <class T>
+struct Conv<T, std::enable_if_t<std::is_floating_point_v<T>>> {
+  static constexpr bool supported = true;
+  static T from(const Value& v) {
+    if (v.tag == 'f' || v.tag == 'd') return (T)to_ld(v);
+    if (v.tag == 'i') {
+      if (strict()) throw ConvError("expected float, got int");
+      return (T)std::strtold(v.s.c_str(), nullptr);
+    }
+    if (!strict() && (v.tag == 'T' || v.tag == 'F')) return v.tag == 'T' ? 1 : 0;
+    throw ConvError("expected float, got " + desc(v));
+  }
+  static Value to(const T& x) {
+    if constexpr (std::is_same_v<T, long double>) return mk('d', fmt_ld(x));
+    else if constexpr (std::is_same_v<T, float>) return mk('f', fmt_float(x));
+    else return mk('f', fmt_double((double)x));
+  }
+};
+
+template <>
+struct Conv<std::string> {
+  static constexpr bool supported = true;
+  static std::string from(const Value& v) {
+    if (v.tag == 's' || (!strict() && v.tag == 'b')) return v.s;
+    throw ConvError("expected str, got " + desc(v));
+  }
+  static Value to(const std::string& s) { return mk('s', s); }
+};
+
+template <>
+struct Conv<std::string_view> {
+  static constexpr bool supported = true;
+  static std::string_view from(const Value& v) { return *new std::string(Conv<std::string>::from(v)); }
+  static Value to(const std::string_view& s) { return mk('s', std::string(s)); }
+};
+
+template <>
+struct Conv<std::nullptr_t> {
+  static constexpr bool supported = true;
+  static std::nullptr_t from(const Value& v) {
+    if (v.tag == 'N') return nullptr;
+    throw ConvError("expected None, got " + desc(v));
+  }
+  static Value to(const std::nullptr_t&) { return mk('N'); }
+};
+
+template <>
+struct Conv<std::monostate> {
+  static constexpr bool supported = true;
+  static std::monostate from(const Value& v) {
+    if (v.tag == 'N') return {};
+    throw ConvError("expected None, got " + desc(v));
+  }
+  static Value to(const std::monostate&) { return mk('N'); }
+};
+
+template <class T>
+struct Conv<T*> {
+  static constexpr bool supported = true;
+  using E = std::remove_cv_t<T>;
+  static T* from(const Value& v) {
+    if (v.tag == 'N') return nullptr;
+    if constexpr (std::is_same_v<E, char>) {
+      std::string s = Conv<std::string>::from(v);
+      char* p = (char*)std::malloc(s.size() + 1);
+      std::memcpy(p, s.c_str(), s.size() + 1);
+      return p;
+    } else if constexpr (Conv<E>::supported && std::is_copy_constructible_v<E>) {
+      return new E(Conv<E>::from(v));
+    } else {
+      throw ConvError("unsupported parameter type " + type_name<T*>());
+    }
+  }
+  static Value to(T* const& p) {
+    if (!p) return mk('N');
+    if constexpr (std::is_same_v<E, char>) return mk('s', std::string(p));
+    else if constexpr (Conv<E>::supported) return Conv<E>::to(*p);
+    else return mk('O');
+  }
+};
+
+template <class T>
+struct Conv<std::optional<T>> {
+  static constexpr bool supported = true;
+  static std::optional<T> from(const Value& v) {
+    if (v.tag == 'N') return std::nullopt;
+    return std::optional<T>(Conv<T>::from(v));
+  }
+  static Value to(const std::optional<T>& o) { return o ? Conv<T>::to(*o) : mk('N'); }
+};
+
+template <class T>
+struct Conv<std::shared_ptr<T>> {
+  static constexpr bool supported = true;
+  static std::shared_ptr<T> from(const Value& v) {
+    if (v.tag == 'N') return nullptr;
+    if constexpr (Conv<T>::supported) return std::make_shared<T>(Conv<T>::from(v));
+    else throw ConvError("unsupported parameter type " + type_name<T>());
+  }
+  static Value to(const std::shared_ptr<T>& p) {
+    if (!p) return mk('N');
+    if constexpr (Conv<T>::supported) return Conv<T>::to(*p);
+    else return mk('O');
+  }
+};
+
+template <class T, class D>
+struct Conv<std::unique_ptr<T, D>> {
+  static constexpr bool supported = true;
+  static std::unique_ptr<T, D> from(const Value& v) {
+    if (v.tag == 'N') return nullptr;
+    if constexpr (Conv<T>::supported) return std::unique_ptr<T, D>(new T(Conv<T>::from(v)));
+    else throw ConvError("unsupported parameter type " + type_name<T>());
+  }
+  static Value to(const std::unique_ptr<T, D>& p) {
+    if (!p) return mk('N');
+    if constexpr (Conv<T>::supported) return Conv<T>::to(*p);
+    else return mk('O');
+  }
+};
+
+// sequence elements of a Value (lenient: sets, bytes, and strings as sequences)
+template <class E>
+std::vector<const Value*> seq_items(const Value& v, std::vector<Value>& tmp) {
+  std::vector<const Value*> out;
+  if (v.is_seq() || (!strict() && v.is_set())) {
+    for (const auto& x : v.items) out.push_back(&x);
+    return out;
+  }
+  if (!strict() && v.tag == 'b') {
+    tmp.clear();
+    for (unsigned char c : v.s) tmp.push_back(mk('i', std::to_string((int)c)));
+    for (const auto& x : tmp) out.push_back(&x);
+    return out;
+  }
+  if (!strict() && v.tag == 's' && (std::is_same_v<E, char> || std::is_same_v<E, std::string>)) {
+    tmp.clear();
+    for (char c : v.s) tmp.push_back(mk('s', std::string(1, c)));
+    for (const auto& x : tmp) out.push_back(&x);
+    return out;
+  }
+  throw ConvError("expected list, got " + desc(v));
+}
+
+template <class C, class E>
+struct SeqConv {
+  static constexpr bool supported = true;
+  static C from(const Value& v) {
+    std::vector<Value> tmp;
+    C c;
+    for (const Value* x : seq_items<E>(v, tmp)) c.push_back(Conv<E>::from(*x));
+    return c;
+  }
+  static Value to(const C& c) {
+    Value r = mk('l');
+    for (const auto& x : c) r.items.push_back(Conv<E>::to(x));
+    return r;
+  }
+};
+
+template <class T, class A> struct Conv<std::vector<T, A>> : SeqConv<std::vector<T, A>, T> {};
+template <class T, class A> struct Conv<std::deque<T, A>> : SeqConv<std::deque<T, A>, T> {};
+template <class T, class A> struct Conv<std::list<T, A>> : SeqConv<std::list<T, A>, T> {};
+
+template <class A>
+struct Conv<std::vector<bool, A>> {
+  static constexpr bool supported = true;
+  static std::vector<bool, A> from(const Value& v) {
+    std::vector<Value> tmp;
+    std::vector<bool, A> c;
+    for (const Value* x : seq_items<bool>(v, tmp)) c.push_back(Conv<bool>::from(*x));
+    return c;
+  }
+  static Value to(const std::vector<bool, A>& c) {
+    Value r = mk('l');
+    for (bool x : c) r.items.push_back(Conv<bool>::to(x));
+    return r;
+  }
+};
+
+template <class T, size_t N>
+struct Conv<std::array<T, N>> {
+  static constexpr bool supported = true;
+  static std::array<T, N> from(const Value& v) {
+    std::vector<Value> tmp;
+    auto items = seq_items<T>(v, tmp);
+    if (items.size() != N) throw ConvError("expected " + std::to_string(N) + " items");
+    std::array<T, N> a{};
+    for (size_t i = 0; i < N; ++i) a[i] = Conv<T>::from(*items[i]);
+    return a;
+  }
+  static Value to(const std::array<T, N>& c) {
+    Value r = mk('l');
+    for (const auto& x : c) r.items.push_back(Conv<T>::to(x));
+    return r;
+  }
+};
+
+template <class C, class E>
+struct SetConv {
+  static constexpr bool supported = true;
+  static C from(const Value& v) {
+    C c;
+    if (v.is_set() || (!strict() && v.is_seq())) {
+      for (const auto& x : v.items) c.insert(Conv<E>::from(x));
+      return c;
+    }
+    throw ConvError("expected set, got " + desc(v));
+  }
+  static Value to(const C& c) {
+    Value r = mk('S');
+    for (const auto& x : c) r.items.push_back(Conv<E>::to(x));
+    return r;
+  }
+};
+
+template <class T, class Cm, class A> struct Conv<std::set<T, Cm, A>> : SetConv<std::set<T, Cm, A>, T> {};
+template <class T, class Cm, class A> struct Conv<std::multiset<T, Cm, A>> : SetConv<std::multiset<T, Cm, A>, T> {
+  static Value to(const std::multiset<T, Cm, A>& c) {
+    Value r = mk('l');
+    for (const auto& x : c) r.items.push_back(Conv<T>::to(x));
+    return r;
+  }
+};
+template <class T, class H, class Eq, class A> struct Conv<std::unordered_set<T, H, Eq, A>> : SetConv<std::unordered_set<T, H, Eq, A>, T> {};
+template <class T, class H, class Eq, class A> struct Conv<std::unordered_multiset<T, H, Eq, A>> : SetConv<std::unordered_multiset<T, H, Eq, A>, T> {
+  static Value to(const std::unordered_multiset<T, H, Eq, A>& c) {
+    Value r = mk('l');
+    for (const auto& x : c) r.items.push_back(Conv<T>::to(x));
+    return r;
+  }
+};
+
+template <class C, class K, class V>
+struct MapConv {
+  static constexpr bool supported = true;
+  static C from(const Value& v) {
+    if (!v.is_dict()) throw ConvError("expected dict, got " + desc(v));
+    C c;
+    for (size_t i = 0; i + 1 < v.items.size(); i += 2)
+      c.emplace(Conv<K>::from(v.items[i]), Conv<V>::from(v.items[i + 1]));
+    return c;
+  }
+  static Value to(const C& c) {
+    Value r = mk('m');
+    for (const auto& kv : c) {
+      r.items.push_back(Conv<K>::to(kv.first));
+      r.items.push_back(Conv<V>::to(kv.second));
+    }
+    return r;
+  }
+};
+
+template <class K, class V, class Cm, class A> struct Conv<std::map<K, V, Cm, A>> : MapConv<std::map<K, V, Cm, A>, K, V> {};
+template <class K, class V, class Cm, class A> struct Conv<std::multimap<K, V, Cm, A>> : MapConv<std::multimap<K, V, Cm, A>, K, V> {};
+template <class K, class V, class H, class Eq, class A> struct Conv<std::unordered_map<K, V, H, Eq, A>> : MapConv<std::unordered_map<K, V, H, Eq, A>, K, V> {};
+template <class K, class V, class H, class Eq, class A> struct Conv<std::unordered_multimap<K, V, H, Eq, A>> : MapConv<std::unordered_multimap<K, V, H, Eq, A>, K, V> {};
+
+template <class A, class B>
+struct Conv<std::pair<A, B>> {
+  static constexpr bool supported = true;
+  static std::pair<A, B> from(const Value& v) {
+    if (!(v.is_seq() || (!strict() && v.is_set())) || v.items.size() != 2) throw ConvError("expected 2-tuple, got " + desc(v));
+    return std::pair<A, B>(Conv<A>::from(v.items[0]), Conv<B>::from(v.items[1]));
+  }
+  static Value to(const std::pair<A, B>& p) {
+    Value r = mk('t');
+    r.items.push_back(Conv<A>::to(p.first));
+    r.items.push_back(Conv<B>::to(p.second));
+    return r;
+  }
+};
+
+template <class... Ts>
+struct Conv<std::tuple<Ts...>> {
+  static constexpr bool supported = true;
+  template <size_t... I>
+  static std::tuple<Ts...> build(const Value& v, std::index_sequence<I...>) {
+    return std::tuple<Ts...>{Conv<Ts>::from(v.items[I])...};
+  }
+  static std::tuple<Ts...> from(const Value& v) {
+    if (!v.is_seq() || v.items.size() != sizeof...(Ts))
+      throw ConvError("expected " + std::to_string(sizeof...(Ts)) + "-tuple, got " + desc(v));
+    return build(v, std::index_sequence_for<Ts...>{});
+  }
+  static Value to(const std::tuple<Ts...>& t) {
+    Value r = mk('t');
+    std::apply([&](const auto&... x) { (r.items.push_back(Conv<std::decay_t<decltype(x)>>::to(x)), ...); }, t);
+    return r;
+  }
+};
+
+template <class... Ts>
+struct Conv<std::variant<Ts...>> {
+  static constexpr bool supported = true;
+  using Var = std::variant<Ts...>;
+  template <size_t I>
+  static bool attempt(const Value& v, std::optional<Var>& out) {
+    if constexpr (I == sizeof...(Ts)) {
+      return false;
+    } else {
+      try {
+        out.emplace(std::in_place_index<I>, Conv<std::variant_alternative_t<I, Var>>::from(v));
+        return true;
+      } catch (const ConvError&) {
+        return attempt<I + 1>(v, out);
+      }
+    }
+  }
+  static Var from(const Value& v) {
+    std::optional<Var> out;
+    {
+      StrictGuard g(true);
+      if (attempt<0>(v, out)) return std::move(*out);
+    }
+    {
+      StrictGuard g(false);
+      if (attempt<0>(v, out)) return std::move(*out);
+    }
+    throw ConvError("no variant alternative accepts " + desc(v));
+  }
+  static Value to(const Var& x) {
+    if (x.valueless_by_exception()) return mk('N');
+    return std::visit([](const auto& y) { return Conv<std::decay_t<decltype(y)>>::to(y); }, x);
+  }
+};
+
+template <class T, class C>
+struct Conv<std::queue<T, C>> {
+  static constexpr bool supported = true;
+  static std::queue<T, C> from(const Value& v) {
+    std::queue<T, C> q;
+    for (auto& x : Conv<std::vector<T>>::from(v)) q.push(std::move(x));
+    return q;
+  }
+  static Value to(const std::queue<T, C>& q0) {
+    auto q = q0;
+    Value r = mk('l');
+    while (!q.empty()) { r.items.push_back(Conv<T>::to(q.front())); q.pop(); }
+    return r;
+  }
+};
+
+template <class T, class C>
+struct Conv<std::stack<T, C>> {
+  static constexpr bool supported = true;
+  static std::stack<T, C> from(const Value& v) {
+    std::stack<T, C> q;
+    for (auto& x : Conv<std::vector<T>>::from(v)) q.push(std::move(x));
+    return q;
+  }
+  static Value to(const std::stack<T, C>& q0) {
+    auto q = q0;
+    Value r = mk('l');
+    while (!q.empty()) { r.items.push_back(Conv<T>::to(q.top())); q.pop(); }
+    std::reverse(r.items.begin(), r.items.end());
+    return r;
+  }
+};
+
+template <class T, class C, class Cm>
+struct Conv<std::priority_queue<T, C, Cm>> {
+  static constexpr bool supported = true;
+  static std::priority_queue<T, C, Cm> from(const Value& v) {
+    std::priority_queue<T, C, Cm> q;
+    for (auto& x : Conv<std::vector<T>>::from(v)) q.push(std::move(x));
+    return q;
+  }
+  static Value to(const std::priority_queue<T, C, Cm>& q0) {
+    auto q = q0;
+    Value r = mk('l');
+    while (!q.empty()) { r.items.push_back(Conv<T>::to(q.top())); q.pop(); }
+    return r;
+  }
+};
+
+template <class T>
+struct Conv<std::reference_wrapper<T>> {
+  static constexpr bool supported = Conv<std::remove_cv_t<T>>::supported;
+  static std::reference_wrapper<T> from(const Value& v) { return std::ref(*Conv<std::remove_cv_t<T>*>::from(v)); }
+  static Value to(const std::reference_wrapper<T>& r) { return Conv<std::remove_cv_t<T>>::to(r.get()); }
+};
+
+// ---- function traits and invocation -------------------------------------------------
+template <class F> struct FnTraits;
+template <class R, class... A> struct FnTraits<R (*)(A...)> {
+  using Ret = R; using Cls = void; using Args = std::tuple<A...>;
+  static constexpr bool member = false;
+};
+template <class R, class... A> struct FnTraits<R (*)(A...) noexcept> : FnTraits<R (*)(A...)> {};
+#define BCG_MEMBER_TRAITS(QUAL)                                                    \
+  template <class R, class C, class... A> struct FnTraits<R (C::*)(A...) QUAL> {   \
+    using Ret = R; using Cls = C; using Args = std::tuple<A...>;                   \
+    static constexpr bool member = true;                                           \
+  };
+BCG_MEMBER_TRAITS()
+BCG_MEMBER_TRAITS(const)
+BCG_MEMBER_TRAITS(&)
+BCG_MEMBER_TRAITS(const&)
+BCG_MEMBER_TRAITS(noexcept)
+BCG_MEMBER_TRAITS(const noexcept)
+BCG_MEMBER_TRAITS(& noexcept)
+BCG_MEMBER_TRAITS(const& noexcept)
+#undef BCG_MEMBER_TRAITS
+
+template <class A> using storage_t = std::remove_cv_t<std::remove_reference_t<A>>;
+
+template <class A, class S>
+decltype(auto) pass(S& s) {
+  if constexpr (std::is_rvalue_reference_v<A>) return std::move(s);
+  else if constexpr (!std::is_reference_v<A> && !std::is_copy_constructible_v<S>) return std::move(s);
+  else return (s);
+}
+
+struct Outcome {
+  bool conv_error = false;
+  std::string conv_msg;
+  bool raised = false;
+  std::string exc_type, exc_msg;
+  Value ret;
+  Value post = mk('l');
+  std::string out, err;
+};
+
+struct Capture {
+  std::string base;
+  int saved[2] = {-1, -1};
+  void start() {
+    std::cout.flush(); std::cerr.flush(); std::clog.flush();
+    std::fflush(stdout); std::fflush(stderr);
+    for (int i = 0; i < 2; ++i) {
+      std::string path = base + (i ? ".err" : ".out");
+      saved[i] = ::dup(i + 1);
+      int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (fd >= 0) { ::dup2(fd, i + 1); ::close(fd); }
+    }
+  }
+  std::string slurp(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+  }
+  void stop(Outcome& o) {
+    std::cout.flush(); std::cerr.flush(); std::clog.flush();
+    std::fflush(stdout); std::fflush(stderr);
+    for (int i = 0; i < 2; ++i) {
+      if (saved[i] >= 0) { ::dup2(saved[i], i + 1); ::close(saved[i]); saved[i] = -1; }
+    }
+    o.out = slurp(base + ".out");
+    o.err = slurp(base + ".err");
+  }
+};
+
+template <class F, class Tr, class... A, size_t... I>
+void invoke_impl(F fn, std::vector<Value>& args, Outcome& o, Capture& cap, std::tuple<A...>*, std::index_sequence<I...>) {
+  using Tup = std::tuple<storage_t<A>...>;
+  if (args.size() != sizeof...(A)) {
+    o.conv_error = true;
+    o.conv_msg = "entrypoint takes " + std::to_string(sizeof...(A)) + " arguments, got " + std::to_string(args.size());
+    return;
+  }
+  std::unique_ptr<Tup> st;
+  try {
+    st.reset(new Tup{Conv<storage_t<A>>::from(args[I])...});
+  } catch (const std::exception& e) {
+    o.conv_error = true;
+    o.conv_msg = std::string("argument conversion failed: ") + e.what();
+    return;
+  }
+  using R = typename Tr::Ret;
+  using Cls = typename Tr::Cls;
+  cap.start();
+  try {
+    if constexpr (Tr::member) {
+      if constexpr (std::is_default_constructible_v<Cls>) {
+        Cls obj{};
+        if constexpr (std::is_void_v<R>) {
+          (obj.*fn)(pass<A>(std::get<I>(*st))...);
+          o.ret = mk('N');
+        } else {
+          decltype(auto) r = (obj.*fn)(pass<A>(std::get<I>(*st))...);
+          o.ret = Conv<storage_t<R>>::to(r);
+        }
+      } else {
+        throw ConvError("entrypoint class is not default-constructible");
+      }
+    } else {
+      if constexpr (std::is_void_v<R>) {
+        fn(pass<A>(std::get<I>(*st))...);
+        o.ret = mk('N');
+      } else {
+        decltype(auto) r = fn(pass<A>(std::get<I>(*st))...);
+        o.ret = Conv<storage_t<R>>::to(r);
+      }
+    }
+  } catch (const std::exception& e) {
+    o.raised = true;
+    int s = 0;
+    char* n = abi::__cxa_demangle(typeid(e).name(), nullptr, nullptr, &s);
+    o.exc_type = (s == 0 && n) ? n : typeid(e).name();
+    std::free(n);
+    o.exc_msg = e.what();
+  } catch (const std::string& e) {
+    o.raised = true; o.exc_type = "std::string"; o.exc_msg = e;
+  } catch (const char* e) {
+    o.raised = true; o.exc_type = "const char*"; o.exc_msg = e ? e : "";
+  } catch (...) {
+    o.raised = true; o.exc_type = "unknown"; o.exc_msg = "";
+  }
+  cap.stop(o);
+  try {
+    o.post.items = {Conv<storage_t<A>>::to(std::get<I>(*st))...};
+  } catch (...) {
+    o.post.items.clear();
+  }
+}
+
+template <class F>
+Outcome invoke(F fn, std::vector<Value>& args, Capture& cap) {
+  using Tr = FnTraits<F>;
+  using Args = typename Tr::Args;
+  Outcome o;
+  invoke_impl<F, Tr>(fn, args, o, cap, (Args*)nullptr, std::make_index_sequence<std::tuple_size_v<Args>>{});
+  return o;
+}
+
+inline void emit(std::FILE* fh, const std::string& line) {
+  if (!fh) return;
+  std::fputs(line.c_str(), fh);
+  std::fputc('\n', fh);
+  std::fflush(fh);
+}
+
+// bind keyword arguments to the remaining parameters by name
+inline std::string merge_kwargs(std::vector<Value>& args, const Value& kwargs) {
+  if (kwargs.items.empty()) return "";
+  static const char* const names[] = BCG_PARAM_NAMES;
+  size_t n = sizeof(names) / sizeof(names[0]) - 1;
+  std::vector<bool> used(kwargs.items.size() / 2, false);
+  for (size_t i = args.size(); i < n; ++i) {
+    bool found = false;
+    for (size_t j = 0; j + 1 < kwargs.items.size(); j += 2) {
+      if (kwargs.items[j].s == names[i]) { args.push_back(kwargs.items[j + 1]); used[j / 2] = true; found = true; break; }
+    }
+    if (!found) return std::string("missing argument ") + names[i];
+  }
+  for (size_t j = 0; j < used.size(); ++j)
+    if (!used[j]) return "unexpected keyword argument " + kwargs.items[2 * j].s;
+  return "";
+}
+
+template <class F>
+int run_main(int argc, char** argv, F entry) {
+  std::string results, ids;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--results" && i + 1 < argc) results = argv[++i];
+    else if (a == "--ids" && i + 1 < argc) ids = argv[++i];
+    else if (a == "--tol" && i + 1 < argc) ++i;
+  }
+  std::vector<size_t> order;
+  if (!ids.empty()) {
+    std::ifstream f(ids);
+    std::string line;
+    while (std::getline(f, line)) {
+      for (size_t k = 0; k < bcg_data::N_TESTS; ++k)
+        if (line == bcg_data::TEST_IDS[k]) { order.push_back(k); break; }
+    }
+  } else {
+    for (size_t k = 0; k < bcg_data::N_TESTS; ++k) order.push_back(k);
+  }
+  std::FILE* fh = results.empty() ? nullptr : std::fopen(results.c_str(), "a");
+  Capture cap;
+  cap.base = (results.empty() ? std::string("bcg-capture") : results) + ".cap";
+  int failed = 0;
+  for (size_t k : order) {
+    std::string id = bcg_data::TEST_IDS[k];
+    emit(fh, "{\"event\":\"start\",\"id\":" + id + "}");
+    Value args = parse_value(bcg_data::TEST_ARGS[k]);
+    Value kwargs = parse_value(bcg_data::TEST_KWARGS[k]);
+    std::string merr = merge_kwargs(args.items, kwargs);
+    Outcome o;
+    if (!merr.empty()) { o.conv_error = true; o.conv_msg = merr; }
+    else o = invoke(entry, args.items, cap);
+    std::string ev = "{\"event\":\"value\",\"id\":" + id;
+    if (o.conv_error) {
+      ev += ",\"conv\":\"" + hex(o.conv_msg) + "\"";
+      ++failed;
+    } else {
+      if (o.raised) ev += ",\"exc\":\"" + hex(o.exc_msg) + "\",\"etype\":\"" + hex(o.exc_type) + "\"";
+      else ev += ",\"ret\":\"" + encode(o.ret) + "\"";
+      ev += ",\"post\":\"" + encode(o.post) + "\"";
+      ev += ",\"out\":\"" + hex(o.out) + "\",\"err\":\"" + hex(o.err) + "\"";
+    }
+    ev += "}";
+    emit(fh, ev);
+  }
+  emit(fh, "{\"event\":\"done\"}");
+  std::remove((cap.base + ".out").c_str());
+  std::remove((cap.base + ".err").c_str());
+  if (fh) std::fclose(fh);
+  return failed ? 1 : 0;
+}
+
+}  // namespace bcg
+
+int main(int argc, char** argv) {
+  return bcg::run_main(argc, argv, BCG_ENTRY_PTR);
+}
+'''
+
+RUST_RUNTIME = r'''
+#[allow(dead_code, unused_imports, unused_variables, unused_mut, non_snake_case, unused_parens, non_camel_case_types)]
+pub mod bcg {
+    use std::cell::{Cell, RefCell};
+    use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
+    use std::convert::TryFrom;
+    use std::hash::{BuildHasher, Hash};
+    use std::io::{Read, Write};
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    // tags: N none, T/F bool, O opaque, i int, f float, d decimal, s str, b bytes,
+    //       l list, q deque, t tuple, S set, z frozenset, m dict, c Counter, o OrderedDict, D defaultdict
+    #[derive(Clone, Debug)]
+    pub struct Val {
+        pub tag: u8,
+        pub s: Vec<u8>,
+        pub items: Vec<Val>,
+    }
+
+    impl Val {
+        pub fn mk(tag: u8) -> Val { Val { tag, s: Vec::new(), items: Vec::new() } }
+        pub fn scalar(tag: u8, s: &str) -> Val { Val { tag, s: s.as_bytes().to_vec(), items: Vec::new() } }
+        pub fn bytes(tag: u8, s: &[u8]) -> Val { Val { tag, s: s.to_vec(), items: Vec::new() } }
+        pub fn text(&self) -> String { String::from_utf8_lossy(&self.s).into_owned() }
+        pub fn is_seq(&self) -> bool { matches!(self.tag, b'l' | b'q' | b't') }
+        pub fn is_set(&self) -> bool { matches!(self.tag, b'S' | b'z') }
+        pub fn is_dict(&self) -> bool { matches!(self.tag, b'm' | b'c' | b'o' | b'D') }
+        pub fn desc(&self) -> String {
+            match self.tag {
+                b'N' => "None".into(),
+                b'T' | b'F' => "bool".into(),
+                b'O' => "object".into(),
+                b'i' => format!("int {}", self.text()),
+                b'f' => format!("float {}", self.text()),
+                b'd' => format!("Decimal {}", self.text()),
+                b's' => "str".into(),
+                b'b' => "bytes".into(),
+                b'l' | b'q' => "list".into(),
+                b't' => "tuple".into(),
+                b'S' | b'z' => "set".into(),
+                _ => "dict".into(),
+            }
+        }
+    }
+
+    fn hexval(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => 0,
+        }
+    }
+
+    pub fn hex(s: &[u8]) -> String {
+        const D: &[u8; 16] = b"0123456789abcdef";
+        let mut o = String::with_capacity(s.len() * 2);
+        for &c in s {
+            o.push(D[(c >> 4) as usize] as char);
+            o.push(D[(c & 15) as usize] as char);
+        }
+        o
+    }
+
+    pub fn parse(src: &[u8], p: &mut usize) -> Val {
+        let tag = src[*p];
+        *p += 1;
+        let mut v = Val::mk(tag);
+        match tag {
+            b'N' | b'T' | b'F' | b'O' => {}
+            b'i' | b'f' | b'd' => {
+                while src[*p] != b';' { v.s.push(src[*p]); *p += 1; }
+                *p += 1;
+            }
+            b's' | b'b' => {
+                while src[*p] != b';' { v.s.push(hexval(src[*p]) * 16 + hexval(src[*p + 1])); *p += 2; }
+                *p += 1;
+            }
+            _ => {
+                *p += 1;
+                while src[*p] != b']' { v.items.push(parse(src, p)); }
+                *p += 1;
+            }
+        }
+        v
+    }
+
+    pub fn encode(v: &Val, o: &mut String) {
+        o.push(v.tag as char);
+        match v.tag {
+            b'N' | b'T' | b'F' | b'O' => {}
+            b'i' | b'f' | b'd' => { o.push_str(&v.text()); o.push(';'); }
+            b's' | b'b' => { o.push_str(&hex(&v.s)); o.push(';'); }
+            _ => {
+                o.push('[');
+                for x in &v.items { encode(x, o); }
+                o.push(']');
+            }
+        }
+    }
+
+    pub trait FromVal: Sized {
+        fn from_val(v: &Val) -> Result<Self, String>;
+    }
+
+    pub trait ToVal {
+        fn to_val(&self) -> Val;
+        fn to_ret(&self) -> Result<Val, String> { Ok(self.to_val()) }
+    }
+
+    pub fn parse_f(v: &Val) -> Result<f64, String> {
+        match v.tag {
+            b'T' => Ok(1.0),
+            b'F' => Ok(0.0),
+            b'i' | b'f' | b'd' => {
+                let t = v.text().to_lowercase();
+                let t = t.trim_start_matches('+');
+                match t {
+                    "nan" | "-nan" | "snan" | "-snan" => Ok(f64::NAN),
+                    "inf" | "infinity" => Ok(f64::INFINITY),
+                    "-inf" | "-infinity" => Ok(f64::NEG_INFINITY),
+                    _ => t.parse::<f64>().map_err(|_| format!("bad number {}", t)),
+                }
+            }
+            _ => Err(format!("expected number, got {}", v.desc())),
+        }
+    }
+
+    macro_rules! bcg_int {
+        ($($t:ty),*) => { $(
+            impl FromVal for $t {
+                fn from_val(v: &Val) -> Result<Self, String> {
+                    match v.tag {
+                        b'i' => v.text().parse::<$t>().map_err(|_| format!("integer {} out of range for {}", v.text(), stringify!($t))),
+                        b'T' => Ok(1 as $t),
+                        b'F' => Ok(0 as $t),
+                        b'f' | b'd' => {
+                            let x = parse_f(v)?;
+                            if x.is_finite() && x.fract() == 0.0 && x.abs() < 1.7e38 {
+                                <$t>::try_from(x as i128).map_err(|_| format!("integer out of range for {}", stringify!($t)))
+                            } else {
+                                Err(format!("expected int, got {}", v.desc()))
+                            }
+                        }
+                        _ => Err(format!("expected int, got {}", v.desc())),
+                    }
+                }
+            }
+            impl ToVal for $t {
+                fn to_val(&self) -> Val { Val::scalar(b'i', &self.to_string()) }
+            }
+        )* };
+    }
+    bcg_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+
+    impl FromVal for f64 {
+        fn from_val(v: &Val) -> Result<Self, String> { parse_f(v) }
+    }
+    impl ToVal for f64 {
+        fn to_val(&self) -> Val {
+            if self.is_nan() { Val::scalar(b'f', "nan") }
+            else if self.is_infinite() { Val::scalar(b'f', if *self > 0.0 { "inf" } else { "-inf" }) }
+            else { Val::scalar(b'f', &format!("{:?}", self)) }
+        }
+    }
+    impl FromVal for f32 {
+        fn from_val(v: &Val) -> Result<Self, String> { parse_f(v).map(|x| x as f32) }
+    }
+    impl ToVal for f32 {
+        fn to_val(&self) -> Val {
+            if self.is_nan() { Val::scalar(b'f', "nan") }
+            else if self.is_infinite() { Val::scalar(b'f', if *self > 0.0 { "inf" } else { "-inf" }) }
+            else { Val::scalar(b'f', &format!("{:?}", self)) }
+        }
+    }
+
+    impl FromVal for bool {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            match v.tag {
+                b'T' => Ok(true),
+                b'F' => Ok(false),
+                b'i' => Ok(v.text() != "0"),
+                _ => Err(format!("expected bool, got {}", v.desc())),
+            }
+        }
+    }
+    impl ToVal for bool {
+        fn to_val(&self) -> Val { Val::mk(if *self { b'T' } else { b'F' }) }
+    }
+
+    impl FromVal for char {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            if v.tag == b's' || v.tag == b'b' {
+                let s = v.text();
+                let mut it = s.chars();
+                if let (Some(c), None) = (it.next(), it.next()) { return Ok(c); }
+            }
+            if v.tag == b'i' {
+                if let Ok(n) = v.text().parse::<u32>() {
+                    if let Some(c) = char::from_u32(n) { return Ok(c); }
+                }
+            }
+            Err(format!("expected single character, got {}", v.desc()))
+        }
+    }
+    impl ToVal for char {
+        fn to_val(&self) -> Val { Val::scalar(b's', &self.to_string()) }
+    }
+
+    impl FromVal for String {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            match v.tag {
+                b's' | b'b' => Ok(v.text()),
+                _ => Err(format!("expected str, got {}", v.desc())),
+            }
+        }
+    }
+    impl ToVal for String {
+        fn to_val(&self) -> Val { Val::bytes(b's', self.as_bytes()) }
+    }
+    impl ToVal for str {
+        fn to_val(&self) -> Val { Val::bytes(b's', self.as_bytes()) }
+    }
+    impl FromVal for &'static str {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            let s: String = FromVal::from_val(v)?;
+            Ok(Box::leak(s.into_boxed_str()))
+        }
+    }
+    impl<T: FromVal + 'static> FromVal for &'static [T] {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            let s: Vec<T> = FromVal::from_val(v)?;
+            Ok(Box::leak(s.into_boxed_slice()))
+        }
+    }
+    impl<T: FromVal + 'static> FromVal for &'static mut [T] {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            let s: Vec<T> = FromVal::from_val(v)?;
+            Ok(Box::leak(s.into_boxed_slice()))
+        }
+    }
+    impl FromVal for std::borrow::Cow<'static, str> {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            let s: String = FromVal::from_val(v)?;
+            Ok(std::borrow::Cow::Owned(s))
+        }
+    }
+    impl<'a> ToVal for std::borrow::Cow<'a, str> {
+        fn to_val(&self) -> Val { Val::bytes(b's', self.as_bytes()) }
+    }
+
+    impl FromVal for () {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            if v.tag == b'N' { Ok(()) } else { Err(format!("expected None, got {}", v.desc())) }
+        }
+    }
+    impl ToVal for () {
+        fn to_val(&self) -> Val { Val::mk(b'N') }
+    }
+
+    impl<T: FromVal> FromVal for Option<T> {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            if v.tag == b'N' { Ok(None) } else { T::from_val(v).map(Some) }
+        }
+    }
+    impl<T: ToVal> ToVal for Option<T> {
+        fn to_val(&self) -> Val {
+            match self { Some(x) => x.to_val(), None => Val::mk(b'N') }
+        }
+    }
+
+    impl<T: ToVal, E: std::fmt::Debug> ToVal for Result<T, E> {
+        fn to_val(&self) -> Val {
+            match self { Ok(x) => x.to_val(), Err(_) => Val::mk(b'O') }
+        }
+        fn to_ret(&self) -> Result<Val, String> {
+            match self {
+                Ok(x) => x.to_ret(),
+                Err(e) => {
+                    let mut m = format!("{:?}", e);
+                    if m.len() >= 2 && m.starts_with('"') && m.ends_with('"') {
+                        m = m[1..m.len() - 1].replace("\\\"", "\"").replace("\\n", "\n").replace("\\\\", "\\");
+                    }
+                    Err(m)
+                }
+            }
+        }
+    }
+
+    impl<'a, T: ToVal + ?Sized> ToVal for &'a T {
+        fn to_val(&self) -> Val { (**self).to_val() }
+        fn to_ret(&self) -> Result<Val, String> { (**self).to_ret() }
+    }
+    impl<'a, T: ToVal + ?Sized> ToVal for &'a mut T {
+        fn to_val(&self) -> Val { (**self).to_val() }
+        fn to_ret(&self) -> Result<Val, String> { (**self).to_ret() }
+    }
+    impl<T: FromVal> FromVal for Box<T> {
+        fn from_val(v: &Val) -> Result<Self, String> { T::from_val(v).map(Box::new) }
+    }
+    impl<T: ToVal + ?Sized> ToVal for Box<T> {
+        fn to_val(&self) -> Val { (**self).to_val() }
+    }
+    impl<T: FromVal> FromVal for Rc<T> {
+        fn from_val(v: &Val) -> Result<Self, String> { T::from_val(v).map(Rc::new) }
+    }
+    impl<T: ToVal + ?Sized> ToVal for Rc<T> {
+        fn to_val(&self) -> Val { (**self).to_val() }
+    }
+    impl<T: FromVal> FromVal for Arc<T> {
+        fn from_val(v: &Val) -> Result<Self, String> { T::from_val(v).map(Arc::new) }
+    }
+    impl<T: ToVal + ?Sized> ToVal for Arc<T> {
+        fn to_val(&self) -> Val { (**self).to_val() }
+    }
+    impl<T: FromVal> FromVal for RefCell<T> {
+        fn from_val(v: &Val) -> Result<Self, String> { T::from_val(v).map(RefCell::new) }
+    }
+    impl<T: ToVal> ToVal for RefCell<T> {
+        fn to_val(&self) -> Val {
+            match self.try_borrow() { Ok(b) => b.to_val(), Err(_) => Val::mk(b'O') }
+        }
+    }
+    impl<T: FromVal> FromVal for Cell<T> {
+        fn from_val(v: &Val) -> Result<Self, String> { T::from_val(v).map(Cell::new) }
+    }
+    impl<T: ToVal + Copy> ToVal for Cell<T> {
+        fn to_val(&self) -> Val { self.get().to_val() }
+    }
+
+    fn seq_items(v: &Val) -> Result<Vec<Val>, String> {
+        if v.is_seq() || v.is_set() { return Ok(v.items.clone()); }
+        if v.tag == b'b' { return Ok(v.s.iter().map(|c| Val::scalar(b'i', &c.to_string())).collect()); }
+        if v.tag == b's' { return Ok(v.text().chars().map(|c| Val::scalar(b's', &c.to_string())).collect()); }
+        Err(format!("expected list, got {}", v.desc()))
+    }
+
+    fn list_of<'a, T: ToVal + 'a, I: Iterator<Item = &'a T>>(tag: u8, it: I) -> Val {
+        let mut r = Val::mk(tag);
+        for x in it { r.items.push(x.to_val()); }
+        r
+    }
+
+    impl<T: FromVal> FromVal for Vec<T> {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            seq_items(v)?.iter().map(T::from_val).collect()
+        }
+    }
+    impl<T: ToVal> ToVal for Vec<T> {
+        fn to_val(&self) -> Val { list_of(b'l', self.iter()) }
+    }
+    impl<T: ToVal> ToVal for [T] {
+        fn to_val(&self) -> Val { list_of(b'l', self.iter()) }
+    }
+    impl<T: FromVal, const N: usize> FromVal for [T; N] {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            let items: Vec<T> = FromVal::from_val(v)?;
+            let n = items.len();
+            <[T; N]>::try_from(items).map_err(|_| format!("expected {} items, got {}", N, n))
+        }
+    }
+    impl<T: ToVal, const N: usize> ToVal for [T; N] {
+        fn to_val(&self) -> Val { list_of(b'l', self.iter()) }
+    }
+    impl<T: FromVal> FromVal for VecDeque<T> {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            seq_items(v)?.iter().map(T::from_val).collect()
+        }
+    }
+    impl<T: ToVal> ToVal for VecDeque<T> {
+        fn to_val(&self) -> Val { list_of(b'l', self.iter()) }
+    }
+    impl<T: FromVal> FromVal for LinkedList<T> {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            seq_items(v)?.iter().map(T::from_val).collect()
+        }
+    }
+    impl<T: ToVal> ToVal for LinkedList<T> {
+        fn to_val(&self) -> Val { list_of(b'l', self.iter()) }
+    }
+    impl<T: FromVal + Ord> FromVal for BinaryHeap<T> {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            seq_items(v)?.iter().map(T::from_val).collect()
+        }
+    }
+    impl<T: ToVal + Ord> ToVal for BinaryHeap<T> {
+        fn to_val(&self) -> Val {
+            let mut items: Vec<&T> = self.iter().collect();
+            items.sort_by(|a, b| b.cmp(a));
+            let mut r = Val::mk(b'l');
+            for x in items { r.items.push(x.to_val()); }
+            r
+        }
+    }
+
+    fn set_items(v: &Val) -> Result<&Vec<Val>, String> {
+        if v.is_set() || v.is_seq() { Ok(&v.items) } else { Err(format!("expected set, got {}", v.desc())) }
+    }
+    impl<T: FromVal + Eq + Hash, S: BuildHasher + Default> FromVal for HashSet<T, S> {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            set_items(v)?.iter().map(T::from_val).collect()
+        }
+    }
+    impl<T: ToVal, S> ToVal for HashSet<T, S> {
+        fn to_val(&self) -> Val { list_of(b'S', self.iter()) }
+    }
+    impl<T: FromVal + Ord> FromVal for BTreeSet<T> {
+        fn from_val(v: &Val) -> Result<Self, String> {
+            set_items(v)?.iter().map(T::from_val).collect()
+        }
+    }
+    impl<T: ToVal> ToVal for BTreeSet<T> {
+        fn to_val(&self) -> Val { list_of(b'S', self.iter()) }
+    }
+
+    fn dict_pairs<K: FromVal, V: FromVal>(v: &Val) -> Result<Vec<(K, V)>, String> {
+        if !v.is_dict() { return Err(format!("expected dict, got {}", v.desc())); }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < v.items.len() {
+            out.push((K::from_val(&v.items[i])?, V::from_val(&v.items[i + 1])?));
+            i += 2;
+        }
+        Ok(out)
+    }
+    impl<K: FromVal + Eq + Hash, V: FromVal, S: BuildHasher + Default> FromVal for HashMap<K, V, S> {
+        fn from_val(v: &Val) -> Result<Self, String> { Ok(dict_pairs(v)?.into_iter().collect()) }
+    }
+    impl<K: ToVal, V: ToVal, S> ToVal for HashMap<K, V, S> {
+        fn to_val(&self) -> Val {
+            let mut r = Val::mk(b'm');
+            for (k, x) in self.iter() { r.items.push(k.to_val()); r.items.push(x.to_val()); }
+            r
+        }
+    }
+    impl<K: FromVal + Ord, V: FromVal> FromVal for BTreeMap<K, V> {
+        fn from_val(v: &Val) -> Result<Self, String> { Ok(dict_pairs(v)?.into_iter().collect()) }
+    }
+    impl<K: ToVal, V: ToVal> ToVal for BTreeMap<K, V> {
+        fn to_val(&self) -> Val {
+            let mut r = Val::mk(b'm');
+            for (k, x) in self.iter() { r.items.push(k.to_val()); r.items.push(x.to_val()); }
+            r
+        }
+    }
+
+    macro_rules! bcg_tuple {
+        ($n:expr; $($T:ident $i:tt),+) => {
+            impl<$($T: FromVal),+> FromVal for ($($T,)+) {
+                fn from_val(v: &Val) -> Result<Self, String> {
+                    if !(v.is_seq()) || v.items.len() != $n {
+                        return Err(format!("expected {}-tuple, got {}", $n, v.desc()));
+                    }
+                    Ok(($($T::from_val(&v.items[$i])?,)+))
+                }
+            }
+            impl<$($T: ToVal),+> ToVal for ($($T,)+) {
+                fn to_val(&self) -> Val {
+                    let mut r = Val::mk(b't');
+                    $( r.items.push(self.$i.to_val()); )+
+                    r
+                }
+            }
+        };
+    }
+    bcg_tuple!(1; A 0);
+    bcg_tuple!(2; A 0, B 1);
+    bcg_tuple!(3; A 0, B 1, C 2);
+    bcg_tuple!(4; A 0, B 1, C 2, D 3);
+    bcg_tuple!(5; A 0, B 1, C 2, D 3, E 4);
+    bcg_tuple!(6; A 0, B 1, C 2, D 3, E 4, F 5);
+    bcg_tuple!(7; A 0, B 1, C 2, D 3, E 4, F 5, G 6);
+    bcg_tuple!(8; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
+    bcg_tuple!(9; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8);
+    bcg_tuple!(10; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
+    bcg_tuple!(11; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
+    bcg_tuple!(12; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
+
+    pub fn from_arg<T: FromVal>(v: &Val) -> Result<T, String> {
+        T::from_val(v).map_err(|e| format!("argument conversion failed: {}", e))
+    }
+
+    // ---- stdout / stderr capture --------------------------------------------------------
+    extern "C" {
+        fn dup(fd: i32) -> i32;
+        fn dup2(src: i32, dst: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+
+    pub struct Capture {
+        pub base: String,
+        saved: [i32; 2],
+    }
+
+    impl Capture {
+        pub fn new(base: String) -> Capture { Capture { base, saved: [-1, -1] } }
+        pub fn start(&mut self) {
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            for i in 0..2 {
+                use std::os::unix::io::AsRawFd;
+                let path = format!("{}{}", self.base, if i == 0 { ".out" } else { ".err" });
+                unsafe { self.saved[i] = dup(i as i32 + 1); }
+                if let Ok(f) = std::fs::File::create(&path) {
+                    unsafe { dup2(f.as_raw_fd(), i as i32 + 1); }
+                }
+            }
+        }
+        pub fn stop(&mut self) -> (Vec<u8>, Vec<u8>) {
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            for i in 0..2 {
+                if self.saved[i] >= 0 {
+                    unsafe { dup2(self.saved[i], i as i32 + 1); close(self.saved[i]); }
+                    self.saved[i] = -1;
+                }
+            }
+            let rd = |suffix: &str| std::fs::read(format!("{}{}", self.base, suffix)).unwrap_or_default();
+            (rd(".out"), rd(".err"))
+        }
+    }
+
+    pub struct Outcome {
+        pub conv: Option<String>,
+        pub exc: Option<(String, String)>,
+        pub ret: Val,
+        pub post: Vec<Val>,
+        pub out: Vec<u8>,
+        pub err: Vec<u8>,
+    }
+
+    impl Outcome {
+        pub fn conv(msg: String) -> Outcome {
+            Outcome { conv: Some(msg), exc: None, ret: Val::mk(b'N'), post: Vec::new(), out: Vec::new(), err: Vec::new() }
+        }
+        pub fn finish(r: std::thread::Result<Result<Val, String>>, post: Vec<Val>, cap: (Vec<u8>, Vec<u8>)) -> Outcome {
+            let mut o = Outcome { conv: None, exc: None, ret: Val::mk(b'N'), post, out: cap.0, err: cap.1 };
+            match r {
+                Ok(Ok(v)) => o.ret = v,
+                Ok(Err(m)) => o.exc = Some(("Err".to_string(), m)),
+                Err(p) => {
+                    let m = if let Some(s) = p.downcast_ref::<&str>() { s.to_string() }
+                        else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
+                        else { String::new() };
+                    o.exc = Some(("panic".to_string(), m));
+                }
+            }
+            o
+        }
+    }
+
+    fn emit(fh: &mut Option<std::fs::File>, line: &str) {
+        if let Some(f) = fh.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(b"\n");
+            let _ = f.flush();
+        }
+    }
+
+    fn merge_kwargs(args: &mut Vec<Val>, kwargs: &Val, names: &[&str]) -> Result<(), String> {
+        if kwargs.items.is_empty() { return Ok(()); }
+        let mut used = vec![false; kwargs.items.len() / 2];
+        for i in args.len()..names.len() {
+            let mut found = false;
+            let mut j = 0;
+            while j + 1 < kwargs.items.len() {
+                if kwargs.items[j].s == names[i].as_bytes() {
+                    args.push(kwargs.items[j + 1].clone());
+                    used[j / 2] = true;
+                    found = true;
+                    break;
+                }
+                j += 2;
+            }
+            if !found { return Err(format!("missing argument {}", names[i])); }
+        }
+        for (j, u) in used.iter().enumerate() {
+            if !u { return Err(format!("unexpected keyword argument {}", kwargs.items[2 * j].text())); }
+        }
+        Ok(())
+    }
+
+    pub fn run_main(ids: &[&str], args: &[&str], kwargs: &[&str], names: &[&str],
+                    entry: fn(&[Val], &mut Capture) -> Outcome) -> i32 {
+        std::panic::set_hook(Box::new(|_| {}));
+        let argv: Vec<String> = std::env::args().collect();
+        let mut results = String::new();
+        let mut ids_path = String::new();
+        let mut i = 1;
+        while i < argv.len() {
+            if argv[i] == "--results" && i + 1 < argv.len() { results = argv[i + 1].clone(); i += 2; }
+            else if argv[i] == "--ids" && i + 1 < argv.len() { ids_path = argv[i + 1].clone(); i += 2; }
+            else if argv[i] == "--tol" && i + 1 < argv.len() { i += 2; }
+            else { i += 1; }
+        }
+        let mut order: Vec<usize> = Vec::new();
+        if !ids_path.is_empty() {
+            let text = std::fs::read_to_string(&ids_path).unwrap_or_default();
+            for line in text.lines() {
+                if let Some(k) = ids.iter().position(|x| *x == line) { order.push(k); }
+            }
+        } else {
+            order = (0..ids.len()).collect();
+        }
+        let mut fh = if results.is_empty() { None } else {
+            std::fs::OpenOptions::new().append(true).create(true).open(&results).ok()
+        };
+        let base = format!("{}.cap", if results.is_empty() { "bcg-capture".to_string() } else { results.clone() });
+        let mut cap = Capture::new(base.clone());
+        let mut failed = 0;
+        for k in order {
+            let id = ids[k];
+            emit(&mut fh, &format!("{{\"event\":\"start\",\"id\":{}}}", id));
+            let mut p = 0usize;
+            let mut av = parse(args[k].as_bytes(), &mut p);
+            let mut p2 = 0usize;
+            let kv = parse(kwargs[k].as_bytes(), &mut p2);
+            let o = match merge_kwargs(&mut av.items, &kv, names) {
+                Ok(()) => entry(&av.items, &mut cap),
+                Err(e) => Outcome::conv(e),
+            };
+            let mut ev = format!("{{\"event\":\"value\",\"id\":{}", id);
+            if let Some(m) = &o.conv {
+                ev.push_str(&format!(",\"conv\":\"{}\"", hex(m.as_bytes())));
+                failed += 1;
+            } else {
+                if let Some((t, m)) = &o.exc {
+                    ev.push_str(&format!(",\"exc\":\"{}\",\"etype\":\"{}\"", hex(m.as_bytes()), hex(t.as_bytes())));
+                } else {
+                    let mut s = String::new();
+                    encode(&o.ret, &mut s);
+                    ev.push_str(&format!(",\"ret\":\"{}\"", s));
+                }
+                let mut s = String::from("l[");
+                for x in &o.post { encode(x, &mut s); }
+                s.push(']');
+                ev.push_str(&format!(",\"post\":\"{}\",\"out\":\"{}\",\"err\":\"{}\"", s, hex(&o.out), hex(&o.err)));
+            }
+            ev.push('}');
+            emit(&mut fh, &ev);
+        }
+        emit(&mut fh, "{\"event\":\"done\"}");
+        let _ = std::fs::remove_file(format!("{}.out", base));
+        let _ = std::fs::remove_file(format!("{}.err", base));
+        if failed > 0 { 1 } else { 0 }
+    }
+}
+'''
+
+
+# ---------------------------------------------------------------------------
+# Native (C++ / Rust) targets
+# ---------------------------------------------------------------------------
+#
+# The native tester converts each test's arguments (encoded with ``native_enc``) into the
+# parameter types of the solution's entrypoint, calls it, and reports the return value, the
+# post-call state of the arguments, any exception / panic and the captured stdout / stderr.
+# The driver then evaluates the assertion with the same Python-semantics evaluator that the
+# Python tester uses (``_judge``), so every value type and operation supported for Python
+# tests is supported for C++ / Rust too.
+
+NATIVE_LANGS = ("cpp", "rust")
+NATIVE_PARAMS = []  # parameter names of the entrypoint found by the last native build
+
+
+def cpp_param_names(src, entry):
+    """Parameter names of the C++ entrypoint (empty strings for unnamed ones)."""
+    meth = entry.lstrip("&").split("::")[-1]
+    code = _blank_code(src, "cpp")
+    blocks = _blocks(code)
+    for m in re.finditer(r"(?<![\w.>:~])" + re.escape(meth) + r"\s*\(", code):
+        if any("(" in h and not re.search(r"\b(class|struct|namespace)\b", h) for _, _, h in _enclosing(blocks, m.start())):
+            continue
+        k = m.end() - 1
+        e = _match_close(code, k, "(", ")")
+        if e < 0:
+            continue
+        params = [p.strip() for p in _split_top(code[k + 1:e])]
+        if params == ["void"]:
+            return []
+        names = []
+        for p in params:
+            p = _split_top(p, "=")[0].strip()
+            p = re.sub(r"\[[^\]]*\]\s*$", "", p).strip()
+            nm = re.search(r"([A-Za-z_]\w*)\s*$", p)
+            kw = {"int", "long", "short", "char", "double", "float", "bool", "unsigned", "signed", "auto", "const"}
+            ok = nm and len(re.findall(r"[A-Za-z_]\w*", p)) > 1 and nm.group(1) not in kw
+            names.append(nm.group(1) if ok else "")
+        return names
+    return []
+
+
+def native_enc(v):
+    """Encode a Python value in the compact tagged format understood by the native runtimes."""
+    out = []
+
+    def enc(x):
+        if x is None:
+            out.append("N")
+        elif isinstance(x, bool):
+            out.append("T" if x else "F")
+        elif isinstance(x, int):
+            out.append("i%d;" % x)
+        elif isinstance(x, float):
+            out.append("f%s;" % repr(x))
+        elif isinstance(x, decimal.Decimal):
+            if x.is_nan():
+                t = "nan"
+            elif x.is_infinite():
+                t = "inf" if x > 0 else "-inf"
+            else:
+                t = str(x)
+            out.append("d%s;" % t)
+        elif isinstance(x, str):
+            out.append("s" + x.encode("utf-8", "surrogatepass").hex() + ";")
+        elif isinstance(x, (bytes, bytearray)):
+            out.append("b" + bytes(x).hex() + ";")
+        elif isinstance(x, dict):
+            if isinstance(x, collections.Counter):
+                tag = "c"
+            elif isinstance(x, collections.defaultdict):
+                tag = "D"
+            elif isinstance(x, collections.OrderedDict):
+                tag = "o"
+            else:
+                tag = "m"
+            out.append(tag + "[")
+            for k, val in x.items():
+                enc(k)
+                enc(val)
+            out.append("]")
+        elif isinstance(x, (list, tuple, collections.deque, set, frozenset)):
+            if isinstance(x, list):
+                tag = "l"
+            elif isinstance(x, tuple):
+                tag = "t"
+            elif isinstance(x, collections.deque):
+                tag = "q"
+            elif isinstance(x, frozenset):
+                tag = "z"
+            else:
+                tag = "S"
+            out.append(tag + "[")
+            for y in x:
+                enc(y)
+            out.append("]")
+        else:
+            raise GenerateError(f"cannot translate {x!r}")
+
+    enc(v)
+    return "".join(out)
+
+
+class _Opaque:
+    """A native value with no Python counterpart (e.g. a user-defined struct)."""
+
+    def __repr__(self):
+        return "<native object>"
+
+
+def _hashable_key(v):
+    if isinstance(v, list):
+        return tuple(_hashable_key(x) for x in v)
+    if isinstance(v, set):
+        return frozenset(v)
+    if isinstance(v, dict):
+        return tuple((k, _hashable_key(x)) for k, x in v.items())
+    return v
+
+
+def native_dec(src, decimals=False):
+    """Decode a value reported by a native tester into Python values."""
+    pos = 0
+
+    def num(text):
+        if decimals:
+            try:
+                return decimal.Decimal(text)
+            except Exception:
+                pass
+        return float(text)
+
+    def dec():
+        nonlocal pos
+        tag = src[pos]
+        pos += 1
+        if tag == "N":
+            return None
+        if tag == "T":
+            return True
+        if tag == "F":
+            return False
+        if tag == "O":
+            return _Opaque()
+        if tag in "ifdsb":
+            end = src.index(";", pos)
+            text = src[pos:end]
+            pos = end + 1
+            if tag == "i":
+                return int(text)
+            if tag in "fd":
+                return num(text)
+            raw = bytes.fromhex(text)
+            if tag == "b":
+                return raw
+            return raw.decode("utf-8", "surrogateescape")
+        pos += 1  # '['
+        items = []
+        while src[pos] != "]":
+            items.append(dec())
+        pos += 1
+        if tag in "mcoD":
+            pairs = [(_hashable_key(items[i]), items[i + 1]) for i in range(0, len(items) - 1, 2)]
+            if tag == "c":
+                return collections.Counter(dict(pairs))
+            if tag == "o":
+                return collections.OrderedDict(pairs)
+            return dict(pairs)
+        if tag in "Sz":
+            vals = {_hashable_key(x) for x in items}
+            return frozenset(vals) if tag == "z" else vals
+        if tag == "t":
+            return tuple(items)
+        if tag == "q":
+            return collections.deque(items)
+        return items
+
+    return dec()
+
+
+def _involves_decimal(t):
+    """True if a test uses Decimal values (then native floats are compared as Decimals)."""
+    def walk(v, depth=0):
+        if depth > 50:
+            return False
+        if isinstance(v, decimal.Decimal):
+            return True
+        if isinstance(v, dict):
+            return any(walk(k, depth + 1) or walk(x, depth + 1) for k, x in v.items())
+        if isinstance(v, (list, tuple, set, frozenset, collections.deque)):
+            return any(walk(x, depth + 1) for x in v)
+        return False
+    return any(walk(t.get(k)) for k in ("expected", "args", "kwargs", "xf"))
+
+
+def _c_str(s):
+    """A C / C++ / Rust string literal for an ASCII string."""
+    out = ['"']
+    for ch in s:
+        if ch in '\\"':
+            out.append("\\" + ch)
+        elif ch == "?":
+            out.append("\\?")
+        elif " " <= ch <= "~":
+            out.append(ch)
+        else:
+            out.append("\\x%02x" % ord(ch))
+    out.append('"')
+    return "".join(out)
+
+
+def _rs_str(s):
+    out = ['"']
+    for ch in s:
+        if ch in '\\"':
+            out.append("\\" + ch)
+        elif " " <= ch <= "~":
+            out.append(ch)
+        else:
+            out.append("\\u{%x}" % ord(ch))
+    out.append('"')
+    return "".join(out)
+
+
+def _native_id(tid):
+    return json.dumps(tid, ensure_ascii=True)
+
+
+def render_native(tests, entrypoint, lang):
+    meta = "// " + META_MARKER + " " + json.dumps({"lang": lang, "entrypoint": entrypoint})
+    ids, args, kwargs = [], [], []
+    for t in tests:
+        if t["kind"] == "loop":
+            continue
+        ids.append(_native_id(t["id"]))
+        args.append(native_enc(list(t["args"])))
+        kwargs.append(native_enc(dict(t["kwargs"])))
+    lines = ["// Auto-generated by babel_code_goat.py -- do not edit.", meta]
+    if lang == "cpp":
+        lines.append("// Compiled by `babel_code_goat.py test` together with the solution (C++17 or later).")
+        lines.append("#include <cstddef>")
+        lines.append("namespace bcg_data {")
+        lines.append(f"static const std::size_t N_TESTS = {len(ids)};")
+        lines.append("static const char* const TEST_IDS[] = {")
+        lines.extend("    " + _c_str(x) + "," for x in ids)
+        lines.append("    nullptr};")
+        lines.append("static const char* const TEST_ARGS[] = {")
+        lines.extend("    " + _c_str(x) + "," for x in args)
+        lines.append("    nullptr};")
+        lines.append("static const char* const TEST_KWARGS[] = {")
+        lines.extend("    " + _c_str(x) + "," for x in kwargs)
+        lines.append("    nullptr};")
+        lines.append("}  // namespace bcg_data")
+        return "\n".join(lines) + "\n" + CPP_RUNTIME
+    lines.append("// Compiled by `babel_code_goat.py test` together with the solution (Rust 2021).")
+    lines.append("static BCG_IDS: &[&str] = &[")
+    lines.extend("    " + _rs_str(x) + "," for x in ids)
+    lines.append("];")
+    lines.append("static BCG_ARGS: &[&str] = &[")
+    lines.extend("    " + _rs_str(x) + "," for x in args)
+    lines.append("];")
+    lines.append("static BCG_KWARGS: &[&str] = &[")
+    lines.extend("    " + _rs_str(x) + "," for x in kwargs)
+    lines.append("];")
+    lines.append("fn main() {")
+    lines.append("    std::process::exit(bcg::run_main(BCG_IDS, BCG_ARGS, BCG_KWARGS, BCG_PARAM_NAMES, __bcg_entry));")
+    lines.append("}")
+    return "\n".join(lines) + "\n" + RUST_RUNTIME
+
+
+# ---- solution source analysis ----------------------------------------------------------
+
+def _blank_code(src, lang):
+    """Replace comments and string / char literals by spaces (keeping offsets and newlines)."""
+    out = list(src)
+    n = len(src)
+    i = 0
+
+    def blank(a, b):
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = src[i]
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif lang == "rust" and c == "r" and re.match(r'r#*"', src[i:i + 300]) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            m = re.match(r'r(#*)"', src[i:])
+            close = '"' + m.group(1)
+            j = src.find(close, i + len(m.group(0)))
+            j = n if j < 0 else j + len(close)
+            blank(i, j)
+            i = j
+        elif lang == "cpp" and c == "R" and src.startswith('R"', i) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            m = re.match(r'R"([^(\s]*)\(', src[i:])
+            if m:
+                close = ")" + m.group(1) + '"'
+                j = src.find(close, i + len(m.group(0)))
+                j = n if j < 0 else j + len(close)
+                blank(i, j)
+                i = j
+            else:
+                i += 1
+        elif c == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            blank(i + 1, j)
+            i = j + 1
+        elif c == "'":
+            if lang == "rust":
+                m = re.match(r"'(\\(x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'])'", src[i:i + 16])
+                if m:
+                    blank(i, i + len(m.group(0)))
+                    i += len(m.group(0))
+                    continue
+                i += 1  # a lifetime
+            else:
+                if i > 0 and (src[i - 1].isalnum()) and i + 1 < n and src[i + 1].isalnum() and src[i - 1] not in "uUL8":
+                    i += 1  # digit separator 1'000
+                    continue
+                j = i + 1
+                while j < n and src[j] != "'" and src[j] != "\n":
+                    j += 2 if src[j] == "\\" else 1
+                blank(i, j + 1)
+                i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _match_close(code, i, open_ch, close_ch):
+    """Index of the bracket closing the one at ``i``."""
+    depth = 0
+    for k in range(i, len(code)):
+        ch = code[k]
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+def _blocks(code):
+    """Yield (start, end, header) for every ``{ ... }`` block; header is the text before it."""
+    stack = []
+    last_stop = 0
+    res = []
+    for k, ch in enumerate(code):
+        if ch == "{":
+            stack.append((k, code[last_stop:k]))
+            last_stop = k + 1
+        elif ch == "}":
+            if stack:
+                start, header = stack.pop()
+                res.append((start, k, header))
+            last_stop = k + 1
+        elif ch == ";":
+            last_stop = k + 1
+    return res
+
+
+def _enclosing(blocks, pos):
+    """Innermost-first list of headers of blocks enclosing ``pos``."""
+    encl = [(s, e, h) for s, e, h in blocks if s < pos < e]
+    encl.sort(key=lambda b: b[0], reverse=True)
+    return encl
+
+
+def _split_top(text, sep=","):
+    parts, depth, cur = [], 0, []
+    for ch in text:
+        if ch in "<([{":
+            depth += 1
+        elif ch in ">)]}":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return parts
+
+
+_CPP_CLASS_RE = re.compile(r"\b(?:class|struct)\s+(?:alignas\s*\([^)]*\)\s*)?([A-Za-z_]\w*)\s*(?:final\b)?[^;{()]*$")
+
+
+def _name_variants(name):
+    """The name itself, then its snake_case and camelCase spellings."""
+    snake = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name)
+    snake = re.sub(r"(?<=[A-Z])([A-Z][a-z])", r"_\1", snake).lower()
+    head, *rest = name.split("_") if "_" in name.strip("_") else (name, )
+    camel = head + "".join(w[:1].upper() + w[1:] for w in rest)
+    out = []
+    for v in (name, snake, camel):
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def _pick_name(code, name, pattern):
+    """First spelling of ``name`` that occurs in ``code`` (``pattern`` formats the regex)."""
+    for v in _name_variants(name):
+        if re.search(pattern % re.escape(v), code):
+            return v
+    return name
+
+
+def cpp_entry_expr(src, entrypoint):
+    """C++ expression naming the entrypoint (``&f`` or ``&Class::method``)."""
+    parts = entrypoint.split(".")
+    code = _blank_code(src, "cpp")
+    meth = _pick_name(code, parts[-1], r"(?<![\w.>:~])%s\s*\(")
+    if len(parts) == 2:
+        return f"&{parts[0]}::{meth}"
+    blocks = _blocks(code)
+    frees, owners = [], []
+    for m in re.finditer(r"(?<![\w.>:~])" + re.escape(meth) + r"\s*\(", code):
+        scopes = []  # innermost first: ("ns" | "cls", name)
+        in_function = False
+        for s_, e_, h in _enclosing(blocks, m.start()):
+            hs = h.strip()
+            hm = _CPP_CLASS_RE.search(hs)
+            nm = re.search(r"\bnamespace\s*([A-Za-z_][\w:]*)?\s*$", hs)
+            if hm and "(" not in h:
+                scopes.append(("cls", hm.group(1)))
+            elif nm:
+                if nm.group(1):
+                    scopes.append(("ns", nm.group(1)))
+            elif re.search(r'\bextern\s*$', hs):
+                continue
+            else:
+                in_function = True
+                break
+        if in_function:
+            continue
+        qual = "::".join(n for _, n in reversed(scopes))
+        target = owners if any(k == "cls" for k, _ in scopes) else frees
+        target.append(qual)
+    if frees:
+        q = frees[0]
+        return f"&{q}::{meth}" if q else f"&{meth}"
+    if owners:
+        return f"&{owners[0]}::{meth}"
+    return f"&{meth}"
+
+
+def _strip_lifetimes(t):
+    t = re.sub(r"&\s*'\w+\s*", "&", t)
+    t = re.sub(r"'\w+\s*,\s*", "", t)
+    t = re.sub(r"<\s*'\w+\s*>", "", t)
+    t = re.sub(r",\s*'\w+\s*", "", t)
+    t = re.sub(r"\bdyn\s+", "dyn ", t)
+    return t.strip()
+
+
+def _rust_storage(ty):
+    """(storage type or None, pass prefix) for a Rust parameter type."""
+    t = _strip_lifetimes(ty)
+    prefix = ""
+    m = re.match(r"^&\s*(mut\b)?\s*(.*)$", t, re.S)
+    if m:
+        prefix = "&mut " if m.group(1) else "&"
+        t = m.group(2).strip()
+    if t == "str":
+        t = "String"
+    elif t.startswith("[") and t.endswith("]") and len(_split_top(t[1:-1], ";")) == 1:
+        t = "Vec<" + t[1:-1].strip() + ">"
+    elif re.match(r"^impl\s+(AsRef\s*<\s*str\s*>|Into\s*<\s*String\s*>|ToString|Display|std::fmt::Display)", t):
+        t = "String"
+    elif re.match(r"^impl\s+(?:std::iter::)?IntoIterator\s*<\s*Item\s*=", t):
+        t = "Vec<" + re.match(r"^impl\s+(?:std::iter::)?IntoIterator\s*<\s*Item\s*=\s*(.*)>$", t, re.S).group(1).strip() + ">"
+    elif re.match(r"^impl\s+(?:std::iter::)?Iterator\s*<\s*Item\s*=", t):
+        inner = re.match(r"^impl\s+(?:std::iter::)?Iterator\s*<\s*Item\s*=\s*(.*)>$", t, re.S).group(1).strip()
+        return "Vec<" + inner + ">", "iter:"
+    elif re.match(r"^impl\b", t) or re.match(r"^dyn\b", t):
+        return None, prefix
+    return t, prefix
+
+
+def _rust_generic_subst(generics):
+    """Concrete stand-ins for a function's generic type parameters."""
+    out = {}
+    for g in _split_top(generics):
+        g = g.strip()
+        if not g or g.startswith("'") or g.startswith("const "):
+            continue
+        m = re.match(r"^([A-Za-z_]\w*)\s*(?::\s*(.*))?$", g, re.S)
+        if not m:
+            continue
+        bounds = m.group(2) or ""
+        if re.search(r"\b(AsRef\s*<\s*str|Into\s*<\s*String|Display|ToString)\b", bounds):
+            out[m.group(1)] = "String"
+        elif re.search(r"\b(Float)\b", bounds):
+            out[m.group(1)] = "f64"
+        else:
+            out[m.group(1)] = "i64"
+    return out
+
+
+def _rust_fn_sig(code, pos):
+    """Parse ``fn name<...>(params) -> ret`` starting at the ``fn`` keyword."""
+    m = re.compile(r"fn\s+\w+\s*").match(code, pos)
+    k = m.end()
+    generics = ""
+    if k < len(code) and code[k] == "<":
+        e = _match_close(code, k, "<", ">")
+        generics = code[k + 1:e]
+        k = e + 1
+    while k < len(code) and code[k].isspace():
+        k += 1
+    if k >= len(code) or code[k] != "(":
+        return None
+    e = _match_close(code, k, "(", ")")
+    params = _split_top(code[k + 1:e])
+    return generics, [p.strip() for p in params if p.strip()]
+
+
+def rust_glue(src, entrypoint):
+    """Rust source of ``__bcg_entry`` calling the solution's entrypoint, plus extra items."""
+    parts = entrypoint.split(".")
+    want_cls = parts[0] if len(parts) == 2 else None
+    code = _blank_code(src, "rust")
+    meth = _pick_name(code, parts[-1], r"\bfn\s+%s\b")
+    blocks = _blocks(code)
+    cands = []
+    for m in re.finditer(r"\bfn\s+" + re.escape(meth) + r"\b", code):
+        encl = _enclosing(blocks, m.start())
+        owner = None
+        inside_fn = False
+        mods = []
+        for s, e, h in encl:
+            hs = h.strip()
+            im = re.search(r"\bimpl\b(?:\s*<[^{]*?>)?\s+(?:[\w:<>, ]+\s+for\s+)?(?:\w+::)*(\w+)\s*(?:<[^{]*>)?\s*(?:where[^{]*)?$", hs)
+            if im and owner is None and not mods:
+                owner = im.group(1)
+            elif re.search(r"\bmod\s+(\w+)\s*$", hs):
+                if re.search(r"\bcfg\s*\(\s*test\s*\)", hs):
+                    inside_fn = True
+                    break
+                mods.append(re.search(r"\bmod\s+(\w+)\s*$", hs).group(1))
+            elif re.search(r"\btrait\s+\w+", hs):
+                inside_fn = True
+                break
+            else:
+                inside_fn = True
+                break
+        if inside_fn:
+            continue
+        cands.append((owner, list(reversed(mods)), m.start()))
+    chosen = None
+    if want_cls:
+        chosen = next((c for c in cands if c[0] == want_cls), None)
+    if chosen is None:
+        chosen = next((c for c in cands if c[0] is None and not c[1]), None)
+    if chosen is None:
+        chosen = next((c for c in cands if c[0] is None), None)
+    if chosen is None and cands:
+        chosen = cands[0]
+    extra = []
+    if chosen is None:
+        if want_cls:
+            call_base, has_self, params, self_mut = f"{want_cls}::{meth}", False, None, False
+        else:
+            call_base, has_self, params, self_mut = meth, False, None, False
+        owner = want_cls
+        modpath = ""
+    else:
+        owner, mods, pos = chosen
+        sig = _rust_fn_sig(code, pos)
+        params = sig[1] if sig else None
+        modpath = "".join(m + "::" for m in mods)
+        has_self = False
+        self_mut = False
+        if params and re.match(r"^(&\s*('\w+\s*)?(mut\s+)?)?(mut\s+)?self\b", params[0]):
+            has_self = True
+            self_mut = bool(re.match(r"^&\s*('\w+\s*)?mut\b", params[0])) or params[0].startswith("mut ")
+            params = params[1:]
+        if owner:
+            call_base = f"{modpath}{owner}::{meth}"
+        else:
+            call_base = f"{modpath}{meth}"
+    if owner and not re.search(r"\b(struct|enum|type|union)\s+" + re.escape(owner) + r"\b", code):
+        extra.append(f"pub struct {owner};")
+    names = []
+    for p in params or []:
+        pm = re.match(r"^(?:mut\s+)?(?:ref\s+)?([A-Za-z_]\w*)\s*:", p)
+        names.append(pm.group(1) if pm else "")
+    NATIVE_PARAMS[:] = names
+    extra.append("static BCG_PARAM_NAMES: &[&str] = &[" + "".join(_rs_str(x) + ", " for x in names) + "];")
+    lines = ["#[allow(unused_mut, unused_variables, non_snake_case, unused_parens, dead_code)]",
+             "fn __bcg_entry(__args: &[bcg::Val], __cap: &mut bcg::Capture) -> bcg::Outcome {"]
+    call_args = []
+    post = []
+    if params is None:
+        n = None
+    else:
+        n = len(params)
+        lines.append(f"    if __args.len() != {n} {{ return bcg::Outcome::conv(format!(\"entrypoint takes {n} arguments, got {{}}\", __args.len())); }}")
+        gsubst = _rust_generic_subst(sig[0] if chosen is not None and sig else "")
+        for i, p in enumerate(params):
+            pm = re.match(r"^(?:mut\s+)?([^:]+?)\s*:\s*(.*)$", p, re.S)
+            ty = pm.group(2) if pm else "_"
+            for gname, gty in gsubst.items():
+                ty = re.sub(r"\b%s\b" % re.escape(gname), gty, ty)
+            storage, prefix = _rust_storage(ty)
+            ann = f": {storage}" if storage else ""
+            lines.append(f"    let mut __a{i}{ann} = match bcg::from_arg(&__args[{i}]) {{ Ok(v) => v, Err(e) => return bcg::Outcome::conv(e) }};")
+            if prefix == "iter:":
+                lines.append(f"    let __p{i} = bcg::ToVal::to_val(&__a{i});")
+                call_args.append(f"__a{i}.into_iter()")
+                post.append(f"__p{i}")
+            elif prefix:
+                call_args.append(f"{prefix}__a{i}")
+                post.append(f"bcg::ToVal::to_val(&__a{i})")
+            else:
+                lines.append(f"    let __p{i} = bcg::ToVal::to_val(&__a{i});")
+                call_args.append(f"__a{i}")
+                post.append(f"__p{i}")
+    if n is None:
+        lines.append("    return bcg::Outcome::conv(String::from(\"entrypoint not found in solution\"));")
+        lines.append("}")
+        return "\n".join(extra + lines) + "\n"
+    if has_self:
+        ctor = _rust_ctor(code, owner)
+        lines.append(f"    let mut __obj = {modpath}{ctor};")
+        call = f"__obj.{meth}({', '.join(call_args)})"
+    else:
+        call = f"{call_base}({', '.join(call_args)})"
+    lines.append("    __cap.start();")
+    lines.append(f"    let __r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ let __ret = {call}; bcg::ToVal::to_ret(&__ret) }}));")
+    lines.append("    let __c = __cap.stop();")
+    lines.append(f"    let __post = vec![{', '.join(post)}];")
+    lines.append("    bcg::Outcome::finish(__r, __post, __c)")
+    lines.append("}")
+    return "\n".join(extra + lines) + "\n"
+
+
+def _rust_ctor(code, owner):
+    for s, e, h in _blocks(code):
+        if re.search(r"\bimpl\b(?:\s*<[^{]*?>)?\s+(?:\w+::)*" + re.escape(owner) + r"\s*(?:<[^{]*>)?\s*$", h.strip()):
+            body = code[s:e]
+            m = re.search(r"\bfn\s+new\s*\(\s*\)", body)
+            if m:
+                return f"{owner}::new()"
+    if re.search(r"\bstruct\s+" + re.escape(owner) + r"\s*;", code):
+        return owner
+    if re.search(r"\bstruct\s+" + re.escape(owner) + r"\s*\{\s*\}", code):
+        return owner + " {}"
+    if not re.search(r"\b(struct|enum|type|union)\s+" + re.escape(owner) + r"\b", code):
+        return owner
+    return f"<{owner} as ::std::default::Default>::default()"
+
+
+_RUST_OWNED_KEY_RE = re.compile(
+    r"\.(get|get_mut|contains_key|remove|get_key_value)\(\s*(?=(String::from\s*\(|format!\s*\(|\"(?:[^\"\\]|\\.)*\"\s*\.\s*(?:to_string|to_owned|into)\s*\(\s*\)))")
+
+
+def rust_prepare_solution(src):
+    """Make a Rust solution includable next to the tester (``main`` renamed, owned-key lookups)."""
+    code = _blank_code(src, "rust")
+    out = []
+    last = 0
+    for m in re.finditer(r"\bfn\s+(main)\s*\(", code):
+        out.append(src[last:m.start(1)])
+        out.append("__bcg_user_main")
+        last = m.end(1)
+    out.append(src[last:])
+    src = "".join(out)
+    code = _blank_code(src, "rust")
+    out, last = [], 0
+    for m in _RUST_OWNED_KEY_RE.finditer(code):
+        k = m.end()
+        # skip when the argument is already a reference
+        out.append(src[last:k])
+        out.append("&")
+        last = k
+    out.append(src[last:])
+    return "".join(out)
+
+
+# ---- compilation -----------------------------------------------------------------------
+
+def _native_cache_dir():
+    d = os.path.join(tempfile.gettempdir(), "bcg-native-cache-%d" % os.getuid() if hasattr(os, "getuid") else "bcg-native-cache")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return None
+    return d
+
+
+def _compile_cached(key_parts, attempts, workdir):
+    """Run compile attempts [(argv, binary_path)] until one produces a binary; cache it."""
+    import hashlib
+    h = hashlib.sha256()
+    for p in key_parts:
+        h.update(p.encode("utf-8", "surrogateescape") if isinstance(p, str) else p)
+        h.update(b"\0")
+    key = h.hexdigest()
+    cache = _native_cache_dir()
+    final = os.path.join(workdir, "tester-bin")
+    if cache:
+        cached = os.path.join(cache, key)
+        if os.path.isfile(cached) and os.access(cached, os.X_OK):
+            try:
+                shutil.copyfile(cached, final)
+                os.chmod(final, 0o755)
+                return final
+            except OSError:
+                pass
+    for argv, out in attempts:
+        try:
+            proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=600, cwd=workdir)
+        except Exception:
+            continue
+        if proc.returncode == 0 and os.path.isfile(out):
+            if out != final:
+                shutil.move(out, final)
+            if cache:
+                try:
+                    tmp = os.path.join(cache, ".%s.%d" % (key, os.getpid()))
+                    shutil.copyfile(final, tmp)
+                    os.chmod(tmp, 0o755)
+                    os.replace(tmp, os.path.join(cache, key))
+                except OSError:
+                    pass
+            return final
+        if os.environ.get("BCG_DEBUG"):
+            sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
+    return None
+
+
+def build_native(lang, tester_path, solution, workdir):
+    with open(tester_path, encoding="utf-8") as f:
+        tester_src = f.read()
+    with open(solution, encoding="utf-8", errors="surrogateescape") as f:
+        sol_src = f.read()
+    meta = read_meta(tester_path) or {}
+    ep = meta.get("entrypoint") or ""
+    if lang == "cpp":
+        cxx = os.environ.get("CXX") or shutil.which("g++") or shutil.which("clang++") or shutil.which("c++")
+        if not cxx:
+            return None
+        sol_copy = os.path.join(workdir, "solution_src.cpp")
+        with open(sol_copy, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(sol_src)
+        tester_copy = os.path.join(workdir, "tester_src.cpp")
+        with open(tester_copy, "w", encoding="utf-8") as f:
+            f.write(tester_src)
+        entry = cpp_entry_expr(sol_src, ep)
+        names = cpp_param_names(sol_src, entry)
+        NATIVE_PARAMS[:] = names
+        attempts = []
+        variants = []
+        for std in ("gnu++20", "gnu++17"):
+            for using in (False, True):
+                variants.append((std, using))
+        for idx, (std, using) in enumerate(variants):
+            main_src = os.path.join(workdir, f"main{idx}.cpp")
+            with open(main_src, "w", encoding="utf-8") as f:
+                f.write("#if __has_include(<bits/stdc++.h>)\n#include <bits/stdc++.h>\n#endif\n")
+                if using:
+                    f.write("using namespace std;\n")
+                f.write("#define main bcg_user_main_\n")
+                f.write('#include "solution_src.cpp"\n')
+                f.write("#undef main\n")
+                f.write(f"#define BCG_ENTRY_PTR ({entry})\n")
+                f.write("#define BCG_PARAM_NAMES {" + "".join(_c_str(x or "") + ", " for x in names) + "nullptr}\n")
+                f.write('#include "tester_src.cpp"\n')
+            out = os.path.join(workdir, f"bin{idx}")
+            attempts.append(([cxx, f"-std={std}", "-O2", "-w", "-o", out, main_src], out))
+        return _compile_cached(["cpp", cxx, entry, repr(names), sol_src, tester_src], attempts, workdir)
+    rustc = os.environ.get("RUSTC") or shutil.which("rustc")
+    if not rustc:
+        return None
+    prepared = rust_prepare_solution(sol_src)
+    glue = rust_glue(sol_src, ep)
+    main_src = os.path.join(workdir, "main.rs")
+    with open(main_src, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(prepared)
+        f.write("\n\n// ---- babel_code_goat tester ----\n")
+        f.write(tester_src)
+        f.write("\n")
+        f.write(glue)
+    attempts = []
+    for edition in ("2021", "2018"):
+        out = os.path.join(workdir, f"bin-{edition}")
+        attempts.append(([rustc, "--edition", edition, "-O", "-A", "warnings", "--crate-name", "bcg_tester",
+                          "-o", out, main_src], out))
+    return _compile_cached(["rust", rustc, prepared, tester_src, glue], attempts, workdir)
+
+
+# ---- judging ---------------------------------------------------------------------------
+
+class NativeJudge:
+    """Evaluates native outcomes with the Python tester's semantics."""
+
+    def __init__(self, tests, tol=None):
+        ns = {"__name__": "bcg_native_judge"}
+        exec(compile(PY_RUNTIME, "<babel_code_goat-runtime>", "exec"), ns)
+        ns["_NATIVE"][0] = True
+        if tol is not None:
+            ns["_TOL"]["abs"] = float(tol)
+            ns["_TOL"]["rel"] = 0.0
+        self.ns = ns
+        self.params = list(NATIVE_PARAMS)
+        self.tests = {}
+        for t in tests:
+            self.tests.setdefault(t["id"], t)
+
+    def judge(self, ev):
+        import copy
+        t = self.tests.get(ev.get("id"))
+        if t is None or "conv" in ev:
+            return False
+        ns = self.ns
+        decimals = _involves_decimal(t)
+        out = {
+            "stdout": bytes.fromhex(ev.get("out", "")).decode("utf-8", "surrogateescape"),
+            "stderr": bytes.fromhex(ev.get("err", "")).decode("utf-8", "surrogateescape"),
+        }
+        raised = None
+        result = raw = None
+        try:
+            if "exc" in ev:
+                msg = bytes.fromhex(ev["exc"]).decode("utf-8", "replace")
+                raised = RuntimeError(msg)
+            else:
+                post = native_dec(ev.get("post", "l[]"), decimals)
+                result = raw = native_dec(ev.get("ret", "N"), decimals)
+                npos = len(t.get("args") or [])
+                kwpost = {}
+                for name in (t.get("kwargs") or {}):
+                    if name in self.params:
+                        idx = self.params.index(name)
+                        if idx < len(post):
+                            kwpost[name] = post[idx]
+                xf = t.get("xf")
+                if xf is not None:
+                    try:
+                        result = ns["_ev"](xf, raw, None, post[:npos], kwpost)
+                    except Exception as e:
+                        raised = e
+        except Exception as e:
+            return False
+        expected = t.get("expected")
+        tt = {
+            "id": t["id"], "kind": t["kind"], "extra": t.get("extra") or {},
+            "expected": lambda: copy.deepcopy(expected),
+            "xf": lambda: t.get("xf"),
+            "stdout": t.get("stdout"), "stderr": t.get("stderr"),
+        }
+        try:
+            ok, _msg = ns["_judge"](tt, result, raw, raised, out)
+        except Exception:
+            return False
+        return bool(ok)
+
+
 def validate_entrypoint(ep):
     if not ep:
         return False
@@ -4200,6 +6668,8 @@ def cmd_generate(opts):
         raise GenerateError(str(e))
     if lang == "python":
         content = render_python(tests, ep)
+    elif lang in NATIVE_LANGS:
+        content = render_native(tests, ep, lang)
     else:
         content = render_js(tests, ep, lang)
     target = os.path.join(tests_dir, LANGS[lang])
@@ -4251,8 +6721,14 @@ def node_supports_strip():
     return node, False
 
 
-def build_command(lang, tester_path, workdir):
+def build_command(lang, tester_path, workdir, solution=None):
     """Return argv prefix for running the tester or None if impossible."""
+    if lang in NATIVE_LANGS:
+        try:
+            binary = build_native(lang, tester_path, solution, workdir)
+        except Exception:
+            return None
+        return [binary] if binary else None
     if lang == "python":
         return [sys.executable, tester_path]
     node = shutil.which("node")
@@ -4301,7 +6777,7 @@ def parse_events(path):
     return events
 
 
-def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None):
+def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None, judge=None):
     """Run tests; return (results: id->bool, error: bool)."""
     results = {}
     remaining = list(ids)
@@ -4312,7 +6788,10 @@ def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None):
         res_path = os.path.join(workdir, f"results{attempt}.jsonl")
         ids_path = os.path.join(workdir, f"ids{attempt}.json")
         with open(ids_path, "w", encoding="utf-8") as f:
-            json.dump(remaining, f)
+            if lang in NATIVE_LANGS:
+                f.write("".join(_native_id(i) + "\n" for i in remaining))
+            else:
+                json.dump(remaining, f)
         open(res_path, "w").close()
         cmd = cmd_prefix + [solution, "--results", res_path, "--ids", ids_path]
         if tol is not None:
@@ -4372,6 +6851,11 @@ def run_tester(cmd_prefix, solution, ids, timeout, workdir, lang, tol=None):
                 if rid not in results:
                     results[rid] = bool(ev.get("ok"))
                 started = None
+            elif kind == "value" and judge is not None:
+                rid = ev.get("id")
+                if rid not in results:
+                    results[rid] = judge(ev)
+                started = None
             elif kind == "done":
                 done = True
         if load_error:
@@ -4426,13 +6910,14 @@ def cmd_test(opts):
     timeout = opts.get("timeout", DEFAULT_TIMEOUT)
     workdir = tempfile.mkdtemp(prefix="bcg-run-")
     try:
-        prefix = build_command(lang, os.path.abspath(tester_path), workdir)
+        prefix = build_command(lang, os.path.abspath(tester_path), workdir, os.path.abspath(solution))
         if prefix is None:
             return emit_result("error", [], ids)
         static = {t["id"]: bool(t["ok"]) for t in tests if t["kind"] == "loop"}
         run_ids = [i for i in ids if i not in static]
+        judge = NativeJudge(tests, opts.get("tol")).judge if lang in NATIVE_LANGS else None
         results, error = run_tester(prefix, os.path.abspath(solution), run_ids, timeout, workdir,
-                                    lang, opts.get("tol"))
+                                    lang, opts.get("tol"), judge)
         results.update(static)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
