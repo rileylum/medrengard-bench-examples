@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""LogQL Part 1: query NDJSON logs with a tiny SQL-like language."""
+"""LogQL Parts 1-2: query NDJSON logs with a tiny SQL-like language (with GROUP BY / aggregates)."""
 import json
+import math
 import re
 import sys
 
 KEYWORDS = {"SELECT", "FROM", "WHERE", "AND", "OR", "TRUE", "FALSE", "NULL"}
 RESERVED_IDENTS = {"SELECT", "FROM", "WHERE", "AND", "OR"}
+AGG_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX", "UNIQUE"}
 
 
 class QueryError(Exception):
@@ -170,31 +172,86 @@ class Parser:
         if self.is_kw("WHERE"):
             self.advance()
             where = self.parse_or()
+        group = None
+        if self.is_word("GROUP"):
+            self.advance()
+            t = self.peek()
+            if not self.is_word("BY"):
+                fail("E_PARSE", "expected BY but found %s" % describe(t), t.pos)
+            self.advance()
+            group = []
+            while True:
+                pos = self.peek().pos
+                group.append((self.parse_field_ref(), pos))
+                if self.peek().kind == "COMMA":
+                    self.advance()
+                    continue
+                break
         t = self.peek()
         if t.kind != "EOF":
             fail("E_PARSE", "unexpected %s" % describe(t), t.pos)
-        return select, where
+        return select, where, group
+
+    def is_word(self, word):
+        t = self.peek()
+        return t.kind == "IDENT" and t.value.upper() == word
 
     def parse_select_list(self):
-        t = self.peek()
-        if t.kind == "STAR":
-            self.advance()
-            return None
-        fields = []
-        seen = set()
+        items = []
         while True:
-            pos = self.peek().pos
-            path = self.parse_field_ref()
-            key = ".".join(path)
-            if key in seen:
-                fail("E_DUPLICATE_FIELD", "duplicate field %r in select list" % key, pos)
-            seen.add(key)
-            fields.append(path)
+            items.append(self.parse_select_item())
             if self.peek().kind == "COMMA":
                 self.advance()
                 continue
             break
-        return fields
+        return items
+
+    def parse_select_item(self):
+        t = self.peek()
+        if t.kind == "STAR":
+            self.advance()
+            return {"kind": "star", "pos": t.pos}
+        nxt = self.toks[self.i + 1] if t.kind == "IDENT" else None
+        if nxt is not None and nxt.kind == "LPAREN":
+            item = self.parse_agg_call()
+        else:
+            path = self.parse_field_ref()
+            item = {"kind": "field", "path": path, "key": ".".join(path), "pos": t.pos}
+        item["alias"] = None
+        if self.is_word("AS"):
+            self.advance()
+            at = self.peek()
+            if at.kind != "IDENT":
+                fail("E_PARSE", "expected alias identifier but found %s" % describe(at), at.pos)
+            self.advance()
+            item["alias"] = at.value
+            item["key"] = at.value
+        return item
+
+    def parse_agg_call(self):
+        t = self.advance()
+        name = t.value.upper()
+        if name == "AVERAGE":
+            name = "AVG"
+        if name not in AGG_FUNCS:
+            fail("E_PARSE", "unknown function %r" % t.value, t.pos)
+        self.advance()  # LPAREN
+        a = self.peek()
+        if a.kind == "STAR":
+            if name != "COUNT":
+                fail("E_PARSE", "'*' is only allowed in COUNT(*)", a.pos)
+            self.advance()
+            path = None
+            arg = "*"
+        else:
+            path = self.parse_field_ref()
+            arg = ".".join(path)
+        r = self.peek()
+        if r.kind != "RPAREN":
+            fail("E_PARSE", "expected ')' but found %s" % describe(r), r.pos)
+        self.advance()
+        return {"kind": "agg", "func": name, "path": path,
+                "key": "%s(%s)" % (name, arg), "pos": t.pos}
 
     def parse_ident(self, first):
         t = self.peek()
@@ -366,17 +423,240 @@ def load_records(path):
     return records
 
 
-def run(log_file, query):
-    select, where = Parser(query).parse_query()
-    records = load_records(log_file)
-    out = []
+# ---------------------------------------------------------------- semantics
+
+def validate(select, group):
+    """Check selection rules; returns True when the query is an aggregation."""
+    stars = [it for it in select if it["kind"] == "star"]
+    aggs = [it for it in select if it["kind"] == "agg"]
+    if stars:
+        if aggs:
+            fail("E_SEMANTIC", "SELECT * cannot be combined with aggregate functions", stars[0]["pos"])
+        if group is not None:
+            fail("E_SEMANTIC", "SELECT * cannot be used with GROUP BY", stars[0]["pos"])
+        if len(select) > 1:
+            other = [it for it in select if it["kind"] != "star"]
+            pos = (other or stars[1:])[0]["pos"]
+            fail("E_PARSE", "'*' cannot be combined with other select items", pos)
+        return False
+    # output key uniqueness
+    seen = {}
+    for it in select:
+        k = it["key"]
+        if k in seen:
+            prev = seen[k]
+            if (not aggs and group is None and it["alias"] is None
+                    and prev["alias"] is None):
+                fail("E_DUPLICATE_FIELD", "duplicate field %r in select list" % k, it["pos"])
+            fail("E_SEMANTIC", "duplicate output key %r in select list" % k, it["pos"])
+        seen[k] = it
+    if group is not None:
+        gseen = set()
+        for path, pos in group:
+            key = tuple(path)
+            if key in gseen:
+                fail("E_SEMANTIC", "duplicate field %r in GROUP BY" % ".".join(path), pos)
+            gseen.add(key)
+        for it in select:
+            if it["kind"] == "field" and tuple(it["path"]) not in gseen:
+                fail("E_SEMANTIC", "field %r must appear in GROUP BY or be used in an aggregate"
+                     % ".".join(it["path"]), it["pos"])
+        return True
+    if aggs:
+        for it in select:
+            if it["kind"] == "field":
+                fail("E_SEMANTIC", "field %r must appear in GROUP BY or be used in an aggregate"
+                     % ".".join(it["path"]), it["pos"])
+        return True
+    return False
+
+
+# ---------------------------------------------------------------- aggregation
+
+MISSING = object()
+
+
+def resolve_present(record, path):
+    cur = record
+    for part in path:
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return MISSING
+    return cur
+
+
+def is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def group_key(v):
+    if v is None:
+        return ("null", None)
+    if isinstance(v, bool):
+        return ("bool", v)
+    if is_number(v):
+        return ("number", v)
+    if isinstance(v, str):
+        return ("string", v)
+    return ("null", None)
+
+
+def deep_key(v):
+    if v is None:
+        return ("null",)
+    if isinstance(v, bool):
+        return ("bool", v)
+    if is_number(v):
+        return ("number", v)
+    if isinstance(v, str):
+        return ("string", v)
+    if isinstance(v, list):
+        return ("array", tuple(deep_key(x) for x in v))
+    if isinstance(v, dict):
+        return ("object", frozenset((k, deep_key(x)) for k, x in v.items()))
+    return ("other", repr(v))
+
+
+def tidy_number(x):
+    if isinstance(x, float) and math.isfinite(x) and x.is_integer() and abs(x) < 2 ** 53:
+        return int(x)
+    return x
+
+
+class Agg:
+    __slots__ = ("func", "path", "count", "ints", "floats", "nums", "best_num",
+                 "best_str", "seen", "uniq")
+
+    def __init__(self, func, path):
+        self.func = func
+        self.path = path
+        self.count = 0
+        self.ints = 0
+        self.floats = []
+        self.nums = 0
+        self.best_num = MISSING
+        self.best_str = MISSING
+        self.seen = set()
+        self.uniq = []
+
+    def add(self, rec):
+        f = self.func
+        if f == "COUNT":
+            if self.path is None:
+                self.count += 1
+            else:
+                v = resolve_present(rec, self.path)
+                if v is not MISSING and v is not None:
+                    self.count += 1
+            return
+        v = resolve_present(rec, self.path)
+        if f == "SUM" or f == "AVG":
+            if is_number(v):
+                self.nums += 1
+                if isinstance(v, int):
+                    self.ints += v
+                else:
+                    self.floats.append(v)
+        elif f == "MIN" or f == "MAX":
+            if is_number(v):
+                b = self.best_num
+                if b is MISSING or (v < b if f == "MIN" else v > b):
+                    self.best_num = v
+            elif isinstance(v, str) and self.best_num is MISSING:
+                b = self.best_str
+                if b is MISSING or (v < b if f == "MIN" else v > b):
+                    self.best_str = v
+        else:  # UNIQUE
+            if v is MISSING:
+                v = None
+            k = deep_key(v)
+            if k not in self.seen:
+                self.seen.add(k)
+                self.uniq.append(v)
+
+    def result(self):
+        f = self.func
+        if f == "COUNT":
+            return self.count
+        if f == "SUM" or f == "AVG":
+            if self.nums == 0:
+                return None
+            if self.floats:
+                total = math.fsum(self.floats + [float(self.ints)]) if abs(self.ints) < 2 ** 53 \
+                    else math.fsum(self.floats) + self.ints
+                if f == "AVG":
+                    return tidy_number(total / self.nums)
+                return tidy_number(total)
+            if f == "AVG":
+                return tidy_number(self.ints / self.nums)
+            return self.ints
+        if f == "MIN" or f == "MAX":
+            if self.best_num is not MISSING:
+                return self.best_num
+            if self.best_str is not MISSING:
+                return self.best_str
+            return None
+        return self.uniq
+
+
+def aggregate(records, where, select, group):
+    group_paths = [p for p, _ in group] if group is not None else []
+    agg_items = [it for it in select if it["kind"] == "agg"]
+    groups = {}
+    order = []
     for rec in records:
         if where is not None and not evaluate(where, rec):
             continue
-        if select is None:
+        gk_vals = []
+        gk = []
+        for p in group_paths:
+            v = resolve(rec, p)
+            k = group_key(v)
+            gk.append(k)
+            gk_vals.append(v if k[0] != "null" else None)
+        gk = tuple(gk)
+        state = groups.get(gk)
+        if state is None:
+            state = (gk_vals, [Agg(it["func"], it["path"]) for it in agg_items])
+            groups[gk] = state
+            order.append(gk)
+        for a in state[1]:
+            a.add(rec)
+    if group is None and not order:
+        order.append(())
+        groups[()] = ([], [Agg(it["func"], it["path"]) for it in agg_items])
+    index = {tuple(p): i for i, p in enumerate(group_paths)}
+    out = []
+    for gk in order:
+        vals, aggs = groups[gk]
+        row = {}
+        ai = 0
+        for it in select:
+            if it["kind"] == "agg":
+                row[it["key"]] = aggs[ai].result()
+                ai += 1
+            else:
+                row[it["key"]] = vals[index[tuple(it["path"])]]
+        out.append(row)
+    return out
+
+
+def run(log_file, query):
+    select, where, group = Parser(query).parse_query()
+    is_agg = validate(select, group)
+    records = load_records(log_file)
+    if is_agg:
+        return aggregate(records, where, select, group)
+    out = []
+    star = select[0]["kind"] == "star"
+    for rec in records:
+        if where is not None and not evaluate(where, rec):
+            continue
+        if star:
             out.append(rec)
         else:
-            out.append({".".join(p): resolve(rec, p) for p in select})
+            out.append({it["key"]: resolve(rec, it["path"]) for it in select})
     return out
 
 
