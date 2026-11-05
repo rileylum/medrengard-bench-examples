@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LogQL Parts 1-2: query NDJSON logs with a tiny SQL-like language (with GROUP BY / aggregates)."""
+"""LogQL Parts 1-3: query NDJSON logs with a tiny SQL-like language (GROUP BY, aggregates, CONFLATE joins)."""
 import json
 import math
 import re
@@ -161,15 +161,22 @@ class Parser:
         select = self.parse_select_list()
         self.expect_kw("FROM")
         t = self.peek()
-        if t.kind == "IDENT" and t.value == "logs":
+        if t.kind == "IDENT":
             self.advance()
-        elif t.kind == "IDENT" or t.kind == "KW":
-            fail("E_UNKNOWN_TABLE", "unknown table %r; only 'logs' is supported"
-                 % (t.value if t.kind == "IDENT" else t.value), t.pos)
+            source = (t.value, t.pos)
+        elif t.kind == "KW":
+            fail("E_UNKNOWN_TABLE", "unknown table %r" % t.value, t.pos)
         else:
-            fail("E_PARSE", "expected table name 'logs' but found %s" % describe(t), t.pos)
+            fail("E_PARSE", "expected table name but found %s" % describe(t), t.pos)
         where = None
         if self.is_kw("WHERE"):
+            self.advance()
+            where = self.parse_or()
+        conflates = []
+        while self.is_word("CONFLATE"):
+            conflates.append(self.parse_conflate())
+        if where is None and conflates and self.is_kw("WHERE"):
+            # lenient: also accept WHERE after the CONFLATE clauses
             self.advance()
             where = self.parse_or()
         group = None
@@ -190,7 +197,51 @@ class Parser:
         t = self.peek()
         if t.kind != "EOF":
             fail("E_PARSE", "unexpected %s" % describe(t), t.pos)
-        return select, where, group
+        return {"select": select, "source": source, "where": where,
+                "conflates": conflates, "group": group}
+
+    def parse_conflate(self):
+        start = self.advance().pos  # CONFLATE
+        flavor = "INNER"
+        if self.is_word("INTERSECTING"):
+            self.advance()
+        elif self.is_word("PRESERVING"):
+            self.advance()
+            t = self.peek()
+            if self.is_word("LEFT"):
+                flavor = "LEFT"
+            elif self.is_word("RIGHT"):
+                flavor = "RIGHT"
+            elif self.is_word("BOTH"):
+                flavor = "BOTH"
+            else:
+                fail("E_PARSE", "expected LEFT, RIGHT or BOTH but found %s" % describe(t), t.pos)
+            self.advance()
+        t = self.peek()
+        if t.kind != "IDENT":
+            fail("E_PARSE", "expected source alias but found %s" % describe(t), t.pos)
+        self.advance()
+        alias = (t.value, t.pos)
+        t = self.peek()
+        if not self.is_word("UPON"):
+            fail("E_PARSE", "expected UPON but found %s" % describe(t), t.pos)
+        self.advance()
+        conj = []
+        while True:
+            lpos = self.peek().pos
+            left = self.parse_field_ref()
+            op = self.peek()
+            if not (op.kind == "OP" and op.value == "="):
+                fail("E_PARSE", "expected '=' in UPON predicate but found %s" % describe(op), op.pos)
+            self.advance()
+            rpos = self.peek().pos
+            right = self.parse_field_ref()
+            conj.append(((left, lpos), (right, rpos)))
+            if self.is_kw("AND"):
+                self.advance()
+                continue
+            break
+        return {"flavor": flavor, "alias": alias, "on": conj, "pos": start}
 
     def is_word(self, word):
         t = self.peek()
@@ -212,6 +263,11 @@ class Parser:
             self.advance()
             return {"kind": "star", "pos": t.pos}
         nxt = self.toks[self.i + 1] if t.kind == "IDENT" else None
+        if (nxt is not None and nxt.kind == "DOT"
+                and self.toks[self.i + 2].kind == "STAR"):
+            self.i += 3
+            return {"kind": "astar", "source": t.value, "pos": t.pos,
+                    "key": t.value + ".*", "alias": None}
         if nxt is not None and nxt.kind == "LPAREN":
             item = self.parse_agg_call()
         else:
@@ -243,15 +299,17 @@ class Parser:
             self.advance()
             path = None
             arg = "*"
+            argpos = a.pos
         else:
             path = self.parse_field_ref()
             arg = ".".join(path)
+        argpos = a.pos
         r = self.peek()
         if r.kind != "RPAREN":
             fail("E_PARSE", "expected ')' but found %s" % describe(r), r.pos)
         self.advance()
         return {"kind": "agg", "func": name, "path": path,
-                "key": "%s(%s)" % (name, arg), "pos": t.pos}
+                "key": "%s(%s)" % (name, arg), "pos": t.pos, "argpos": argpos}
 
     def parse_ident(self, first):
         t = self.peek()
@@ -296,6 +354,7 @@ class Parser:
         return self.parse_predicate()
 
     def parse_predicate(self):
+        ppos = self.peek().pos
         path = self.parse_field_ref()
         t = self.peek()
         if t.kind != "OP":
@@ -316,7 +375,7 @@ class Parser:
         else:
             fail("E_PARSE", "expected literal but found %s" % describe(lt), lt.pos)
         self.advance()
-        return ("CMP", path, op, lit)
+        return ("CMP", path, op, lit, ppos)
 
 
 # ---------------------------------------------------------------- evaluation
@@ -381,8 +440,23 @@ def evaluate(expr, record):
         return evaluate(expr[1], record) and evaluate(expr[2], record)
     if kind == "OR":
         return evaluate(expr[1], record) or evaluate(expr[2], record)
-    _, path, op, lit = expr
-    return compare(resolve(record, path), op, lit)
+    _, ref, op, lit = expr
+    return compare(resolve_ref(record, ref), op, lit)
+
+
+def resolve_ref(row, ref):
+    """row maps alias -> record (or None when null-padded by an outer conflation)."""
+    rec = row.get(ref[0])
+    if rec is None:
+        return None
+    return resolve(rec, ref[1])
+
+
+def resolve_ref_present(row, ref):
+    rec = row.get(ref[0])
+    if rec is None:
+        return MISSING
+    return resolve_present(rec, ref[1])
 
 
 # ---------------------------------------------------------------- I/O
@@ -425,40 +499,112 @@ def load_records(path):
 
 # ---------------------------------------------------------------- semantics
 
-def validate(select, group):
+def bind_query(q):
+    """Resolve every field reference to (alias, subpath). Returns analysis info."""
+    from_alias, from_pos = q["source"]
+    conflates = q["conflates"]
+    multi = bool(conflates)
+    aliases = [from_alias]
+    for c in conflates:
+        name, pos = c["alias"]
+        if name in aliases:
+            fail("E_SEMANTIC", "source alias %r used more than once" % name, pos)
+        aliases.append(name)
+
+    def bind(path, pos, scope=None):
+        scope = aliases if scope is None else scope
+        if not multi:
+            if len(path) >= 2 and path[0] == from_alias:
+                return (from_alias, tuple(path[1:]))
+            return (from_alias, tuple(path))
+        if len(path) < 2:
+            fail("E_SEMANTIC", "field reference %r must be qualified with a source alias"
+                 % ".".join(path), pos)
+        if path[0] not in aliases:
+            fail("E_SEMANTIC", "unknown source alias %r in field reference %r"
+                 % (path[0], ".".join(path)), pos)
+        if path[0] not in scope:
+            fail("E_SEMANTIC", "source alias %r is not in scope here" % path[0], pos)
+        return (path[0], tuple(path[1:]))
+
+    def bind_expr(e):
+        if e[0] in ("AND", "OR"):
+            return (e[0], bind_expr(e[1]), bind_expr(e[2]))
+        _, path, op, lit, pos = e
+        return ("CMP", bind(path, pos), op, lit)
+
+    select = q["select"]
+    for it in select:
+        if it["kind"] == "field":
+            it["ref"] = bind(it["path"], it["pos"])
+        elif it["kind"] == "agg":
+            it["ref"] = bind(it["path"], it["argpos"]) if it["path"] is not None else None
+        elif it["kind"] == "astar":
+            if it["source"] not in aliases:
+                fail("E_SEMANTIC", "unknown source alias %r in %s.*"
+                     % (it["source"], it["source"]), it["pos"])
+        elif it["kind"] == "star" and multi:
+            fail("E_SEMANTIC", "SELECT * is not allowed with CONFLATE; use alias.*", it["pos"])
+    q["where_b"] = bind_expr(q["where"]) if q["where"] is not None else None
+    if q["group"] is not None:
+        q["group_b"] = [(bind(p, pos), p, pos) for p, pos in q["group"]]
+    else:
+        q["group_b"] = None
+    scope = [from_alias]
+    for c in conflates:
+        name = c["alias"][0]
+        scope = scope + [name]
+        on = []
+        for (lp, lpos), (rp, rpos) in c["on"]:
+            l = bind(lp, lpos, scope)
+            r = bind(rp, rpos, scope)
+            if l[0] == r[0]:
+                fail("E_SEMANTIC", "UPON predicate must compare two different aliases", lpos)
+            on.append((l, r))
+        c["on_b"] = on
+    q["aliases"] = aliases
+    q["multi"] = multi
+
+
+def validate(q):
     """Check selection rules; returns True when the query is an aggregation."""
-    stars = [it for it in select if it["kind"] == "star"]
+    select = q["select"]
+    group = q["group_b"]
+    multi = q["multi"]
+    stars = [it for it in select if it["kind"] in ("star", "astar")]
     aggs = [it for it in select if it["kind"] == "agg"]
     if stars:
         if aggs:
-            fail("E_SEMANTIC", "SELECT * cannot be combined with aggregate functions", stars[0]["pos"])
+            fail("E_SEMANTIC", "* cannot be combined with aggregate functions", stars[0]["pos"])
         if group is not None:
-            fail("E_SEMANTIC", "SELECT * cannot be used with GROUP BY", stars[0]["pos"])
-        if len(select) > 1:
-            other = [it for it in select if it["kind"] != "star"]
-            pos = (other or stars[1:])[0]["pos"]
-            fail("E_PARSE", "'*' cannot be combined with other select items", pos)
-        return False
-    # output key uniqueness
+            fail("E_SEMANTIC", "* cannot be used with GROUP BY", stars[0]["pos"])
+        bare = [it for it in select if it["kind"] == "star"]
+        if bare and len(select) > 1:
+            other = [it for it in select if it is not bare[0]]
+            fail("E_PARSE", "'*' cannot be combined with other select items", other[0]["pos"])
+    # output key uniqueness (static part)
     seen = {}
     for it in select:
+        if it["kind"] == "star":
+            continue
         k = it["key"]
         if k in seen:
             prev = seen[k]
-            if (not aggs and group is None and it["alias"] is None
-                    and prev["alias"] is None):
+            if it["kind"] == "astar":
+                fail("E_SEMANTIC", "duplicate expansion %r in select list" % k, it["pos"])
+            if (not multi and not aggs and group is None and it["alias"] is None
+                    and prev["alias"] is None and prev["kind"] == "field"):
                 fail("E_DUPLICATE_FIELD", "duplicate field %r in select list" % k, it["pos"])
-            fail("E_SEMANTIC", "duplicate output key %r in select list" % k, it["pos"])
+            fail("E_SEMANTIC", "duplicate output key %r" % k, it["pos"])
         seen[k] = it
     if group is not None:
         gseen = set()
-        for path, pos in group:
-            key = tuple(path)
-            if key in gseen:
+        for ref, path, pos in group:
+            if ref in gseen:
                 fail("E_SEMANTIC", "duplicate field %r in GROUP BY" % ".".join(path), pos)
-            gseen.add(key)
+            gseen.add(ref)
         for it in select:
-            if it["kind"] == "field" and tuple(it["path"]) not in gseen:
+            if it["kind"] == "field" and it["ref"] not in gseen:
                 fail("E_SEMANTIC", "field %r must appear in GROUP BY or be used in an aggregate"
                      % ".".join(it["path"]), it["pos"])
         return True
@@ -528,9 +674,9 @@ class Agg:
     __slots__ = ("func", "path", "count", "ints", "floats", "nums", "best_num",
                  "best_str", "seen", "uniq")
 
-    def __init__(self, func, path):
+    def __init__(self, func, ref):
         self.func = func
-        self.path = path
+        self.path = ref
         self.count = 0
         self.ints = 0
         self.floats = []
@@ -546,11 +692,11 @@ class Agg:
             if self.path is None:
                 self.count += 1
             else:
-                v = resolve_present(rec, self.path)
+                v = resolve_ref_present(rec, self.path)
                 if v is not MISSING and v is not None:
                     self.count += 1
             return
-        v = resolve_present(rec, self.path)
+        v = resolve_ref_present(rec, self.path)
         if f == "SUM" or f == "AVG":
             if is_number(v):
                 self.nums += 1
@@ -600,33 +746,31 @@ class Agg:
         return self.uniq
 
 
-def aggregate(records, where, select, group):
-    group_paths = [p for p, _ in group] if group is not None else []
+def aggregate(rows, select, group):
+    group_refs = [ref for ref, _, _ in group] if group is not None else []
     agg_items = [it for it in select if it["kind"] == "agg"]
     groups = {}
     order = []
-    for rec in records:
-        if where is not None and not evaluate(where, rec):
-            continue
+    for row in rows:
         gk_vals = []
         gk = []
-        for p in group_paths:
-            v = resolve(rec, p)
+        for ref in group_refs:
+            v = resolve_ref(row, ref)
             k = group_key(v)
             gk.append(k)
             gk_vals.append(v if k[0] != "null" else None)
         gk = tuple(gk)
         state = groups.get(gk)
         if state is None:
-            state = (gk_vals, [Agg(it["func"], it["path"]) for it in agg_items])
+            state = (gk_vals, [Agg(it["func"], it["ref"]) for it in agg_items])
             groups[gk] = state
             order.append(gk)
         for a in state[1]:
-            a.add(rec)
+            a.add(row)
     if group is None and not order:
         order.append(())
-        groups[()] = ([], [Agg(it["func"], it["path"]) for it in agg_items])
-    index = {tuple(p): i for i, p in enumerate(group_paths)}
+        groups[()] = ([], [Agg(it["func"], it["ref"]) for it in agg_items])
+    index = {ref: i for i, ref in enumerate(group_refs)}
     out = []
     for gk in order:
         vals, aggs = groups[gk]
@@ -637,27 +781,156 @@ def aggregate(records, where, select, group):
                 row[it["key"]] = aggs[ai].result()
                 ai += 1
             else:
-                row[it["key"]] = vals[index[tuple(it["path"])]]
+                row[it["key"]] = vals[index[it["ref"]]]
         out.append(row)
     return out
 
 
-def run(log_file, query):
-    select, where, group = Parser(query).parse_query()
-    is_agg = validate(select, group)
-    records = load_records(log_file)
-    if is_agg:
-        return aggregate(records, where, select, group)
-    out = []
-    star = select[0]["kind"] == "star"
-    for rec in records:
-        if where is not None and not evaluate(where, rec):
-            continue
-        if star:
-            out.append(rec)
+# ---------------------------------------------------------------- conflation
+
+def conflate(left_rows, left_aliases, right_alias, right_records, on, flavor):
+    # Conjuncts with exactly one side on the new alias are hash-joinable;
+    # anything else is checked per candidate pair.
+    hash_l, hash_r, extra = [], [], []
+    for l, r in on:
+        if r[0] == right_alias and l[0] != right_alias:
+            hash_l.append(l)
+            hash_r.append(r)
+        elif l[0] == right_alias and r[0] != right_alias:
+            hash_l.append(r)
+            hash_r.append(l)
         else:
-            out.append({it["key"]: resolve(rec, it["path"]) for it in select})
+            extra.append((l, r))
+
+    index = {}
+    for j, rec in enumerate(right_records):
+        k = tuple(deep_key(resolve(rec, ref[1])) for ref in hash_r)
+        index.setdefault(k, []).append(j)
+
+    all_right = list(range(len(right_records)))
+    matches = []
+    for row in left_rows:
+        if hash_l:
+            k = tuple(deep_key(resolve_ref(row, ref)) for ref in hash_l)
+            cand = index.get(k, [])
+        else:
+            cand = all_right
+        if extra:
+            ok = []
+            for j in cand:
+                combined = dict(row)
+                combined[right_alias] = right_records[j]
+                if all(deep_key(resolve_ref(combined, a)) == deep_key(resolve_ref(combined, b))
+                       for a, b in extra):
+                    ok.append(j)
+            cand = ok
+        matches.append(cand)
+
+    def pair(i, j):
+        row = dict(left_rows[i])
+        row[right_alias] = right_records[j]
+        return row
+
+    def left_only(i):
+        row = dict(left_rows[i])
+        row[right_alias] = None
+        return row
+
+    def right_only(j):
+        row = {a: None for a in left_aliases}
+        row[right_alias] = right_records[j]
+        return row
+
+    out = []
+    if flavor == "INNER":
+        for i, ms in enumerate(matches):
+            out.extend(pair(i, j) for j in ms)
+    elif flavor == "LEFT":
+        for i, ms in enumerate(matches):
+            if ms:
+                out.extend(pair(i, j) for j in ms)
+            else:
+                out.append(left_only(i))
+    elif flavor == "RIGHT":
+        matched_r = set()
+        for i, ms in enumerate(matches):
+            for j in ms:
+                out.append(pair(i, j))
+                matched_r.add(j)
+        out.extend(right_only(j) for j in all_right if j not in matched_r)
+    else:  # BOTH
+        rev = [[] for _ in right_records]
+        for i, ms in enumerate(matches):
+            for j in ms:
+                rev[j].append(i)
+        for j, lefts in enumerate(rev):
+            out.extend(pair(i, j) for i in lefts)
+        out.extend(left_only(i) for i, ms in enumerate(matches) if not ms)
+        out.extend(right_only(j) for j in all_right if not rev[j])
     return out
+
+
+def top_level_keys(records):
+    keys = {}
+    for rec in records:
+        for k in rec:
+            if k not in keys:
+                keys[k] = True
+    return list(keys)
+
+
+def run(sources, query):
+    q = Parser(query).parse_query()
+    from_alias, from_pos = q["source"]
+    if from_alias not in sources:
+        fail("E_UNKNOWN_TABLE", "unknown table %r; no source bound to that alias" % from_alias,
+             from_pos)
+    for c in q["conflates"]:
+        name, pos = c["alias"]
+        if name not in sources:
+            fail("E_UNKNOWN_TABLE", "unknown table %r; no source bound to that alias" % name, pos)
+    bind_query(q)
+    is_agg = validate(q)
+    select = q["select"]
+
+    data = {}
+    for a in q["aliases"]:
+        data[a] = load_records(sources[a])
+
+    rows = [{from_alias: rec} for rec in data[from_alias]]
+    bound = [from_alias]
+    for c in q["conflates"]:
+        name = c["alias"][0]
+        rows = conflate(rows, bound, name, data[name], c["on_b"], c["flavor"])
+        bound.append(name)
+
+    where = q["where_b"]
+    if where is not None:
+        rows = [r for r in rows if evaluate(where, r)]
+
+    if is_agg:
+        return aggregate(rows, select, q["group_b"])
+
+    if select[0]["kind"] == "star":
+        return [r[from_alias] for r in rows]
+
+    # Build output column plan (alias.* expanded to the source's top-level keys).
+    plan = []
+    seen = set()
+    for it in select:
+        if it["kind"] == "astar":
+            for k in top_level_keys(data[it["source"]]):
+                key = "%s.%s" % (it["source"], k)
+                if key in seen:
+                    fail("E_SEMANTIC", "duplicate output key %r" % key, it["pos"])
+                seen.add(key)
+                plan.append((key, (it["source"], (k,))))
+        else:
+            if it["key"] in seen:
+                fail("E_SEMANTIC", "duplicate output key %r" % it["key"], it["pos"])
+            seen.add(it["key"])
+            plan.append((it["key"], it["ref"]))
+    return [{key: resolve_ref(r, ref) for key, ref in plan} for r in rows]
 
 
 def emit_error(code, message, position=None):
@@ -670,7 +943,16 @@ def emit_error(code, message, position=None):
 
 def parse_args(argv):
     opts = {}
-    allowed = {"--log-file": "log_file", "--query": "query", "--output": "output"}
+    sources = {}
+    allowed = {"--log-file": "log_file", "--query": "query", "--output": "output",
+               "--source": "source"}
+
+    def bind_source(alias, path, flag):
+        if alias in sources and sources[alias] != path:
+            fail("E_SEMANTIC", "alias %r bound to conflicting paths %r and %r"
+                 % (alias, sources[alias], path))
+        sources[alias] = path
+
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -687,12 +969,28 @@ def parse_args(argv):
         else:
             i += 1
         key = allowed[name]
+        if key == "source":
+            if "=" not in val:
+                fail("E_ARGS", "--source expects <alias>=<path>, got %r" % val)
+            alias, path = val.split("=", 1)
+            if not IDENT_RE.fullmatch(alias):
+                fail("E_ARGS", "invalid source alias %r" % alias)
+            if path == "":
+                fail("E_ARGS", "missing path for source alias %r" % alias)
+            bind_source(alias, path, name)
+            continue
         if key in opts:
             fail("E_ARGS", "argument %s given more than once" % name)
+        if key == "log_file":
+            if val == "":
+                fail("E_ARGS", "missing path for --log-file")
+            bind_source("logs", val, name)
         opts[key] = val
-    for req in ("--log-file", "--query"):
-        if allowed[req] not in opts:
-            fail("E_ARGS", "missing required argument %s" % req)
+    if "query" not in opts:
+        fail("E_ARGS", "missing required argument --query")
+    if not sources:
+        fail("E_ARGS", "missing required argument --log-file or --source")
+    opts["sources"] = sources
     return opts
 
 
@@ -700,7 +998,7 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
         opts = parse_args(argv)
-        result = run(opts["log_file"], opts["query"])
+        result = run(opts["sources"], opts["query"])
         payload = json.dumps(result, ensure_ascii=False)
         if opts.get("output") is not None:
             try:
