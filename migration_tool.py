@@ -91,8 +91,8 @@ def validate_column(col, ctx):
             )
 
 
-def validate_operation(op, index):
-    ctx = f"operation {index}"
+def validate_operation(op, index, label="operation"):
+    ctx = f"{label} {index}"
     if not isinstance(op, dict):
         raise schema_error(f"{ctx}: operation must be an object")
     if "type" not in op:
@@ -100,7 +100,7 @@ def validate_operation(op, index):
     otype = op["type"]
     if not isinstance(otype, str) or otype not in OPERATION_TYPES:
         raise schema_error(f"{ctx}: unknown operation type {json.dumps(otype)}")
-    ctx = f"operation {index} ({otype})"
+    ctx = f"{label} {index} ({otype})"
     if otype not in TABLELESS_OPERATIONS:
         if "table" not in op:
             raise schema_error(f"{ctx}: missing required field 'table'")
@@ -291,6 +291,12 @@ def validate_migration(mig):
         raise schema_error("field 'operations' must be an array")
     for i, op in enumerate(mig["operations"]):
         validate_operation(op, i)
+    if mig.get("rollback_operations") is not None:
+        rops = mig["rollback_operations"]
+        if not isinstance(rops, list):
+            raise schema_error("field 'rollback_operations' must be an array")
+        for i, op in enumerate(rops):
+            validate_operation(op, i, "rollback operation")
 
 
 # --------------------------------------------------------------------------
@@ -517,9 +523,25 @@ def _unused_name(conn, base):
     return name
 
 
-def rebuild_table(conn, table, new_defs, suffix, copy_cols, keep_extra=None):
+def has_rowid_alias(conn, table):
+    """True if the table has an INTEGER PRIMARY KEY column (alias of rowid)."""
+    pk = [r for r in table_info(conn, table) if r[5]]
+    return len(pk) == 1 and (pk[0][2] or "").upper() == "INTEGER"
+
+
+def rebuild_table(conn, table, new_defs, suffix, copy_cols, keep_extra=None,
+                  extra_cols=None, from_sql=None):
     """Recreate `table` with new column/constraint definitions, preserving data,
-    indexes and triggers (those for which keep_extra(sql) is true)."""
+    indexes and triggers (those for which keep_extra(sql) is true).
+
+    The source table is aliased as "_src" in the copy query. `extra_cols` is a
+    list of (column, select expression) pairs for additional target columns;
+    `from_sql` optionally replaces the FROM clause of the copy query."""
+    extra_cols = extra_cols or []
+    preserve_rowid = (
+        not has_rowid_alias(conn, table)
+        and "WITHOUT ROWID" not in " ".join(suffix.upper().split())
+    )
     extras = conn.execute(
         "SELECT type, sql FROM sqlite_master "
         "WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL "
@@ -534,12 +556,23 @@ def rebuild_table(conn, table, new_defs, suffix, copy_cols, keep_extra=None):
         seq = r[0] if r else None
 
     tmp = _unused_name(conn, f"_{table}_new")
-    col_list = ", ".join(quote_ident(c) for c in copy_cols)
+    target = [quote_ident(c) for c in copy_cols]
+    source = [f"_src.{quote_ident(c)}" for c in copy_cols]
+    for c, expr in extra_cols:
+        target.append(quote_ident(c))
+        source.append(expr)
     conn.execute(f"CREATE TABLE {quote_ident(tmp)} ({', '.join(new_defs)}){suffix}")
+    if preserve_rowid and has_rowid_alias(conn, tmp):
+        preserve_rowid = False
+    if preserve_rowid:
+        target.insert(0, "rowid")
+        source.insert(0, "_src.rowid")
+    if from_sql is None:
+        from_sql = f"{quote_ident(table)} AS _src"
     try:
         conn.execute(
-            f"INSERT INTO {quote_ident(tmp)} ({col_list}) "
-            f"SELECT {col_list} FROM {quote_ident(table)}"
+            f"INSERT INTO {quote_ident(tmp)} ({', '.join(target)}) "
+            f"SELECT {', '.join(source)} FROM {from_sql}"
         )
     except sqlite3.IntegrityError as e:
         raise integrity_error(e, table)
@@ -1108,6 +1141,519 @@ OPERATIONS = {
 
 
 # --------------------------------------------------------------------------
+# Rollback support: capturing metadata and reversing operations
+# --------------------------------------------------------------------------
+
+IRREVERSIBLE_OPERATIONS = ("transform_data", "backfill_data")
+FK_VIOLATION_MSG = "cannot rollback: foreign key constraint violation"
+
+
+class RollbackError(MigrationError):
+    """Rollback error carrying its final message."""
+
+
+def rollback_failed(msg):
+    return RollbackError(f"rollback failed: {msg}")
+
+
+def _guard(fn):
+    """Run a rollback step, normalizing errors to rollback error messages."""
+    try:
+        return fn()
+    except RollbackError:
+        raise
+    except MigrationError as e:
+        msg = str(e)
+        if msg.startswith("invalid operation: "):
+            msg = msg[len("invalid operation: "):]
+        low = msg.lower()
+        if ("foreign key violation" in low or "foreign key constraint" in low
+                or "referenced by a foreign key" in low):
+            raise RollbackError(FK_VIOLATION_MSG)
+        raise rollback_failed(msg)
+    except sqlite3.IntegrityError as e:
+        if "FOREIGN KEY" in str(e).upper():
+            raise RollbackError(FK_VIOLATION_MSG)
+        raise rollback_failed(str(e))
+    except sqlite3.Error as e:
+        raise rollback_failed(f"SQL error: {e}")
+
+
+def rollback_event(op, version, explicit=False):
+    """operation_rolled_back event for a stored (or explicit rollback) operation."""
+    event = operation_event("operation_rolled_back", op, version)
+    if op["type"] == "migrate_column_data":
+        if explicit:
+            event["from_column"] = op["from_column"]
+            event["to_column"] = op["to_column"]
+        else:
+            # Automatic rollback copies the data back the other way.
+            event["from_column"] = op["to_column"]
+            event["to_column"] = op["from_column"]
+    elif op["type"] == "backfill_data":
+        event["column"] = op["column"]
+    event["version"] = event.pop("version")
+    return event
+
+
+def _encode_value(v):
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return {"$blob": bytes(v).hex()}
+    return v
+
+
+def _decode_value(v):
+    if isinstance(v, dict) and "$blob" in v:
+        return bytes.fromhex(v["$blob"])
+    return v
+
+
+def _real_table(conn, table):
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?)",
+        (table,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _table_suffix_without_rowid(suffix):
+    return "WITHOUT ROWID" in " ".join((suffix or "").upper().split())
+
+
+def _local_part(definition):
+    m = re.search(r"\bREFERENCES\b", _strip_literals(definition), re.IGNORECASE)
+    return definition[:m.start()] if m else definition
+
+
+def _parse_fk_clause(sql):
+    """Best-effort parse of 'CONSTRAINT n FOREIGN KEY (...) REFERENCES t (...) ...'."""
+    out = {}
+    stripped = _strip_literals(sql)
+    m = re.search(r"\bFOREIGN\s+KEY\s*\(([^)]*)\)", sql, re.IGNORECASE)
+    if m:
+        out["columns"] = [_unquote(c) for c in m.group(1).split(",")]
+    m = re.search(r"\bREFERENCES\s+(\"(?:[^\"]|\"\")*\"|[^\s(]+)\s*(?:\(([^)]*)\))?",
+                  sql, re.IGNORECASE)
+    if m:
+        ref = {"table": _unquote(m.group(1))}
+        if m.group(2):
+            ref["columns"] = [_unquote(c) for c in m.group(2).split(",")]
+        out["references"] = ref
+    for field, kw in (("on_delete", "DELETE"), ("on_update", "UPDATE")):
+        m = re.search(
+            r"\bON\s+" + kw + r"\s+(SET\s+NULL|SET\s+DEFAULT|NO\s+ACTION|CASCADE|RESTRICT)",
+            stripped, re.IGNORECASE,
+        )
+        if m:
+            out[field] = normalize_action(m.group(1))
+    return out
+
+
+def _unquote(token):
+    t = token.strip()
+    if len(t) >= 2 and t[0] in "\"`[" :
+        close = "]" if t[0] == "[" else t[0]
+        if t[-1] == close:
+            inner = t[1:-1]
+            return inner if t[0] == "[" else inner.replace(close * 2, close)
+    return t
+
+
+def _check_expression_of(definition):
+    """Return the expression inside 'CONSTRAINT n CHECK (expr)'."""
+    _tok, _q, rest = _next_token(definition)   # CONSTRAINT
+    _name, _q, rest = _next_token(rest)         # name
+    rest = rest.lstrip()
+    if rest[:5].upper() == "CHECK":
+        rest = rest[5:].strip()
+    if rest.startswith("("):
+        _p, defs, _s = split_create_table(rest)
+        return ", ".join(defs)
+    return rest
+
+
+def capture_rollback_info(conn, op):
+    """Return a copy of op enriched with what is needed to reverse it later.
+    Must be called before the operation is applied."""
+    info = dict(op)
+    try:
+        otype = op["type"]
+        if otype == "drop_column":
+            _capture_drop_column(conn, op, info)
+        elif otype in ("drop_foreign_key", "drop_check_constraint"):
+            table = _real_table(conn, op["table"])
+            if table:
+                defs, _suffix = table_defs(conn, table)
+                idx, kind = find_named_constraint(defs, op["name"])
+                if idx is not None:
+                    d = {"name": op["name"]}
+                    if otype == "drop_foreign_key":
+                        d.update(_parse_fk_clause(defs[idx]))
+                    else:
+                        d["expression"] = _check_expression_of(defs[idx])
+                    d["sql"] = defs[idx]
+                    d["position"] = idx
+                    info["original_definition"] = d
+        elif otype == "drop_index":
+            row = conn.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master "
+                "WHERE type = 'index' AND lower(name) = lower(?)",
+                (op["name"],),
+            ).fetchone()
+            if row is not None and row[2] is not None:
+                cols = [r[2] for r in conn.execute(
+                    f"PRAGMA index_info({quote_ident(row[0])})").fetchall()]
+                unique = bool(re.match(r"\s*CREATE\s+UNIQUE\b", row[2], re.IGNORECASE))
+                info["original_definition"] = {
+                    "name": row[0], "table": row[1], "columns": cols,
+                    "unique": unique, "sql": row[2],
+                }
+    except (sqlite3.Error, MigrationError):
+        # The operation itself will report the problem when applied.
+        pass
+    return info
+
+
+def _capture_drop_column(conn, op, info):
+    table = _real_table(conn, op["table"])
+    if not table:
+        return
+    column = op["column"]
+    rows = table_info(conn, table)
+    col = next((r for r in rows if r[1] == column), None)
+    if col is None:
+        return
+    defs, suffix = table_defs(conn, table)
+    position = None
+    dropped_constraints = []
+    for i, d in enumerate(defs):
+        if is_table_constraint(d):
+            if mentions_identifier(_local_part(d), column):
+                dropped_constraints.append([i, d])
+        elif position is None and leading_name(d)[0].lower() == column.lower():
+            position = i
+    col_sql = defs[position] if position is not None else None
+    info["original_definition"] = {
+        "name": col[1],
+        "type": col[2] or "",
+        "not_null": bool(col[3]),
+        "default": col[4],
+        "primary_key": bool(col[5]),
+        "unique": bool(col_sql and re.search(
+            r"\bUNIQUE\b", _strip_literals(col_sql), re.IGNORECASE)),
+    }
+    if col_sql is not None:
+        info["original_sql"] = col_sql
+        info["position"] = position
+    if dropped_constraints:
+        info["dropped_constraints"] = dropped_constraints
+    objs = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL "
+        "ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, rowid",
+        (table,),
+    ).fetchall()
+    dropped_objects = [r[0] for r in objs if mentions_identifier(r[0], column)]
+    if dropped_objects:
+        info["dropped_objects"] = dropped_objects
+    # Preserve the column's data, keyed by primary key (or rowid).
+    pk = sorted((r for r in rows if r[5]), key=lambda r: r[5])
+    if pk:
+        keys = [r[1] for r in pk]
+        key_sql = [quote_ident(k) for k in keys]
+    elif not _table_suffix_without_rowid(suffix):
+        keys = ["rowid"]
+        key_sql = ["rowid"]
+    else:
+        return
+    data = conn.execute(
+        f"SELECT {', '.join(key_sql)}, {quote_ident(column)} FROM {quote_ident(table)}"
+    ).fetchall()
+    info["original_data"] = {
+        "key_columns": keys,
+        "rows": [[_encode_value(v) for v in r] for r in data],
+    }
+
+
+def _placeholder_sql(declared):
+    cls = _type_class(declared)
+    if cls in ("INTEGER", "REAL", "NUMERIC"):
+        return "0"
+    if cls == "BLOB":
+        return "X''"
+    return "''"
+
+
+def _column_def_sql(d):
+    parts = [quote_ident(d["name"])]
+    if d.get("type"):
+        parts.append(str(d["type"]))
+    if d.get("primary_key"):
+        parts.append("PRIMARY KEY")
+    if d.get("not_null"):
+        parts.append("NOT NULL")
+    if d.get("unique"):
+        parts.append("UNIQUE")
+    if d.get("default") is not None:
+        parts.append("DEFAULT " + default_sql(d["default"]))
+    return " ".join(parts)
+
+
+def _require_real_table(conn, table):
+    real = _real_table(conn, table)
+    if real is None:
+        raise rollback_failed(f"table '{table}' does not exist")
+    return real
+
+
+def _insert_definitions(defs, items):
+    """Insert (position, sql, is_column) items into defs at their positions."""
+    defs = list(defs)
+    for pos, sql, is_column in sorted(items, key=lambda x: x[0]):
+        limit = len(defs)
+        if is_column:
+            limit = next(
+                (i for i, d in enumerate(defs) if is_table_constraint(d)), len(defs)
+            )
+        pos = limit if pos is None else max(0, min(pos, limit))
+        defs.insert(pos, sql)
+    return defs
+
+
+def rb_create_table(conn, op):
+    table = _require_real_table(conn, op["table"])
+    if child_tables(conn, table):
+        raise RollbackError(FK_VIOLATION_MSG)
+    conn.execute(f"DROP TABLE {quote_ident(table)}")
+
+
+def rb_add_column(conn, op):
+    table = _require_real_table(conn, op["table"])
+    column = op["column"]["name"]
+    match = next(
+        (r[1] for r in table_info(conn, table) if r[1].lower() == column.lower()), None
+    )
+    if match is None:
+        raise rollback_failed(
+            f"column '{column}' does not exist in table '{table}'"
+        )
+    for child in child_tables(conn, table):
+        for _fid, parent, _frm, to in foreign_key_list(conn, child):
+            if parent.lower() == table.lower() and any(
+                (c or "").lower() == match.lower() for c in to
+            ):
+                raise RollbackError(FK_VIOLATION_MSG)
+    for idx in conn.execute(f"PRAGMA index_list({quote_ident(table)})").fetchall():
+        cols = [r[2] for r in conn.execute(
+            f"PRAGMA index_info({quote_ident(idx[1])})").fetchall()]
+        if any((c or "").lower() == match.lower() for c in cols):
+            raise rollback_failed(
+                f"cannot drop column '{match}': index '{idx[1]}' depends on it"
+            )
+    apply_drop_column(conn, {"type": "drop_column", "table": table, "column": match})
+
+
+def rb_drop_column(conn, op):
+    table = _require_real_table(conn, op["table"])
+    column = op["column"]
+    rows = table_info(conn, table)
+    if any(r[1].lower() == column.lower() for r in rows):
+        raise rollback_failed(f"column '{column}' already exists in table '{table}'")
+    orig = op.get("original_definition") or {"name": column, "type": "TEXT"}
+    col_sql = op.get("original_sql") or _column_def_sql(orig)
+
+    defs, suffix = table_defs(conn, table)
+    items = [(op.get("position"), col_sql, True)]
+    for pos, sql in op.get("dropped_constraints") or []:
+        items.append((pos, sql, False))
+    new_defs = _insert_definitions(defs, items)
+
+    # Value for the restored column: preserved data, else default/placeholder.
+    if orig.get("default") is not None:
+        fallback = f"({orig['default']})"
+    elif orig.get("not_null"):
+        fallback = _placeholder_sql(orig.get("type"))
+    else:
+        fallback = "NULL"
+    data = op.get("original_data")
+    existing = [r[1] for r in rows]
+    from_sql = None
+    expr = fallback
+    conn.execute("DROP TABLE IF EXISTS temp._rollback_data")
+    if data and data.get("rows") and data.get("key_columns"):
+        keys = data["key_columns"]
+        lower_existing = {c.lower(): c for c in existing}
+        key_refs = []
+        for k in keys:
+            if k == "rowid":
+                key_refs.append("_src.rowid")
+            elif k.lower() in lower_existing:
+                key_refs.append(f"_src.{quote_ident(lower_existing[k.lower()])}")
+            else:
+                key_refs = None
+                break
+        if key_refs:
+            kcols = [f"k{i}" for i in range(len(keys))]
+            conn.execute(
+                f"CREATE TEMP TABLE _rollback_data ({', '.join(kcols)}, v)"
+            )
+            conn.executemany(
+                f"INSERT INTO temp._rollback_data VALUES "
+                f"({', '.join('?' for _ in range(len(keys) + 1))})",
+                [[_decode_value(v) for v in r] for r in data["rows"]
+                 if isinstance(r, list) and len(r) == len(keys) + 1],
+            )
+            conn.execute(
+                f"CREATE INDEX temp._rollback_data_idx ON _rollback_data "
+                f"({', '.join(kcols)})"
+            )
+            cond = " AND ".join(f"{ref} IS _r.{k}" for ref, k in zip(key_refs, kcols))
+            from_sql = (
+                f"{quote_ident(table)} AS _src LEFT JOIN temp._rollback_data AS _r "
+                f"ON {cond}"
+            )
+            expr = f"CASE WHEN _r.rowid IS NOT NULL THEN _r.v ELSE {fallback} END"
+    try:
+        rebuild_table(conn, table, new_defs, suffix, existing,
+                      extra_cols=[(orig.get("name") or column, expr)],
+                      from_sql=from_sql)
+    finally:
+        conn.execute("DROP TABLE IF EXISTS temp._rollback_data")
+    for sql in op.get("dropped_objects") or []:
+        conn.execute(sql)
+    check_foreign_keys(conn, [table])
+
+
+def rb_migrate_column_data(conn, op):
+    _require_real_table(conn, op["table"])
+    apply_migrate_column_data(conn, {
+        "type": "migrate_column_data", "table": op["table"],
+        "from_column": op["to_column"], "to_column": op["from_column"],
+    })
+
+
+def rb_add_foreign_key(conn, op):
+    _require_real_table(conn, op["table"])
+    apply_drop_foreign_key(conn, op)
+
+
+def rb_drop_foreign_key(conn, op):
+    table = _require_real_table(conn, op["table"])
+    orig = op.get("original_definition")
+    if not orig or not (orig.get("sql") or (orig.get("columns") and orig.get("references"))):
+        raise rollback_failed(
+            f"original definition of foreign key '{op['name']}' is not available"
+        )
+    defs, suffix = table_defs(conn, table)
+    idx, _kind = find_named_constraint(defs, op["name"])
+    if idx is not None:
+        raise rollback_failed(f"constraint '{op['name']}' already exists on table '{table}'")
+    if not orig.get("sql"):
+        new_op = dict(orig, type="add_foreign_key", table=table, name=op["name"])
+        apply_add_foreign_key(conn, new_op)
+        return
+    ref = (orig.get("references") or {}).get("table")
+    if ref and ref.lower() != table.lower() and _real_table(conn, ref) is None:
+        raise rollback_failed(
+            f"cannot restore foreign key '{op['name']}': referenced table '{ref}' "
+            f"does not exist"
+        )
+    new_defs = _insert_definitions(defs, [(orig.get("position"), orig["sql"], False)])
+    cols = [r[1] for r in table_info(conn, table)]
+    rebuild_table(conn, table, new_defs, suffix, cols)
+    check_foreign_keys(conn, [table])
+
+
+def rb_create_index(conn, op):
+    apply_drop_index(conn, op)
+
+
+def rb_drop_index(conn, op):
+    orig = op.get("original_definition")
+    if not orig or not (orig.get("sql") or (orig.get("table") and orig.get("columns"))):
+        raise rollback_failed(
+            f"original definition of index '{op['name']}' is not available"
+        )
+    _require_real_table(conn, orig["table"])
+    existing = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE lower(name) = lower(?)", (op["name"],)
+    ).fetchone()
+    if existing:
+        raise rollback_failed(f"index '{op['name']}' already exists")
+    if orig.get("sql"):
+        try:
+            conn.execute(orig["sql"])
+        except sqlite3.IntegrityError as e:
+            raise rollback_failed(
+                f"cannot re-create unique index '{op['name']}': duplicate values ({e})"
+            )
+    else:
+        apply_create_index(conn, {
+            "type": "create_index", "name": op["name"], "table": orig["table"],
+            "columns": orig["columns"], "unique": bool(orig.get("unique")),
+        })
+
+
+def rb_add_check_constraint(conn, op):
+    _require_real_table(conn, op["table"])
+    apply_drop_check_constraint(conn, op)
+
+
+def rb_drop_check_constraint(conn, op):
+    table = _require_real_table(conn, op["table"])
+    orig = op.get("original_definition")
+    if not orig or not (orig.get("sql") or orig.get("expression")):
+        raise rollback_failed(
+            f"original definition of check constraint '{op['name']}' is not available"
+        )
+    expr = orig.get("expression")
+    if not orig.get("sql"):
+        apply_add_check_constraint(conn, {
+            "type": "add_check_constraint", "table": table,
+            "name": op["name"], "expression": expr,
+        })
+        return
+    defs, suffix = table_defs(conn, table)
+    idx, _kind = find_named_constraint(defs, op["name"])
+    if idx is not None:
+        raise rollback_failed(f"constraint '{op['name']}' already exists on table '{table}'")
+    if expr:
+        bad = conn.execute(
+            f"SELECT COUNT(*) FROM {quote_ident(table)} WHERE NOT ({expr})"
+        ).fetchone()[0]
+        if bad:
+            raise rollback_failed(
+                f"check constraint violation: {bad} existing row(s) in table "
+                f"'{table}' do not satisfy constraint '{op['name']}' ({expr})"
+            )
+    new_defs = _insert_definitions(defs, [(orig.get("position"), orig["sql"], False)])
+    cols = [r[1] for r in table_info(conn, table)]
+    rebuild_table(conn, table, new_defs, suffix, cols)
+
+
+def rb_irreversible(conn, op):
+    raise RollbackError(
+        f"cannot rollback: missing rollback_operations for {op['type']}"
+    )
+
+
+ROLLBACKS = {
+    "create_table": rb_create_table,
+    "add_column": rb_add_column,
+    "drop_column": rb_drop_column,
+    "transform_data": rb_irreversible,
+    "migrate_column_data": rb_migrate_column_data,
+    "backfill_data": rb_irreversible,
+    "add_foreign_key": rb_add_foreign_key,
+    "drop_foreign_key": rb_drop_foreign_key,
+    "create_index": rb_create_index,
+    "drop_index": rb_drop_index,
+    "add_check_constraint": rb_add_check_constraint,
+    "drop_check_constraint": rb_drop_check_constraint,
+}
+
+
+# --------------------------------------------------------------------------
 # Migration driver
 # --------------------------------------------------------------------------
 
@@ -1129,6 +1675,56 @@ def load_migration(path):
     return mig
 
 
+MIGRATIONS_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS _migrations ("
+    "version INTEGER PRIMARY KEY, "
+    "description TEXT NOT NULL, "
+    "applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+    "operations TEXT NOT NULL, "
+    "rollback_operations TEXT)"
+)
+
+
+def _migrations_columns(conn):
+    return [r[1] for r in table_info(conn, "_migrations")]
+
+
+def ensure_migrations_table(conn):
+    """Create the _migrations table, upgrading tables from older versions."""
+    conn.execute(MIGRATIONS_TABLE_SQL)
+    cols = _migrations_columns(conn)
+    if "operations" not in cols:
+        # Migrations recorded before rollback support have no stored operations;
+        # the empty string marks them as not automatically reversible.
+        conn.execute(
+            "ALTER TABLE _migrations ADD COLUMN operations TEXT NOT NULL DEFAULT ''"
+        )
+    if "rollback_operations" not in cols:
+        conn.execute("ALTER TABLE _migrations ADD COLUMN rollback_operations TEXT")
+
+
+def operation_event(event_name, op, version, extra=None):
+    otype = op["type"]
+    event = {"event": event_name, "type": otype}
+    if otype in ("create_index", "drop_index"):
+        event["name"] = op["name"]
+        if "table" in op:
+            event["table"] = op["table"]
+    else:
+        event["table"] = op["table"]
+    if otype in ("add_foreign_key", "drop_foreign_key",
+                 "add_check_constraint", "drop_check_constraint"):
+        event["name"] = op["name"]
+    if otype == "add_column":
+        event["column"] = op["column"]["name"]
+    elif otype == "drop_column":
+        event["column"] = op["column"]
+    if extra:
+        event.update(extra)
+    event["version"] = version
+    return event
+
+
 def migrate(migration_path, db_path):
     mig = load_migration(migration_path)
     version = mig["version"]
@@ -1148,12 +1744,7 @@ def migrate(migration_path, db_path):
             # affect referential integrity, PRAGMA foreign_key_check is run and
             # violations abort (and roll back) the migration.
             conn.execute("PRAGMA foreign_keys = OFF")
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS _migrations ("
-                "version INTEGER PRIMARY KEY, "
-                "description TEXT NOT NULL, "
-                "applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
-            )
+            ensure_migrations_table(conn)
             row = conn.execute(
                 "SELECT 1 FROM _migrations WHERE version = ?", (version,)
             ).fetchone()
@@ -1170,29 +1761,18 @@ def migrate(migration_path, db_path):
 
         try:
             conn.execute("BEGIN")
+            stored = []
             for op in mig["operations"]:
+                stored.append(capture_rollback_info(conn, op))
                 extra = OPERATIONS[op["type"]](conn, op)
-                event = {"event": "operation_applied", "type": op["type"]}
-                if op["type"] in ("create_index", "drop_index"):
-                    event["name"] = op["name"]
-                    if "table" in op:
-                        event["table"] = op["table"]
-                else:
-                    event["table"] = op["table"]
-                if op["type"] in ("add_foreign_key", "drop_foreign_key",
-                                  "add_check_constraint", "drop_check_constraint"):
-                    event["name"] = op["name"]
-                if op["type"] == "add_column":
-                    event["column"] = op["column"]["name"]
-                elif op["type"] == "drop_column":
-                    event["column"] = op["column"]
-                if extra:
-                    event.update(extra)
-                event["version"] = version
-                emit(event)
+                emit(operation_event("operation_applied", op, version, extra))
+            rops = mig.get("rollback_operations")
             conn.execute(
-                "INSERT INTO _migrations (version, description) VALUES (?, ?)",
-                (version, mig["description"]),
+                "INSERT INTO _migrations "
+                "(version, description, operations, rollback_operations) "
+                "VALUES (?, ?, ?, ?)",
+                (version, mig["description"], json.dumps(stored),
+                 None if rops is None else json.dumps(rops)),
             )
             conn.execute("COMMIT")
         except sqlite3.Error as e:
@@ -1216,16 +1796,181 @@ def _rollback(conn):
         pass
 
 
-USAGE = "usage: migration_tool.py migrate <migration.json> <database.db>"
+# --------------------------------------------------------------------------
+# Rollback driver
+# --------------------------------------------------------------------------
+
+def _load_json_field(text, version, what):
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        value = None
+    if not isinstance(value, list) or not all(
+        isinstance(op, dict) and op.get("type") in OPERATION_TYPES for op in value
+    ):
+        raise MigrationError(
+            f"cannot rollback version {version}: no valid {what} stored"
+        )
+    return value
+
+
+def rollback(db_path, to_version=None, count=None):
+    if not os.path.isfile(db_path):
+        raise MigrationError("no migrations to rollback")
+    try:
+        conn = sqlite3.connect(db_path, isolation_level=None)
+    except sqlite3.Error as e:
+        raise MigrationError(f"SQL error: {e}")
+
+    try:
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            if not table_exists(conn, "_migrations"):
+                raise MigrationError("no migrations to rollback")
+            cols = _migrations_columns(conn)
+            ops_sql = "operations" if "operations" in cols else "NULL"
+            rops_sql = (
+                "rollback_operations" if "rollback_operations" in cols else "NULL"
+            )
+            rows = conn.execute(
+                f"SELECT version, description, {ops_sql}, {rops_sql} "
+                "FROM _migrations ORDER BY version DESC"
+            ).fetchall()
+        except sqlite3.Error as e:
+            raise MigrationError(f"SQL error: {e}")
+
+        if not rows:
+            raise MigrationError("no migrations to rollback")
+
+        if to_version is not None:
+            if to_version != 0 and not any(r[0] == to_version for r in rows):
+                raise MigrationError(f"version {to_version} not found")
+            targets = [r for r in rows if r[0] > to_version]
+        else:
+            targets = rows[:count if count is not None else 1]
+
+        # Validate everything before touching the database.
+        plan = []
+        for version, description, ops_text, rops_text in targets:
+            explicit = None
+            if rops_text is not None:
+                explicit = _load_json_field(rops_text, version, "rollback_operations")
+            if explicit is None:
+                ops = _load_json_field(ops_text, version, "operation metadata")
+                for op in reversed(ops):
+                    if op["type"] in IRREVERSIBLE_OPERATIONS:
+                        raise MigrationError(
+                            f"cannot rollback version {version}: missing "
+                            f"rollback_operations for {op['type']}"
+                        )
+            else:
+                ops = None
+            plan.append((version, description, ops, explicit))
+
+        rolled_back = []
+        try:
+            conn.execute("BEGIN")
+            for version, description, ops, explicit in plan:
+                emit({"event": "rollback_started", "version": version,
+                      "description": description})
+                if explicit is not None:
+                    for op in explicit:
+                        _guard(lambda op=op: OPERATIONS[op["type"]](conn, op))
+                        emit(rollback_event(op, version, explicit=True))
+                else:
+                    for op in reversed(ops):
+                        _guard(lambda op=op: ROLLBACKS[op["type"]](conn, op))
+                        emit(rollback_event(op, version))
+                conn.execute("DELETE FROM _migrations WHERE version = ?", (version,))
+                emit({"event": "rollback_complete", "version": version})
+                rolled_back.append(version)
+            _guard(lambda: check_foreign_keys(conn, all_tables(conn)))
+            final = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM _migrations"
+            ).fetchone()[0]
+            conn.execute("COMMIT")
+        except BaseException:
+            _rollback(conn)
+            raise
+
+        emit({"event": "rollback_finished", "versions_rolled_back": rolled_back,
+              "final_version": final})
+    finally:
+        conn.close()
+
+
+USAGE = (
+    "usage: migration_tool.py migrate <migration.json> <database.db>\n"
+    "       migration_tool.py rollback <database.db> "
+    "[--to-version <version>] [--count <n>]"
+)
+
+
+def _parse_int(value, option):
+    try:
+        if not re.match(r"^\s*[+-]?\d+\s*$", value):
+            raise ValueError
+        return int(value)
+    except (TypeError, ValueError):
+        raise ArgumentError(f"invalid value for {option}: {value!r}")
+
+
+class ArgumentError(Exception):
+    pass
+
+
+def parse_rollback_args(args):
+    db_path = None
+    to_version = None
+    count = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        opt, eq, val = a.partition("=")
+        if opt in ("--to-version", "--count"):
+            if not eq:
+                if i + 1 >= len(args):
+                    raise ArgumentError(f"missing value for {opt}")
+                i += 1
+                val = args[i]
+            n = _parse_int(val, opt)
+            if opt == "--to-version":
+                if n < 0:
+                    raise ArgumentError(f"invalid value for {opt}: {val!r}")
+                to_version = n
+            else:
+                if n < 1:
+                    raise ArgumentError(f"invalid value for {opt}: {val!r}")
+                count = n
+        elif a.startswith("--"):
+            raise ArgumentError(f"unknown option {a}")
+        elif db_path is None:
+            db_path = a
+        else:
+            raise ArgumentError("too many arguments")
+        i += 1
+    if db_path is None:
+        raise ArgumentError("missing database path")
+    if to_version is not None and count is not None:
+        raise ArgumentError("--to-version and --count cannot be used together")
+    return db_path, to_version, count
 
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 3 or args[0] != "migrate":
-        sys.stderr.write(f"Error: invalid arguments\n{USAGE}\n")
-        return 1
     try:
-        migrate(args[1], args[2])
+        if len(args) == 3 and args[0] == "migrate":
+            migrate(args[1], args[2])
+        elif args and args[0] == "rollback":
+            try:
+                db_path, to_version, count = parse_rollback_args(args[1:])
+            except ArgumentError as e:
+                sys.stderr.write(f"Error: invalid arguments: {e}\n{USAGE}\n")
+                return 1
+            rollback(db_path, to_version, count)
+        else:
+            sys.stderr.write(f"Error: invalid arguments\n{USAGE}\n")
+            return 1
     except MigrationError as e:
         sys.stderr.write(f"Error: {e}\n")
         return 1
