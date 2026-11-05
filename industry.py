@@ -350,6 +350,58 @@ def load_config(path):
     return te_bonus, skill
 
 
+def load_full_config(path):
+    cfg = {}
+    if path:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        try:
+            import yaml
+            data = yaml.safe_load(text)
+            if isinstance(data, dict):
+                cfg = data
+        except Exception:
+            cfg = {}
+    te_bonus, skill = load_config(path)
+    split = cfg.get("split_days", 3)
+    try:
+        split = Fraction(Decimal(str(split if split is not None else 3)))
+    except (InvalidOperation, ValueError):
+        split = Fraction(3)
+    split = min(Fraction(30), split)
+    comp = cfg.get("component_bpo_defaults") or {}
+    if not isinstance(comp, dict):
+        comp = {}
+    cme = comp.get("me", 10)
+    cte = comp.get("te", 20)
+    cme = int(cme) if cme is not None else 10
+    cte = int(cte) if cte is not None else 20
+    return dict(te_bonus=te_bonus, skill=skill, split_days=split,
+                comp_me=cme, comp_te=cte)
+
+
+def split_runs(n, dpr, split_days):
+    """Split n runs into list of (runs, count)."""
+    if n <= 1 or dpr <= 0 or n * dpr < split_days:
+        return [(n, 1)]
+    max_runs = math.ceil(split_days / dpr) - 1
+    if max_runs < 1:
+        max_runs = 1
+    t = math.ceil(Fraction(n, max_runs))
+    b = n // t
+    x = n % t
+    if b + 1 == max_runs and x > Fraction(t, 2) and n // (t + 1) + 1 < max_runs:
+        t += 1
+        b = n // t
+        x = n % t
+    out = []
+    if x:
+        out.append((b + 1, x))
+    if t - x and b > 0:
+        out.append((b, t - x))
+    return out
+
+
 def frac_of(x):
     return Fraction(Decimal(str(x)))
 
@@ -460,6 +512,10 @@ def plan(args, build, sde, types, by_name, product_bps, bp_products, times,
 
     if act != MANUFACTURING:
         me = 0
+    if getattr(args, "build_all", False):
+        return plan_build_all(args, types, product_bps, bp_products, times,
+                              mats, is_pub, groups, cats, by_name, buy, act,
+                              bp, me, te, runs, njobs, tname)
     for mid, q in mats.get((bp, act), []):
         per_job = max(runs, math.ceil(Fraction(q) * runs * (1 - Fraction(me, 100))))
         add(mid, per_job * njobs)
@@ -492,6 +548,157 @@ def plan(args, build, sde, types, by_name, product_bps, bp_products, times,
             w.writerow([n, q, v, 0, 0])
     jobs = [(tname(bp), runs, days, njobs)]
     jobs.sort(key=lambda j: (j[0], j[1], j[3], j[2]))
+    with open(os.path.join(args.output, "jobs.csv"), "w",
+              newline="", encoding="utf-8") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(["name", "runs", "days", "count"])
+        for n, r, d, c in jobs:
+            w.writerow([n, r, d, c])
+    return 0
+
+
+CAPITAL_GROUPS = {"Carrier", "Dreadnought", "Force Auxiliary", "Freighter",
+                  "Supercarrier", "Titan", "Capital Industrial Ship",
+                  "Lancer Dreadnought", "Jump Freighter"}
+
+
+def plan_build_all(args, types, product_bps, bp_products, times, mats, is_pub,
+                   groups, cats, by_name, buy, act, bp, me, te, runs, njobs,
+                   tname):
+    cfg = load_full_config(args.config)
+    te_bonus = cfg["te_bonus"]
+    split_days = cfg["split_days"]
+    sde = args.sde
+
+    def recipe_for(tid):
+        cands = [c for c in product_bps.get(tid, [])
+                 if is_pub(c[1]) and c[0] in (MANUFACTURING, REACTIONS)]
+        cands.sort(key=lambda c: (0 if (c[1], c[0]) in mats else 1,
+                                  0 if c[0] == MANUFACTURING else 1, c[1]))
+        return cands[0] if cands else None
+
+    def is_t1_capital(tid):
+        t = types.get(tid)
+        if not t:
+            return False
+        gname, cid = groups.get(t["group"], ("Unknown", None))
+        if cats.get(cid) != "Ship":
+            return False
+        if gname not in CAPITAL_GROUPS:
+            return False
+        # T1 if this ship is not itself invented (i.e. no T2 hull)
+        return gname != "Jump Freighter"
+
+    def day_per_run(b, a, te_):
+        return Fraction(times.get((b, a), 0)) * (1 - Fraction(te_, 100)) \
+            * (1 - Fraction(te_bonus, 100)) / 86400
+
+    demand = {}
+    produced = {}
+    job_rows = {}
+
+    def run_jobs(b, a, n, me_, te_, count=1):
+        dpr = day_per_run(b, a, te_)
+        for r, c in split_runs(n, dpr, split_days):
+            key = (tname(b), r, round(float(dpr * r), 2))
+            job_rows[key] = job_rows.get(key, 0) + c * count
+            for mid, q in mats.get((b, a), []):
+                per_job = max(r, math.ceil(Fraction(q) * r
+                                           * (1 - Fraction(me_, 100))))
+                demand[mid] = demand.get(mid, 0) + per_job * c * count
+
+    run_jobs(bp, act, runs, me, te, njobs)
+    top_products = {p for a_, p, _ in bp_products.get(bp, []) if a_ == act}
+
+    # discover buildable graph
+    recipes = {}
+    stack = [m for m, _ in mats.get((bp, act), [])]
+    while stack:
+        tid = stack.pop()
+        if tid in recipes:
+            continue
+        rc = recipe_for(tid)
+        recipes[tid] = rc
+        if rc:
+            stack.extend(m for m, _ in mats.get((rc[1], rc[0]), []))
+    nodes = [t for t, rc in recipes.items() if rc]
+    indeg = {t: 0 for t in nodes}
+    for t in nodes:
+        rc = recipes[t]
+        for m in {m for m, _ in mats.get((rc[1], rc[0]), [])}:
+            if m in indeg:
+                indeg[m] += 1
+    order = []
+    ready = sorted([t for t in nodes if indeg[t] == 0])
+    done = set()
+    while len(order) < len(nodes):
+        if not ready:
+            rest = sorted(t for t in nodes if t not in done)
+            ready = [rest[0]]
+            indeg[rest[0]] = 0
+        t = ready.pop(0)
+        if t in done:
+            continue
+        done.add(t)
+        order.append(t)
+        rc = recipes[t]
+        for m in sorted({m for m, _ in mats.get((rc[1], rc[0]), [])}):
+            if m in indeg and m not in done:
+                indeg[m] -= 1
+                if indeg[m] == 0:
+                    ready.append(m)
+
+    for t in order:
+        need = demand.get(t, 0)
+        if need <= 0:
+            continue
+        a, b, qty = recipes[t]
+        qty = max(1, qty)
+        n = math.ceil(Fraction(need, qty))
+        if a != MANUFACTURING:
+            cme, cte = 0, 0
+        elif is_t1_capital(t):
+            cme, cte = 0, 0
+        else:
+            cme, cte = cfg["comp_me"], cfg["comp_te"]
+        produced[t] = n * qty
+        run_jobs(b, a, n, cme, cte)
+
+    for tid, q in demand.items():
+        if tid in produced:
+            continue
+        add_q = q
+        if add_q:
+            buy[tid] = buy.get(tid, 0) + add_q
+
+    ship_vols = load_ship_volumes(sde)
+
+    def unit_volume(tid):
+        t = types.get(tid)
+        if not t:
+            return Decimal(0)
+        gname, cid = groups.get(t["group"], ("Unknown", None))
+        if cats.get(cid) == "Ship" and gname in ship_vols:
+            return ship_vols[gname]
+        return t["volume"] if t["volume"] is not None else Decimal(0)
+
+    rows = []
+    for tid in set(buy) | set(produced):
+        q = buy.get(tid, 0)
+        end = produced.get(tid, 0) - demand.get(tid, 0) if tid in produced else 0
+        if q == 0 and end == 0:
+            continue
+        rows.append((tname(tid), q, fmt_plain(unit_volume(tid) * q), 0, end))
+    rows.sort(key=lambda r: r[0])
+    os.makedirs(args.output, exist_ok=True)
+    with open(os.path.join(args.output, "materials.csv"), "w",
+              newline="", encoding="utf-8") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(["name", "to_buy", "buy_volume", "start_amount", "end_amount"])
+        for r in rows:
+            w.writerow(list(r))
+    jobs = sorted(((n, r, d, c) for (n, r, d), c in job_rows.items()),
+                  key=lambda j: (j[0], j[1], j[2], j[3]))
     with open(os.path.join(args.output, "jobs.csv"), "w",
               newline="", encoding="utf-8") as f:
         w = csv.writer(f, lineterminator="\n")
@@ -541,6 +748,7 @@ def main(argv=None):
     pl.add_argument("--config", default=None)
     pl.add_argument("--sde", required=True)
     pl.add_argument("--output", required=True)
+    pl.add_argument("--build-all", dest="build_all", action="store_true")
     args = p.parse_args(argv)
     name = " ".join(args.name)
     sde = args.sde
