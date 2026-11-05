@@ -3,7 +3,7 @@
 import json
 import sys
 
-SUPPORTED_OPS = ("select", "filter", "map", "rename", "limit")
+SUPPORTED_OPS = ("select", "filter", "map", "rename", "limit", "branch")
 
 
 class ETLError(Exception):
@@ -430,8 +430,94 @@ def check_idents(idents, known, fpath):
             raise ETLError("MISSING_COLUMN", "unknown column '%s'" % name, fpath)
 
 
-def normalize_step(step, i, known):
-    path = "pipeline.steps[%d]" % i
+def normalize_steps(steps, base, known):
+    """Normalize a list of steps located at path `base` (e.g. 'pipeline.steps')."""
+    out = []
+    for i, step in enumerate(steps):
+        ns, known = normalize_step(step, "%s[%d]" % (base, i), known)
+        out.append(ns)
+    return out, known
+
+
+def normalize_branch(step, path, known):
+    bpath = path + ".branches"
+    if "branches" not in step:
+        raise schema_err("missing required field 'branches'", bpath)
+    branches = step["branches"]
+    if not isinstance(branches, list):
+        raise schema_err("field 'branches' must be an array, got %s" % type_name(branches), bpath)
+    if not branches:
+        raise schema_err("field 'branches' must not be empty", bpath)
+
+    # Pass 1: shape of each branch + 'otherwise' placement rules.
+    shaped = []
+    otherwise_idx = None
+    for j, br in enumerate(branches):
+        jpath = "%s[%d]" % (bpath, j)
+        if not isinstance(br, dict):
+            raise schema_err("branch must be an object, got %s" % type_name(br), jpath)
+        nb = {}
+        if "id" in br and br["id"] is not None:
+            if not isinstance(br["id"], str):
+                raise schema_err("field 'id' must be a string, got %s" % type_name(br["id"]),
+                                 jpath + ".id")
+            nb["id"] = br["id"]
+        when = req_trimmed_string(br, "when", jpath)
+        is_otherwise = when.lower() == "otherwise"
+        if is_otherwise:
+            if otherwise_idx is not None:
+                raise ETLError("MALFORMED_STEP", "at most one 'otherwise' branch is allowed",
+                               bpath)
+            otherwise_idx = j
+            when = "otherwise"
+        nb["when"] = when
+        spath = jpath + ".steps"
+        if "steps" not in br:
+            raise schema_err("missing required field 'steps'", spath)
+        if not isinstance(br["steps"], list):
+            raise schema_err("field 'steps' must be an array, got %s" % type_name(br["steps"]),
+                             spath)
+        shaped.append((nb, is_otherwise, jpath))
+    if otherwise_idx is not None and otherwise_idx != len(branches) - 1:
+        raise ETLError("MALFORMED_STEP", "'otherwise' branch must be last", bpath)
+
+    # merge
+    strategy = "concat"
+    if "merge" in step and step["merge"] is not None:
+        merge = step["merge"]
+        mpath = path + ".merge"
+        if not isinstance(merge, dict):
+            raise schema_err("field 'merge' must be an object, got %s" % type_name(merge), mpath)
+        if "strategy" in merge and merge["strategy"] is not None:
+            st = merge["strategy"]
+            if not isinstance(st, str):
+                raise schema_err("field 'strategy' must be a string, got %s" % type_name(st),
+                                 mpath + ".strategy")
+            if st.strip().lower() != "concat":
+                raise ETLError("MALFORMED_STEP", "unsupported merge strategy '%s'" % st,
+                               mpath + ".strategy")
+
+    # Pass 2: expressions and nested steps.
+    out_branches = []
+    result_known = None if known is None else set()
+    for (nb, is_otherwise, jpath), br in zip(shaped, branches):
+        if not is_otherwise:
+            fpath = jpath + ".when"
+            try:
+                idents = check_expr(nb["when"])
+            except ValueError as e:
+                raise expr_error(e, fpath)
+            check_idents(idents, known, fpath)
+        sub, sub_known = normalize_steps(br["steps"], jpath + ".steps",
+                                         None if known is None else set(known))
+        nb["steps"] = sub
+        if result_known is not None:
+            result_known.update(sub_known)
+        out_branches.append(nb)
+    return {"branches": out_branches, "merge": {"strategy": strategy}}, result_known
+
+
+def normalize_step(step, path, known):
     if not isinstance(step, dict):
         raise schema_err("step must be an object, got %s" % type_name(step), path)
     if "op" not in step:
@@ -447,7 +533,11 @@ def normalize_step(step, i, known):
 
     out = {"op": op}
 
-    if op == "select":
+    if op == "branch":
+        fields, known = normalize_branch(step, path, known)
+        out.update(fields)
+
+    elif op == "select":
         fpath = path + ".columns"
         if "columns" not in step:
             raise schema_err("missing required field 'columns'", fpath)
@@ -585,10 +675,7 @@ def process(req):
         for row in dataset:
             known.update(row.keys())
 
-    normalized = []
-    for i, step in enumerate(steps):
-        ns, known = normalize_step(step, i, known)
-        normalized.append(ns)
+    normalized, _ = normalize_steps(steps, "pipeline.steps", known)
     return {"status": "ok", "normalized": {"steps": normalized}}
 
 
@@ -618,15 +705,12 @@ def run_expr(ast, row, fpath):
         raise ETLError("EXECUTION_FAILED", "expression too deeply nested", fpath)
 
 
-def execute(req):
-    steps, dataset = validate_request(req)
-
-    # Validate / normalize every step up front (schema + expression syntax).
-    # Column existence is checked at run time against the actual rows.
+def build_plan(norm_steps, raw_steps, base):
+    """Attach compiled expressions and paths to normalized steps (recursively)."""
     plan = []
-    for i, step in enumerate(steps):
-        ns, _ = normalize_step(step, i, None)
-        path = "pipeline.steps[%d]" % i
+    for i, (ns, raw) in enumerate(zip(norm_steps, raw_steps)):
+        path = "%s[%d]" % (base, i)
+        ns = dict(ns)
         if ns["op"] == "filter":
             ns["_ast"] = compile_expr(ns["where"])[0]
             ns["_path"] = path + ".where"
@@ -634,11 +718,24 @@ def execute(req):
             ns["_ast"] = compile_expr(ns["expr"])[0]
             ns["_path"] = path + ".expr"
         elif ns["op"] == "rename":
-            ns["_from_to"] = "mapping" not in step
+            ns["_from_to"] = "mapping" not in raw
+        elif ns["op"] == "branch":
+            brs = []
+            for j, (nb, rb) in enumerate(zip(ns["branches"], raw["branches"])):
+                jpath = "%s.branches[%d]" % (path, j)
+                cb = {"otherwise": nb["when"] == "otherwise"}
+                if not cb["otherwise"]:
+                    cb["ast"] = compile_expr(nb["when"])[0]
+                    cb["path"] = jpath + ".when"
+                cb["plan"] = build_plan(nb["steps"], rb["steps"], jpath + ".steps")
+                brs.append(cb)
+            ns["_branches"] = brs
         ns["_base"] = path
         plan.append(ns)
+    return plan
 
-    rows = [dict(r) for r in dataset]
+
+def run_steps(plan, rows):
     for st in plan:
         op = st["op"]
         base = st["_base"]
@@ -677,7 +774,30 @@ def execute(req):
             rows = new_rows
         elif op == "limit":
             rows = rows[:st["n"]]
+        elif op == "branch":
+            brs = st["_branches"]
+            buckets = [[] for _ in brs]
+            for row in rows:
+                for k, br in enumerate(brs):
+                    if br["otherwise"] or truthy(run_expr(br["ast"], row, br["path"])):
+                        buckets[k].append(row)
+                        break
+            merged = []
+            for br, bucket in zip(brs, buckets):
+                merged.extend(run_steps(br["plan"], bucket))
+            rows = merged
+    return rows
 
+
+def execute(req):
+    steps, dataset = validate_request(req)
+
+    # Validate / normalize every step up front (schema + expression syntax).
+    # Column existence is checked at run time against the actual rows.
+    normalized, _ = normalize_steps(steps, "pipeline.steps", None)
+    plan = build_plan(normalized, steps, "pipeline.steps")
+
+    rows = run_steps(plan, [dict(r) for r in dataset])
     return {
         "status": "ok",
         "data": rows,
