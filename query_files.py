@@ -8,6 +8,12 @@ compressed with gzip (.gz) or bzip2 (.bz2). Files sharing a table name
 Window functions (COUNT/SUM/AVG/MIN/MAX/ROW_NUMBER/RANK/DENSE_RANK ... OVER (...))
 are supported; window errors exit with code 3.
 
+Common table expressions (WITH [RECURSIVE] name [(cols)] AS (...)), set operations
+(UNION [ALL] / INTERSECT / EXCEPT), scalar, derived-table, correlated, IN, EXISTS and
+ANY/ALL subqueries, arithmetic, CASE, common scalar functions and aggregate
+FILTER (WHERE ...) clauses are supported. CTE errors exit with code 4, subquery
+errors with code 5.
+
 Usage:
     python query_files.py --data <dir> --sql <query or path to .sql file> [--out <file.csv>]
 """
@@ -32,6 +38,33 @@ class WindowError(QueryError):
         super().__init__("WINDOW_ERROR (%s): %s" % (kind, msg))
 
 
+class CTEError(QueryError):
+    """Errors in common table expressions (exit code 4, group CTE_ERROR)."""
+    exit_code = 4
+
+    def __init__(self, kind, msg):
+        # INVALID_CTE_SYNTAX, RECURSIVE_DEPTH_EXCEEDED, CTE_NOT_FOUND, CYCLIC_REFERENCE
+        self.kind = kind
+        super().__init__("CTE_ERROR (%s): %s" % (kind, msg))
+
+
+class SubqueryError(QueryError):
+    """Errors in subqueries (exit code 5, group SUBQUERY_ERROR)."""
+    exit_code = 5
+
+    def __init__(self, kind, msg):
+        # SCALAR_SUBQUERY_MULTIPLE_ROWS, INVALID_SUBQUERY_REFERENCE, CORRELATED_SUBQUERY_ERROR
+        self.kind = kind
+        super().__init__("SUBQUERY_ERROR (%s): %s" % (kind, msg))
+
+
+class ColumnMissing(QueryError):
+    """A qualifier matched a table but the column does not exist in it."""
+
+
+MAX_RECURSION = 1000  # maximum number of recursive iterations of a recursive CTE
+
+
 # ---------------------------------------------------------------------------
 # Value helpers
 # ---------------------------------------------------------------------------
@@ -45,12 +78,25 @@ def to_num(v):
         return None
     if isinstance(v, (int, Decimal)):
         return v
-    if isinstance(v, str) and _NUM_RE.match(v):
+    if isinstance(v, str):
         try:
-            return Decimal(v.strip())
-        except InvalidOperation:
-            return None
+            return _NUM_CACHE[v]
+        except KeyError:
+            pass
+        n = None
+        if _NUM_RE.match(v):
+            try:
+                n = Decimal(v.strip())
+            except InvalidOperation:
+                n = None
+        if len(_NUM_CACHE) > 500000:
+            _NUM_CACHE.clear()
+        _NUM_CACHE[v] = n
+        return n
     return None
+
+
+_NUM_CACHE = {}
 
 
 def sort_key(v):
@@ -84,15 +130,21 @@ def compare(a, b):
         return None
     na, nb = to_num(a), to_num(b)
     if na is not None and nb is not None:
-        na, nb = Decimal(na), Decimal(nb)
+        pass
     else:
         na, nb = to_str(a), to_str(b)
     return (na > nb) - (na < nb)
 
 
+class FloatDec(Decimal):
+    """A Decimal rendered like a floating point number (e.g. 94000.0)."""
+
+
 def to_str(v):
     if v is None:
         return "NULL"
+    if isinstance(v, FloatDec):
+        return repr(float(v))
     if isinstance(v, Decimal):
         s = format(v, "f")
         return s
@@ -120,6 +172,7 @@ KEYWORDS = {
     "OUTER", "JOIN", "ON", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "ASC",
     "DESC", "LIMIT", "OFFSET", "AND", "OR", "NOT", "LIKE", "IS", "NULL", "IN",
     "CROSS", "NULLS", "FIRST", "LAST", "TRUE", "FALSE",
+    "WITH", "UNION", "INTERSECT", "EXCEPT", "EXISTS",
 }
 
 
@@ -223,11 +276,15 @@ def tokenize(sql):
             i = j
             continue
         two = sql[i:i + 2]
+        if two == "||":
+            toks.append(Tok("OP", "||", start, i + 2))
+            i += 2
+            continue
         if two in ("!=", "<>", "<=", ">=", "=="):
             toks.append(Tok("OP", "!=" if two == "<>" else ("=" if two == "==" else two), start, i + 2))
             i += 2
             continue
-        if c in "=<>(),.*;-+":
+        if c in "=<>(),.*;-+/%":
             toks.append(Tok("OP", c, start, i + 1))
             i += 1
             continue
@@ -242,12 +299,15 @@ def tokenize(sql):
 
 class Node:
     text = None
+    FIELDS = ()
 
 
 class Col(Node):
     def __init__(self, parts):
         self.parts = parts
         self.idx = None
+        self.level = 0
+        self.outer = False
 
     @property
     def name(self):
@@ -260,53 +320,126 @@ class Lit(Node):
 
 
 class Agg(Node):
-    def __init__(self, func, arg, distinct=False):
-        self.func = func  # COUNT SUM MIN MAX
+    def __init__(self, func, arg, distinct=False, filter=None):
+        self.func = func  # COUNT SUM AVG MIN MAX
         self.arg = arg    # None means '*'
         self.distinct = distinct
+        self.filter = filter  # FILTER (WHERE ...) condition or None
 
 
 class Window(Node):
     """func(arg) OVER (PARTITION BY ... ORDER BY ... frame)."""
 
-    def __init__(self, func, arg, partition, order, frame):
+    def __init__(self, func, arg, partition, order, frame, filter=None):
         self.func = func          # COUNT SUM AVG MIN MAX ROW_NUMBER RANK DENSE_RANK
         self.arg = arg            # None for COUNT(*) and ranking functions
         self.partition = partition  # list of exprs
         self.order = order        # list of OrderItem
         self.frame = frame        # None or (mode, start, end); bound = (kind, n)
+        self.filter = filter
         self.values = None
 
 
 class Cmp(Node):
+    FIELDS = ("left", "right")
+
     def __init__(self, op, left, right):
         self.op, self.left, self.right = op, left, right
 
 
 class BoolOp(Node):
+    FIELDS = ("items",)
+
     def __init__(self, op, items):
         self.op, self.items = op, items
 
 
 class Not(Node):
+    FIELDS = ("item",)
+
     def __init__(self, item):
         self.item = item
 
 
 class Like(Node):
+    FIELDS = ("expr", "pattern")
+
     def __init__(self, expr, pattern, negate):
         self.expr, self.pattern, self.negate = expr, pattern, negate
         self._cache = {}
 
 
 class IsNull(Node):
+    FIELDS = ("expr",)
+
     def __init__(self, expr, negate):
         self.expr, self.negate = expr, negate
 
 
 class InList(Node):
+    FIELDS = ("expr", "items")
+
     def __init__(self, expr, items, negate):
         self.expr, self.items, self.negate = expr, items, negate
+
+
+class Between(Node):
+    FIELDS = ("expr", "lo", "hi")
+
+    def __init__(self, expr, lo, hi, negate):
+        self.expr, self.lo, self.hi, self.negate = expr, lo, hi, negate
+
+
+class Arith(Node):
+    FIELDS = ("left", "right")
+
+    def __init__(self, op, left, right):
+        self.op, self.left, self.right = op, left, right
+
+
+class Neg(Node):
+    FIELDS = ("item",)
+
+    def __init__(self, item):
+        self.item = item
+
+
+class Case(Node):
+    FIELDS = ("operand", "conds", "results", "default")
+
+    def __init__(self, operand, conds, results, default):
+        self.operand, self.conds, self.results, self.default = operand, conds, results, default
+
+
+class Func(Node):
+    FIELDS = ("args",)
+
+    def __init__(self, name, args):
+        self.name, self.args = name, args
+
+
+class Cast(Node):
+    FIELDS = ("expr",)
+
+    def __init__(self, expr, typ):
+        self.expr, self.typ = expr, typ
+
+
+class SubqueryExpr(Node):
+    """A nested SELECT used inside an expression.
+
+    kind: SCALAR, EXISTS, IN (expr [NOT] IN (subquery)), ANY / ALL (expr op ANY|ALL (subquery)).
+    """
+    FIELDS = ("expr",)
+
+    def __init__(self, kind, query, expr=None, op=None, negate=False):
+        self.kind, self.query, self.expr, self.op, self.negate = kind, query, expr, op, negate
+        self.plan = None
+        self.level = 0
+        self.refs = set()   # outer (level, idx) references -> correlation
+        self.cache = {}
+        self.epoch = None
+        self.float_avg = False
 
 
 class Star(Node):
@@ -324,6 +457,11 @@ class TableRef:
         self.name, self.alias = name, alias
 
 
+class DerivedRef:
+    def __init__(self, query, alias, columns):
+        self.query, self.alias, self.columns = query, alias, columns
+
+
 class Join:
     def __init__(self, kind, table, on):
         self.kind, self.table, self.on = kind, table, on
@@ -335,28 +473,44 @@ class OrderItem:
 
 
 class Query:
-    pass
+    """A single SELECT ... FROM ... block."""
+
+
+class SetQuery:
+    """left UNION/INTERSECT/EXCEPT [ALL] right (op None: parenthesised pass-through)."""
+
+    def __init__(self, op, all_, left, right):
+        self.op, self.all, self.left, self.right = op, all_, left, right
+        self.order_by, self.limit, self.offset = [], None, None
+
+
+class CTEDef:
+    def __init__(self, name, columns, query):
+        self.name, self.columns, self.query = name, columns, query
+
+
+class With:
+    def __init__(self, ctes, recursive, body):
+        self.ctes, self.recursive, self.body = ctes, recursive, body
 
 
 def children(node):
-    if isinstance(node, Cmp):
-        return [node.left, node.right]
-    if isinstance(node, BoolOp):
-        return list(node.items)
-    if isinstance(node, Not):
-        return [node.item]
-    if isinstance(node, Like):
-        return [node.expr, node.pattern]
-    if isinstance(node, IsNull):
-        return [node.expr]
-    if isinstance(node, InList):
-        return [node.expr] + list(node.items)
     if isinstance(node, Agg):
-        return [node.arg] if node.arg is not None else []
+        return [x for x in (node.arg, node.filter) if x is not None]
     if isinstance(node, Window):
         out = [node.arg] if node.arg is not None else []
-        return out + list(node.partition) + [o.expr for o in node.order]
-    return []
+        out += list(node.partition) + [o.expr for o in node.order]
+        if node.filter is not None:
+            out.append(node.filter)
+        return out
+    out = []
+    for f in node.FIELDS:
+        v = getattr(node, f)
+        if isinstance(v, list):
+            out.extend(x for x in v if x is not None)
+        elif v is not None:
+            out.append(v)
+    return out
 
 
 def walk(node):
@@ -378,12 +532,58 @@ def reject_window(node, where):
         raise WindowError("INVALID_WINDOW_SPEC", "Window functions are not allowed in %s" % where)
 
 
+def query_exprs(q):
+    """All expressions directly contained in a SELECT block."""
+    out = [it.expr for it in q.select]
+    for j in q.joins:
+        if j.on is not None:
+            out.append(j.on)
+    for e in (q.where, q.having):
+        if e is not None:
+            out.append(e)
+    out += list(q.group_by) + [o.expr for o in q.order_by]
+    return out
+
+
+def query_refs(q, out=None):
+    """Lower-cased single-part table names referenced anywhere in a query."""
+    if out is None:
+        out = set()
+    if isinstance(q, With):
+        for d in q.ctes:
+            query_refs(d.query, out)
+        query_refs(q.body, out)
+    elif isinstance(q, SetQuery):
+        query_refs(q.left, out)
+        if q.right is not None:
+            query_refs(q.right, out)
+    elif isinstance(q, Query):
+        trefs = ([q.table] if q.table is not None else []) + [j.table for j in q.joins]
+        for t in trefs:
+            if isinstance(t, DerivedRef):
+                query_refs(t.query, out)
+            elif len(t.name) == 1:
+                out.add(t.name[0].lower())
+        for e in query_exprs(q):
+            for n in walk(e):
+                if isinstance(n, SubqueryExpr):
+                    query_refs(n.query, out)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
 
 AGG_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
 RANK_FUNCS = {"ROW_NUMBER", "RANK", "DENSE_RANK"}
+# scalar function name -> (min args, max args)
+SCALAR_FUNCS = {
+    "COALESCE": (1, 99), "IFNULL": (2, 2), "NULLIF": (2, 2), "ABS": (1, 1), "ROUND": (1, 2),
+    "UPPER": (1, 1), "LOWER": (1, 1), "LENGTH": (1, 1), "LEN": (1, 1), "TRIM": (1, 1),
+    "LTRIM": (1, 1), "RTRIM": (1, 1), "SUBSTR": (2, 3), "SUBSTRING": (2, 3), "CONCAT": (1, 99),
+    "FLOOR": (1, 1), "CEIL": (1, 1), "CEILING": (1, 1), "REPLACE": (3, 3),
+}
 CLAUSE_END = {"FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET",
               "INNER", "LEFT", "RIGHT", "FULL", "JOIN", "ON", "CROSS"}
 
@@ -393,6 +593,7 @@ class Parser:
         self.sql = sql
         self.toks = tokenize(sql)
         self.pos = 0
+        self.saw_with = False
 
     def peek(self, k=0):
         return self.toks[min(self.pos + k, len(self.toks) - 1)]
@@ -450,12 +651,128 @@ class Parser:
 
     # -- query ---------------------------------------------------------------
     def parse(self):
-        q = self.parse_select()
+        if self.peek().kind == "EOF":
+            raise QueryError("Empty query")
+        q = self.parse_query()
         while self.accept_op(";"):
             pass
         if self.peek().kind != "EOF":
             raise QueryError("Unexpected %s after end of query" % self.describe(self.peek()))
         return q
+
+    def starts_query(self, k=0):
+        """True if a (possibly parenthesised) query starts at offset k."""
+        while self.is_op("(", k=k):
+            k += 1
+        return self.is_kw("SELECT", "WITH", k=k)
+
+    def parse_query(self):
+        if self.is_kw("WITH"):
+            self.saw_with = True
+            self.next()
+            recursive = bool(self.accept_word("RECURSIVE"))
+            ctes = self.parse_cte_list()
+            if not self.starts_query():
+                raise CTEError("INVALID_CTE_SYNTAX", "Expected SELECT after WITH clause but found %s"
+                               % self.describe(self.peek()))
+            body = self.parse_set_expr()
+            return With(ctes, recursive, body)
+        return self.parse_set_expr()
+
+    def parse_cte_list(self):
+        ctes = []
+        seen = set()
+        while True:
+            try:
+                d = self.parse_cte()
+            except (CTEError, WindowError, SubqueryError):
+                raise
+            except QueryError as e:
+                raise CTEError("INVALID_CTE_SYNTAX", str(e))
+            if d.name.lower() in seen:
+                raise CTEError("INVALID_CTE_SYNTAX", "CTE name '%s' specified more than once" % d.name)
+            seen.add(d.name.lower())
+            ctes.append(d)
+            if not self.accept_op(","):
+                break
+        return ctes
+
+    def parse_cte(self):
+        t = self.peek()
+        if t.kind not in ("IDENT", "QIDENT"):
+            raise CTEError("INVALID_CTE_SYNTAX", "Expected CTE name but found %s" % self.describe(t))
+        name = self.next().value
+        cols = None
+        if self.accept_op("("):
+            cols = [self.ident()]
+            while self.accept_op(","):
+                cols.append(self.ident())
+            self.expect_op(")")
+            if len(set(c.lower() for c in cols)) != len(cols):
+                raise CTEError("INVALID_CTE_SYNTAX", "Duplicate column name in column list of CTE '%s'" % name)
+        if not self.accept_kw("AS"):
+            raise CTEError("INVALID_CTE_SYNTAX", "Expected AS after CTE name '%s' but found %s"
+                           % (name, self.describe(self.peek())))
+        if not self.is_op("("):
+            raise CTEError("INVALID_CTE_SYNTAX", "Expected '(' after AS in CTE '%s' but found %s"
+                           % (name, self.describe(self.peek())))
+        self.next()
+        if not self.starts_query():
+            raise CTEError("INVALID_CTE_SYNTAX", "Expected SELECT in CTE '%s' but found %s"
+                           % (name, self.describe(self.peek())))
+        q = self.parse_query()
+        if not self.is_op(")"):
+            raise CTEError("INVALID_CTE_SYNTAX", "Expected ')' to close CTE '%s' but found %s"
+                           % (name, self.describe(self.peek())))
+        self.next()
+        return CTEDef(name, cols, q)
+
+    def parse_set_expr(self):
+        node = self.parse_set_term()
+        while self.is_kw("UNION", "INTERSECT", "EXCEPT"):
+            op = self.next().value
+            all_ = bool(self.accept_kw("ALL"))
+            if not all_:
+                self.accept_kw("DISTINCT")
+            right = self.parse_set_term()
+            node = SetQuery(op, all_, node, right)
+        order, limit, offset = self.parse_order_limit()
+        if order or limit is not None or offset is not None:
+            if isinstance(node, Query) and not node.order_by and node.limit is None and node.offset is None:
+                target = node
+            elif isinstance(node, SetQuery) and not node.order_by and node.limit is None \
+                    and node.offset is None:
+                target = node
+            else:
+                target = node = SetQuery(None, False, node, None)
+            target.order_by, target.limit, target.offset = order, limit, offset
+        return node
+
+    def parse_set_term(self):
+        if self.is_op("(") and self.starts_query(1):
+            self.next()
+            q = self.parse_query()
+            self.expect_op(")")
+            return q
+        return self.parse_select()
+
+    def parse_order_limit(self):
+        order = []
+        if self.accept_kw("ORDER"):
+            self.expect_kw("BY")
+            order.append(self.parse_order_item())
+            while self.accept_op(","):
+                order.append(self.parse_order_item())
+        limit = offset = None
+        for _ in range(2):
+            if limit is None and self.accept_kw("LIMIT"):
+                limit = self.parse_nonneg_int("LIMIT")
+                if self.accept_op(","):
+                    # MySQL style LIMIT offset, count
+                    offset, limit = limit, self.parse_nonneg_int("LIMIT")
+            elif offset is None and self.accept_kw("OFFSET"):
+                offset = self.parse_nonneg_int("OFFSET")
+        return order, limit, offset
 
     def parse_select(self):
         q = Query()
@@ -470,38 +787,43 @@ class Parser:
         q.select = [self.parse_select_item()]
         while self.accept_op(","):
             q.select.append(self.parse_select_item())
-        self.expect_kw("FROM")
-        q.table = self.parse_table_ref()
+        q.table = None
         q.joins = []
-        while True:
-            kind = None
-            if self.is_kw("JOIN"):
-                kind = "INNER"
-            elif self.is_kw("INNER") and self.is_kw("JOIN", k=1):
-                kind = "INNER"
-                self.next()
-            elif self.is_kw("LEFT", "RIGHT", "FULL"):
-                kind = self.next().value
-                self.accept_kw("OUTER")
-                if not self.is_kw("JOIN"):
-                    raise QueryError("Expected JOIN after %s" % kind)
-            elif self.is_kw("CROSS"):
-                self.next()
-                kind = "CROSS"
-                if not self.is_kw("JOIN"):
-                    raise QueryError("Expected JOIN after CROSS")
-            else:
-                break
-            self.expect_kw("JOIN")
-            tref = self.parse_table_ref()
-            on = None
-            if kind != "CROSS":
-                self.expect_kw("ON")
-                on = self.parse_expr()
-                reject_window(on, "JOIN conditions")
-                if contains_agg(on):
-                    raise QueryError("Aggregate functions are not allowed in JOIN conditions")
-            q.joins.append(Join(kind, tref, on))
+        if self.accept_kw("FROM"):
+            q.table = self.parse_table_ref()
+            while True:
+                kind = None
+                if self.is_op(","):
+                    self.next()
+                    q.joins.append(Join("CROSS", self.parse_table_ref(), None))
+                    continue
+                if self.is_kw("JOIN"):
+                    kind = "INNER"
+                elif self.is_kw("INNER") and self.is_kw("JOIN", k=1):
+                    kind = "INNER"
+                    self.next()
+                elif self.is_kw("LEFT", "RIGHT", "FULL"):
+                    kind = self.next().value
+                    self.accept_kw("OUTER")
+                    if not self.is_kw("JOIN"):
+                        raise QueryError("Expected JOIN after %s" % kind)
+                elif self.is_kw("CROSS"):
+                    self.next()
+                    kind = "CROSS"
+                    if not self.is_kw("JOIN"):
+                        raise QueryError("Expected JOIN after CROSS")
+                else:
+                    break
+                self.expect_kw("JOIN")
+                tref = self.parse_table_ref()
+                on = None
+                if kind != "CROSS":
+                    self.expect_kw("ON")
+                    on = self.parse_expr()
+                    reject_window(on, "JOIN conditions")
+                    if contains_agg(on):
+                        raise QueryError("Aggregate functions are not allowed in JOIN conditions")
+                q.joins.append(Join(kind, tref, on))
         q.where = None
         if self.accept_kw("WHERE"):
             q.where = self.parse_expr()
@@ -523,21 +845,8 @@ class Parser:
             q.having = self.parse_expr()
             reject_window(q.having, "HAVING")
         q.order_by = []
-        if self.accept_kw("ORDER"):
-            self.expect_kw("BY")
-            q.order_by.append(self.parse_order_item())
-            while self.accept_op(","):
-                q.order_by.append(self.parse_order_item())
         q.limit = None
         q.offset = None
-        for _ in range(2):
-            if q.limit is None and self.accept_kw("LIMIT"):
-                q.limit = self.parse_nonneg_int("LIMIT")
-                if self.accept_op(","):
-                    # MySQL style LIMIT offset, count
-                    q.offset, q.limit = q.limit, self.parse_nonneg_int("LIMIT")
-            elif q.offset is None and self.accept_kw("OFFSET"):
-                q.offset = self.parse_nonneg_int("OFFSET")
         return q
 
     def parse_nonneg_int(self, what):
@@ -577,6 +886,28 @@ class Parser:
         return SelectItem(expr, alias, text)
 
     def parse_table_ref(self):
+        if self.is_op("("):
+            if not self.starts_query(1):
+                raise QueryError("Expected subquery after '(' in FROM clause but found %s"
+                                 % self.describe(self.peek(1)))
+            self.next()
+            sub = self.parse_query()
+            self.expect_op(")")
+            alias = None
+            if self.accept_kw("AS"):
+                alias = self.ident()
+            elif self.is_ident():
+                alias = self.ident()
+            if alias is None:
+                raise SubqueryError("INVALID_SUBQUERY_REFERENCE", "Subquery in FROM must have an alias")
+            cols = None
+            if self.is_op("(") and self.is_ident(1):
+                self.next()
+                cols = [self.ident()]
+                while self.accept_op(","):
+                    cols.append(self.ident())
+                self.expect_op(")")
+            return DerivedRef(sub, alias, cols)
         parts = [self.ident()]
         while self.is_op(".") and self.is_ident(1):
             self.next()
@@ -625,26 +956,46 @@ class Parser:
             return Not(self.parse_not())
         return self.parse_predicate()
 
+    def parse_subquery_parens(self):
+        self.expect_op("(")
+        q = self.parse_query()
+        self.expect_op(")")
+        return q
+
     def parse_predicate(self):
-        left = self.parse_primary()
+        left = self.parse_additive()
         while True:
             if self.is_op("=", "!=", "<", "<=", ">", ">="):
                 op = self.next().value
-                right = self.parse_primary()
+                if (self.is_word("ANY") or self.is_word("SOME") or self.is_kw("ALL")) \
+                        and self.is_op("(", k=1) and self.starts_query(2):
+                    quant = "ALL" if self.next().value.upper() == "ALL" else "ANY"
+                    left = SubqueryExpr(quant, self.parse_subquery_parens(), left, op)
+                    continue
+                right = self.parse_additive()
                 left = Cmp(op, left, right)
                 continue
             negate = False
-            if self.is_kw("NOT") and self.is_kw("LIKE", "IN", k=1):
+            if self.is_kw("NOT") and (self.is_kw("LIKE", "IN", k=1) or self.is_word("BETWEEN", k=1)):
                 self.next()
                 negate = True
             if self.accept_kw("LIKE"):
-                left = Like(left, self.parse_primary(), negate)
+                left = Like(left, self.parse_additive(), negate)
+                continue
+            if self.accept_word("BETWEEN"):
+                lo = self.parse_additive()
+                self.expect_kw("AND")
+                hi = self.parse_additive()
+                left = Between(left, lo, hi, negate)
                 continue
             if self.accept_kw("IN"):
+                if self.is_op("(") and self.starts_query(1):
+                    left = SubqueryExpr("IN", self.parse_subquery_parens(), left, negate=negate)
+                    continue
                 self.expect_op("(")
-                items = [self.parse_primary()]
+                items = [self.parse_additive()]
                 while self.accept_op(","):
-                    items.append(self.parse_primary())
+                    items.append(self.parse_additive())
                 self.expect_op(")")
                 left = InList(left, items, negate)
                 continue
@@ -655,13 +1006,41 @@ class Parser:
                 continue
             return left
 
+    def parse_additive(self):
+        left = self.parse_multiplicative()
+        while self.is_op("+", "-", "||"):
+            op = self.next().value
+            left = Arith(op, left, self.parse_multiplicative())
+        return left
+
+    def parse_multiplicative(self):
+        left = self.parse_unary()
+        while self.is_op("*", "/", "%"):
+            op = self.next().value
+            left = Arith(op, left, self.parse_unary())
+        return left
+
+    def parse_unary(self):
+        if self.is_op("-", "+") and self.peek(1).kind != "NUM":
+            op = self.next().value
+            item = self.parse_unary()
+            return Neg(item) if op == "-" else item
+        return self.parse_primary()
+
     def parse_primary(self):
         t = self.peek()
         if t.kind == "OP" and t.value == "(":
+            if self.starts_query(1):
+                return SubqueryExpr("SCALAR", self.parse_subquery_parens())
             self.next()
             e = self.parse_expr()
             self.expect_op(")")
             return e
+        if t.kind == "KW" and t.value == "EXISTS":
+            self.next()
+            if not (self.is_op("(") and self.starts_query(1)):
+                raise QueryError("Expected subquery after EXISTS")
+            return SubqueryExpr("EXISTS", self.parse_subquery_parens())
         if t.kind == "STR":
             self.next()
             return Lit(t.value)
@@ -678,6 +1057,8 @@ class Parser:
         if t.kind == "KW" and t.value in ("TRUE", "FALSE"):
             self.next()
             return Lit(1 if t.value == "TRUE" else 0)
+        if t.kind == "IDENT" and t.value.upper() == "CASE":
+            return self.parse_case()
         if t.kind in ("IDENT", "QIDENT"):
             if t.kind == "IDENT" and self.is_op("(", k=1):
                 return self.parse_func()
@@ -687,6 +1068,26 @@ class Parser:
                 parts.append(self.next().value)
             return Col(parts)
         raise QueryError("Unexpected %s in expression" % self.describe(t))
+
+    def parse_case(self):
+        self.next()  # CASE
+        operand = None
+        if not self.is_word("WHEN"):
+            operand = self.parse_expr()
+        conds, results = [], []
+        while self.accept_word("WHEN"):
+            conds.append(self.parse_expr())
+            if not self.accept_word("THEN"):
+                raise QueryError("Expected THEN in CASE expression but found %s" % self.describe(self.peek()))
+            results.append(self.parse_expr())
+        if not conds:
+            raise QueryError("CASE expression requires at least one WHEN clause")
+        default = None
+        if self.accept_word("ELSE"):
+            default = self.parse_expr()
+        if not self.accept_word("END"):
+            raise QueryError("Expected END to close CASE expression but found %s" % self.describe(self.peek()))
+        return Case(operand, conds, results, default)
 
     @staticmethod
     def num_lit(s):
@@ -703,6 +1104,20 @@ class Parser:
             return self.next()
         return None
 
+    def parse_filter(self):
+        """Optional FILTER (WHERE cond) after an aggregate call."""
+        if not (self.is_word("FILTER") and self.is_op("(", k=1)):
+            return None
+        self.next()
+        self.next()
+        self.expect_kw("WHERE")
+        cond = self.parse_expr()
+        self.expect_op(")")
+        reject_window(cond, "FILTER clauses")
+        if contains_agg(cond):
+            raise QueryError("Aggregate functions are not allowed in FILTER clauses")
+        return cond
+
     def parse_func(self):
         name_tok = self.next()
         fname = name_tok.value.upper()
@@ -714,7 +1129,37 @@ class Parser:
             if not self.is_word("OVER"):
                 raise WindowError("INVALID_WINDOW_SPEC", "%s() requires an OVER clause" % fname)
             self.next()
-            return self.parse_window(fname, None)
+            w = self.parse_window(fname, None)
+            if self.is_word("FILTER"):
+                raise WindowError("INVALID_WINDOW_SPEC", "FILTER is not allowed with %s()" % fname)
+            return w
+        if fname == "CAST":
+            self.expect_op("(")
+            e = self.parse_expr()
+            self.expect_kw("AS")
+            typ = self.ident().upper()
+            while self.is_ident():
+                typ += " " + self.ident().upper()
+            if self.accept_op("("):
+                while not self.is_op(")"):
+                    if self.peek().kind == "EOF":
+                        raise QueryError("Unterminated type in CAST")
+                    self.next()
+                self.next()
+            self.expect_op(")")
+            return Cast(e, typ)
+        if fname in SCALAR_FUNCS:
+            self.expect_op("(")
+            args = []
+            if not self.is_op(")"):
+                args.append(self.parse_expr())
+                while self.accept_op(","):
+                    args.append(self.parse_expr())
+            self.expect_op(")")
+            lo, hi = SCALAR_FUNCS[fname]
+            if not lo <= len(args) <= hi:
+                raise QueryError("Wrong number of arguments to %s()" % name_tok.value)
+            return Func(fname, args)
         if fname not in AGG_FUNCS:
             raise QueryError("Unsupported function: %s" % name_tok.value)
         self.expect_op("(")
@@ -727,22 +1172,23 @@ class Parser:
         else:
             arg = self.parse_expr()
         self.expect_op(")")
+        filt = self.parse_filter()
         if self.is_word("OVER"):
             self.next()
             if distinct:
                 raise WindowError("INVALID_WINDOW_SPEC", "DISTINCT is not supported in window functions")
             if arg is not None and contains_window(arg):
                 raise WindowError("NESTED_WINDOW_ERROR", "Window functions cannot be nested")
-            return self.parse_window(fname, arg)
+            w = self.parse_window(fname, arg)
+            w.filter = filt
+            return w
         if arg is not None:
             if contains_window(arg):
                 raise WindowError("NESTED_WINDOW_ERROR",
                                   "Window functions are not allowed inside aggregate functions")
             if contains_agg(arg):
                 raise QueryError("Nested aggregate functions are not allowed")
-            if not isinstance(arg, Col):
-                raise QueryError("%s() only accepts a column reference" % fname)
-        return Agg(fname, arg, distinct)
+        return Agg(fname, arg, distinct, filt)
 
     def parse_window(self, fname, arg):
         if not self.is_op("("):
@@ -932,7 +1378,7 @@ def load_delimited(text, name, delim, kind):
         if not row:
             continue
         row = (row + [""] * ncol)[:ncol]
-        rows.append([None if v == "" else v for v in row])
+        rows.append([None if v == "" or v == "NULL" else v for v in row])
     return header, rows
 
 
@@ -1165,13 +1611,13 @@ class Scope:
         self.tables = []   # list of dict(name, alias, columns, offset)
         self.width = 0
 
-    def add(self, name, alias, columns):
+    def add(self, name, alias, columns, derived=False):
         quals = []
         if alias is not None:
             quals.append(alias)
         quals.append(name)
         self.tables.append({"name": name, "alias": alias, "columns": columns,
-                            "offset": self.width, "quals": quals})
+                            "offset": self.width, "quals": quals, "derived": derived})
         self.width += len(columns)
 
     def copy(self):
@@ -1179,6 +1625,10 @@ class Scope:
         s.tables = list(self.tables)
         s.width = self.width
         return s
+
+    @property
+    def has_derived(self):
+        return any(t["derived"] for t in self.tables)
 
     def find_table(self, qual):
         for matcher in (lambda a, b: a == b, lambda a, b: a.lower() == b.lower()):
@@ -1207,16 +1657,18 @@ class Scope:
                 return i
         return None
 
-    def resolve(self, parts):
+    def lookup(self, parts):
+        """Return the row index of a column, or None if it is not visible in this scope.
+        Raises on ambiguity or on a missing column of a matched table."""
         name = parts[-1]
         if len(parts) > 1:
             qual = ".".join(parts[:-1])
             t = self.find_table(qual)
             if t is None:
-                raise QueryError("Unknown table or alias '%s'" % qual)
+                return None
             i = self.find_col(t, name)
             if i is None:
-                raise QueryError("Unknown column '%s' in '%s'" % (name, qual))
+                raise ColumnMissing("Unknown column '%s' in '%s'" % (name, qual))
             return t["offset"] + i
         hits = []
         for t in self.tables:
@@ -1229,54 +1681,139 @@ class Scope:
                 if i is not None:
                     hits.append(t["offset"] + i)
         if not hits:
-            raise QueryError("Unknown column '%s'" % name)
+            return None
         if len(hits) > 1:
             raise QueryError("Ambiguous column reference '%s'" % name)
         return hits[0]
 
-    def try_resolve(self, parts):
+
+class Ctx:
+    """Planning context: visible CTEs, enclosing scopes (one per outer level) and
+    the chain of enclosing expression subqueries (for correlation tracking)."""
+
+    def __init__(self, env, ctes=None, outer=None, sub_chain=None, in_sub=False):
+        self.env = env
+        self.ctes = ctes or {}
+        self.outer = outer or []
+        self.sub_chain = sub_chain or []
+        self.in_sub = in_sub
+
+    @property
+    def level(self):
+        return len(self.outer)
+
+    def derive(self, **kw):
+        c = Ctx(self.env, self.ctes, self.outer, self.sub_chain, self.in_sub)
+        for k, v in kw.items():
+            setattr(c, k, v)
+        return c
+
+
+class Resolver:
+    def __init__(self, ctx, scope):
+        self.ctx = ctx
+        self.scope = scope
+
+    def resolve_col(self, node):
+        ctx = self.ctx
+        scopes = ctx.outer + [self.scope]
+        cur = len(scopes) - 1
+        for lv in range(cur, -1, -1):
+            try:
+                idx = scopes[lv].lookup(node.parts)
+            except ColumnMissing as e:
+                if lv < cur:
+                    raise SubqueryError("CORRELATED_SUBQUERY_ERROR", "%s (outer query reference)" % e)
+                if ctx.in_sub:
+                    raise SubqueryError("INVALID_SUBQUERY_REFERENCE", "%s in subquery" % e)
+                t = self.scope.find_table(".".join(node.parts[:-1]))
+                if t is not None and t["derived"]:
+                    raise SubqueryError("INVALID_SUBQUERY_REFERENCE",
+                                        "%s: derived table does not expose this column" % e)
+                raise QueryError(str(e))
+            if idx is None:
+                continue
+            node.idx, node.level, node.outer = idx, lv, lv < cur
+            if lv < cur:
+                for sq in ctx.sub_chain:
+                    if sq.level > lv:
+                        sq.refs.add((lv, idx))
+            return node
+        full = ".".join(node.parts)
+        if len(node.parts) > 1:
+            qual = ".".join(node.parts[:-1])
+            if ctx.in_sub:
+                raise SubqueryError("CORRELATED_SUBQUERY_ERROR",
+                                    "Unknown table or alias '%s' referenced in subquery (column '%s')"
+                                    % (qual, full))
+            if self.scope.has_derived:
+                raise SubqueryError("INVALID_SUBQUERY_REFERENCE",
+                                    "Unknown table or alias '%s'; tables inside a derived table are not "
+                                    "visible outside it" % qual)
+            raise QueryError("Unknown table or alias '%s'" % qual)
+        if ctx.in_sub:
+            raise SubqueryError("INVALID_SUBQUERY_REFERENCE", "Unknown column '%s' in subquery" % full)
+        if self.scope.has_derived:
+            raise SubqueryError("INVALID_SUBQUERY_REFERENCE",
+                                "Unknown column '%s' (not exposed by derived table)" % full)
+        raise QueryError("Unknown column '%s'" % full)
+
+    def try_resolve_local(self, parts):
         try:
-            return self.resolve(parts)
+            return self.scope.lookup(parts)
         except QueryError:
             return None
 
-
-def resolve_expr(node, scope, aliases=None):
-    """Resolve column references; returns (possibly replaced) node."""
-    if isinstance(node, Col):
-        if aliases is not None and len(node.parts) == 1:
-            idx = scope.try_resolve(node.parts)
-            if idx is None:
-                target = lookup_alias(aliases, node.parts[0])
-                if target is not None:
-                    return target
-        node.idx = scope.resolve(node.parts)
+    def resolve(self, node, aliases=None):
+        """Resolve column references and plan subqueries; returns (possibly replaced) node."""
+        if node is None:
+            return None
+        if isinstance(node, Col):
+            if aliases is not None and len(node.parts) == 1:
+                if self.try_resolve_local(node.parts) is None:
+                    target = lookup_alias(aliases, node.parts[0])
+                    if target is not None:
+                        return target
+            return self.resolve_col(node)
+        if isinstance(node, Agg):
+            node.arg = self.resolve(node.arg)
+            node.filter = self.resolve(node.filter)
+            return node
+        if isinstance(node, Window):
+            node.arg = self.resolve(node.arg)
+            node.filter = self.resolve(node.filter)
+            node.partition = [self.resolve(p) for p in node.partition]
+            for o in node.order:
+                o.expr = self.resolve(o.expr)
+            return node
+        if isinstance(node, SubqueryExpr):
+            node.expr = self.resolve(node.expr, aliases)
+            self.plan_subquery(node)
+            return node
+        for f in node.FIELDS:
+            v = getattr(node, f)
+            if isinstance(v, list):
+                setattr(node, f, [self.resolve(x, aliases) for x in v])
+            elif v is not None:
+                setattr(node, f, self.resolve(v, aliases))
         return node
-    if isinstance(node, Cmp):
-        node.left = resolve_expr(node.left, scope, aliases)
-        node.right = resolve_expr(node.right, scope, aliases)
-    elif isinstance(node, BoolOp):
-        node.items = [resolve_expr(i, scope, aliases) for i in node.items]
-    elif isinstance(node, Not):
-        node.item = resolve_expr(node.item, scope, aliases)
-    elif isinstance(node, Like):
-        node.expr = resolve_expr(node.expr, scope, aliases)
-        node.pattern = resolve_expr(node.pattern, scope, aliases)
-    elif isinstance(node, IsNull):
-        node.expr = resolve_expr(node.expr, scope, aliases)
-    elif isinstance(node, InList):
-        node.expr = resolve_expr(node.expr, scope, aliases)
-        node.items = [resolve_expr(i, scope, aliases) for i in node.items]
-    elif isinstance(node, Agg):
-        if node.arg is not None:
-            node.arg = resolve_expr(node.arg, scope, None)
-    elif isinstance(node, Window):
-        if node.arg is not None:
-            node.arg = resolve_expr(node.arg, scope, None)
-        node.partition = [resolve_expr(p, scope, None) for p in node.partition]
-        for o in node.order:
-            o.expr = resolve_expr(o.expr, scope, None)
-    return node
+
+    def plan_subquery(self, sq):
+        if sq.plan is not None:
+            return
+        ctx = self.ctx
+        sq.level = ctx.level + 1
+        sub_ctx = ctx.derive(outer=ctx.outer + [self.scope], sub_chain=ctx.sub_chain + [sq], in_sub=True)
+        sq.plan = plan_query(sq.query, sub_ctx)
+        if sq.kind != "EXISTS" and len(sq.plan.names) != 1:
+            raise SubqueryError("INVALID_SUBQUERY_REFERENCE",
+                                "Subquery used as %s must return exactly one column, got %d"
+                                % ("a scalar value" if sq.kind == "SCALAR" else "an operand of %s" % sq.kind,
+                                   len(sq.plan.names)))
+        p = sq.plan
+        if sq.kind == "SCALAR" and isinstance(p, SelectPlan) and isinstance(p.items[0].expr, Agg) \
+                and p.items[0].expr.func == "AVG":
+            sq.float_avg = True
 
 
 def lookup_alias(aliases, name):
@@ -1307,6 +1844,9 @@ def truth(v):
 
 def evaluate(node, row, group=None):
     if isinstance(node, Col):
+        if node.outer:
+            orow = OUTER[node.level] if node.level < len(OUTER) else None
+            return None if orow is None else orow[node.idx]
         if row is None:
             return None
         return row[node.idx]
@@ -1389,10 +1929,161 @@ def evaluate(node, row, group=None):
         if saw_null:
             return None
         return node.negate
+    if isinstance(node, Arith):
+        return arith(node.op, evaluate(node.left, row, group), evaluate(node.right, row, group))
+    if isinstance(node, Neg):
+        v = evaluate(node.item, row, group)
+        if v is None:
+            return None
+        n = to_num(v)
+        if n is None:
+            raise QueryError("Cannot negate non-numeric value %r" % (v,))
+        return -n
+    if isinstance(node, Between):
+        v = evaluate(node.expr, row, group)
+        lo = compare(v, evaluate(node.lo, row, group))
+        hi = compare(v, evaluate(node.hi, row, group))
+        a = None if lo is None else lo >= 0
+        b = None if hi is None else hi <= 0
+        if a is False or b is False:
+            res = False
+        elif a is None or b is None:
+            return None
+        else:
+            res = True
+        return (not res) if node.negate else res
+    if isinstance(node, Case):
+        if node.operand is not None:
+            base = evaluate(node.operand, row, group)
+            for c, r in zip(node.conds, node.results):
+                if compare(base, evaluate(c, row, group)) == 0:
+                    return evaluate(r, row, group)
+        else:
+            for c, r in zip(node.conds, node.results):
+                if truth(evaluate(c, row, group)) is True:
+                    return evaluate(r, row, group)
+        return evaluate(node.default, row, group) if node.default is not None else None
+    if isinstance(node, Func):
+        return eval_func(node, row, group)
+    if isinstance(node, Cast):
+        return eval_cast(evaluate(node.expr, row, group), node.typ)
+    if isinstance(node, SubqueryExpr):
+        return eval_subquery(node, row, group)
     raise QueryError("Cannot evaluate expression")
 
 
+def arith(op, a, b):
+    if a is None or b is None:
+        return None
+    if op == "||":
+        return to_str(a) + to_str(b)
+    na, nb = to_num(a), to_num(b)
+    if na is None or nb is None:
+        bad = a if na is None else b
+        raise QueryError("Arithmetic operator '%s' requires numeric values, found %r" % (op, bad))
+    if isinstance(na, int) and isinstance(nb, int) and op in ("+", "-", "*"):
+        return na + nb if op == "+" else (na - nb if op == "-" else na * nb)
+    da, db = Decimal(na), Decimal(nb)
+    if op == "+":
+        return da + db
+    if op == "-":
+        return da - db
+    if op == "*":
+        return da * db
+    if db == 0:
+        return None
+    if op == "%":
+        r = da % db
+        return int(r) if isinstance(na, int) and isinstance(nb, int) else r
+    from decimal import localcontext
+    with localcontext() as ctx:
+        ctx.prec = 15
+        q = da / db
+    q = q.normalize()
+    return Decimal(0) if q == 0 else q
+
+
+def eval_func(node, row, group):
+    name = node.name
+    args = [evaluate(a, row, group) for a in node.args]
+    if name in ("COALESCE", "IFNULL"):
+        for v in args:
+            if v is not None:
+                return v
+        return None
+    if name == "NULLIF":
+        return None if compare(args[0], args[1]) == 0 else args[0]
+    if name == "CONCAT":
+        return "".join(to_str(v) for v in args if v is not None)
+    if args[0] is None:
+        return None
+    v = args[0]
+    if name in ("UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "LENGTH", "LEN"):
+        s = to_str(v)
+        return {"UPPER": s.upper, "LOWER": s.lower, "TRIM": s.strip, "LTRIM": s.lstrip,
+                "RTRIM": s.rstrip, "LENGTH": lambda: len(s), "LEN": lambda: len(s)}[name]()
+    if name == "REPLACE":
+        if args[1] is None or args[2] is None:
+            return None
+        return to_str(v).replace(to_str(args[1]), to_str(args[2]))
+    if name in ("SUBSTR", "SUBSTRING"):
+        s = to_str(v)
+        if any(a is None for a in args[1:]):
+            return None
+        start = int(to_num(args[1]) or 0)
+        begin = max(start - 1, 0)
+        if len(args) > 2:
+            ln = int(to_num(args[2]) or 0)
+            end = start - 1 + ln
+            return s[begin:max(end, begin)]
+        return s[begin:]
+    n = to_num(v)
+    if n is None:
+        raise QueryError("%s() requires a numeric value, found %r" % (name, v))
+    if name == "ABS":
+        return abs(n)
+    if name == "FLOOR":
+        import math
+        return int(math.floor(Decimal(n)))
+    if name in ("CEIL", "CEILING"):
+        import math
+        return int(math.ceil(Decimal(n)))
+    if name == "ROUND":
+        from decimal import ROUND_HALF_UP
+        digits = 0
+        if len(args) > 1:
+            if args[1] is None:
+                return None
+            digits = int(to_num(args[1]) or 0)
+        if isinstance(n, int) and digits >= 0:
+            return n
+        q = Decimal(n).quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP)
+        return q
+    raise QueryError("Unsupported function: %s" % name)
+
+
+def eval_cast(v, typ):
+    if v is None:
+        return None
+    base = typ.split()[0]
+    if base in ("INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT"):
+        n = to_num(v)
+        if n is None:
+            raise QueryError("Cannot cast %r to %s" % (v, typ))
+        return int(n)
+    if base in ("REAL", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"):
+        n = to_num(v)
+        if n is None:
+            raise QueryError("Cannot cast %r to %s" % (v, typ))
+        return Decimal(n)
+    if base in ("TEXT", "VARCHAR", "CHAR", "STRING"):
+        return to_str(v)
+    raise QueryError("Unsupported CAST type: %s" % typ)
+
+
 def eval_agg(node, group):
+    if node.filter is not None:
+        group = [r for r in group if truth(evaluate(node.filter, r)) is True]
     if node.func == "COUNT" and node.arg is None:
         return len(group)
     vals = [evaluate(node.arg, r) for r in group]
@@ -1613,11 +2304,17 @@ def compute_partition(w, ctxs, part, ovals, values):
     lo, hi = frame_bounds(w, part, ovals, starts, ends)
     lo = [max(0, v) for v in lo]
     hi = [min(m - 1, v) for v in hi]
-    if func == "COUNT" and w.arg is None:
+    if func == "COUNT" and w.arg is None and w.filter is None:
         for x in range(m):
             values[part[x]] = max(0, hi[x] - lo[x] + 1)
         return
-    args = [evaluate(w.arg, ctxs[i][0], ctxs[i][1]) for i in part]
+    if w.arg is None:
+        args = [1] * m
+    else:
+        args = [evaluate(w.arg, ctxs[i][0], ctxs[i][1]) for i in part]
+    if w.filter is not None:
+        keep = [truth(evaluate(w.filter, ctxs[i][0], ctxs[i][1])) is True for i in part]
+        args = [a if k else None for a, k in zip(args, keep)]
     if func in ("COUNT", "SUM", "AVG"):
         cnt = [0] * (m + 1)
         tot = [Decimal(0)] * (m + 1)
@@ -1682,6 +2379,10 @@ def compute_partition(w, ctxs, part, ovals, values):
 # Execution
 # ---------------------------------------------------------------------------
 
+OUTER = []      # OUTER[level] = current row of the enclosing query at that level
+_EPOCH = [0]    # bumped whenever CTE contents change; invalidates subquery caches
+
+
 def resolve_table_name(tables, parts):
     name = ".".join(parts)
     if name in tables:
@@ -1696,9 +2397,611 @@ def resolve_table_name(tables, parts):
     raise QueryError("Unknown table '%s'" % name)
 
 
+class Env:
+    """Per-execution state: discovered tables and a cache of loaded data."""
+
+    def __init__(self, tables, has_with=False):
+        self.tables = tables
+        self.has_with = has_with
+        self.cache = {}
+
+    def has_table(self, lname):
+        try:
+            resolve_table_name(self.tables, [lname])
+            return True
+        except QueryError:
+            return False
+
+    def load(self, name):
+        if name not in self.cache:
+            self.cache[name] = load_table(self.tables[name], name)
+        return self.cache[name]
+
+
+# -- subquery evaluation --------------------------------------------------------
+
+def eval_subquery(sq, row, group):
+    left = None
+    if sq.kind in ("IN", "ANY", "ALL"):
+        left = evaluate(sq.expr, row, group)
+    lv = sq.level - 1
+    saved = OUTER[lv:]
+    del OUTER[lv:]
+    while len(OUTER) < lv:
+        OUTER.append(None)
+    OUTER.append(row)
+    try:
+        if sq.epoch != _EPOCH[0]:
+            sq.cache = {}
+            sq.epoch = _EPOCH[0]
+        key = []
+        for l, i in sorted(sq.refs):
+            orow = OUTER[l] if l < len(OUTER) else None
+            key.append(group_key(None if orow is None else orow[i]))
+        key = tuple(key)
+        if key in sq.cache:
+            res = sq.cache[key]
+        else:
+            rows = sq.plan.run()
+            if sq.kind == "SCALAR":
+                if len(rows) > 1:
+                    raise SubqueryError("SCALAR_SUBQUERY_MULTIPLE_ROWS",
+                                        "Scalar subquery returned %d rows (expected at most one)" % len(rows))
+                res = rows[0][0] if rows else None
+                if sq.float_avg and sq.refs and isinstance(res, Decimal):
+                    res = FloatDec(res)
+            elif sq.kind == "EXISTS":
+                res = bool(rows)
+            else:
+                vals = [r[0] for r in rows]
+                keys = set(eq_key(v) for v in vals if v is not None)
+                res = (vals, keys, any(v is None for v in vals))
+            sq.cache[key] = res
+    finally:
+        del OUTER[lv:]
+        OUTER.extend(saved)
+    if sq.kind == "SCALAR":
+        return res
+    if sq.kind == "EXISTS":
+        return (not res) if sq.negate else res
+    vals, keys, has_null = res
+    if sq.kind == "IN":
+        if not vals:
+            out = False
+        elif left is None:
+            out = None
+        elif eq_key(left) in keys:
+            out = True
+        else:
+            out = True if any(compare(left, v) == 0 for v in vals if v is not None) else \
+                (None if has_null else False)
+        if sq.negate:
+            return None if out is None else (not out)
+        return out
+    # ANY / ALL
+    tmp = Cmp(sq.op, Lit(left), Lit(None))
+    results = []
+    for v in vals:
+        tmp.right = Lit(v)
+        results.append(evaluate(tmp, None))
+    if sq.kind == "ANY":
+        if any(r is True for r in results):
+            return True
+        return None if any(r is None for r in results) else False
+    if any(r is False for r in results):
+        return False
+    return None if any(r is None for r in results) else True
+
+
+# -- CTEs -------------------------------------------------------------------------
+
+class CTE:
+    def __init__(self, name):
+        self.name = name
+        self.names = None
+        self.plan = None       # non-recursive body
+        self.anchors = []      # recursive: anchor member plans
+        self.recs = []         # recursive: recursive member plans
+        self.union_all = True
+        self.rows = None
+        self.working = None
+        self.computing = False
+
+    def get_rows(self):
+        if self.working is not None:
+            return self.working
+        if self.rows is None:
+            if self.computing:
+                raise CTEError("CYCLIC_REFERENCE", "CTE '%s' depends on itself" % self.name)
+            self.computing = True
+            try:
+                self.rows = self.compute()
+            finally:
+                self.computing = False
+        return self.rows
+
+    def compute(self):
+        if not self.recs:
+            return self.plan.run()
+        seen = set()
+
+        def add(rows):
+            if self.union_all:
+                return list(rows)
+            out = []
+            for r in rows:
+                k = tuple(group_key(v) for v in r)
+                if k not in seen:
+                    seen.add(k)
+                    out.append(r)
+            return out
+        working = []
+        for p in self.anchors:
+            working += add(p.run())
+        result = list(working)
+        iterations = 0
+        while working:
+            if iterations >= MAX_RECURSION:
+                raise CTEError("RECURSIVE_DEPTH_EXCEEDED",
+                               "Recursive CTE '%s' exceeded the maximum recursion depth of %d"
+                               % (self.name, MAX_RECURSION))
+            iterations += 1
+            self.working = working
+            _EPOCH[0] += 1
+            try:
+                new = []
+                for p in self.recs:
+                    new += p.run()
+            finally:
+                self.working = None
+                _EPOCH[0] += 1
+            working = add(new)
+            result += working
+        return result
+
+
+def union_terms(q):
+    """Flatten a left-deep chain of UNION [ALL] into (terms, all_flags)."""
+    if isinstance(q, SetQuery) and q.op == "UNION" and not q.order_by and q.limit is None \
+            and q.offset is None:
+        terms, flags = union_terms(q.left)
+        return terms + [q.right], flags + [q.all]
+    return [q], []
+
+
+def plan_cte(d, ctx, recursive):
+    lname = d.name.lower()
+    obj = CTE(d.name)
+    if recursive and lname in query_refs(d.query):
+        terms, flags = union_terms(d.query)
+        if not flags:
+            raise CTEError("INVALID_CTE_SYNTAX",
+                           "Recursive CTE '%s' must have the form <anchor> UNION [ALL] <recursive member>"
+                           % d.name)
+        anchors = [t for t in terms if lname not in query_refs(t)]
+        recs = [t for t in terms if lname in query_refs(t)]
+        if not anchors:
+            raise CTEError("INVALID_CTE_SYNTAX", "Recursive CTE '%s' has no non-recursive anchor member"
+                           % d.name)
+        aplans = [plan_query(t, ctx) for t in anchors]
+        ncols = len(aplans[0].names)
+        if any(len(p.names) != ncols for p in aplans):
+            raise CTEError("INVALID_CTE_SYNTAX", "Members of recursive CTE '%s' have different numbers "
+                           "of columns" % d.name)
+        names = d.columns or aplans[0].names
+        if len(names) != ncols:
+            raise CTEError("INVALID_CTE_SYNTAX", "CTE '%s' has %d columns but %d column names were "
+                           "specified" % (d.name, ncols, len(names)))
+        obj.names = list(names)
+        ctes = dict(ctx.ctes)
+        ctes[lname] = obj
+        rctx = ctx.derive(ctes=ctes)
+        rplans = [plan_query(t, rctx) for t in recs]
+        if any(len(p.names) != ncols for p in rplans):
+            raise CTEError("INVALID_CTE_SYNTAX", "Recursive member of CTE '%s' returns a different number "
+                           "of columns than the anchor member" % d.name)
+        obj.anchors, obj.recs = aplans, rplans
+        obj.union_all = all(flags)
+        return obj
+    p = plan_query(d.query, ctx)
+    names = d.columns or p.names
+    if len(names) != len(p.names):
+        raise CTEError("INVALID_CTE_SYNTAX", "CTE '%s' has %d columns but %d column names were specified"
+                       % (d.name, len(p.names), len(names)))
+    obj.plan = p
+    obj.names = list(names)
+    return obj
+
+
+class WithPlan:
+    def __init__(self, w, ctx):
+        env = ctx.env
+        defs = w.ctes
+        lnames = [d.name.lower() for d in defs]
+        index = {n: i for i, n in enumerate(lnames)}
+        refs = [query_refs(d.query) & set(lnames) for d in defs]
+        edges = [[index[r] for r in refs[i] if index[r] != i] for i in range(len(defs))]
+
+        def reaches(src, target):
+            stack, seen = [src], set()
+            while stack:
+                x = stack.pop()
+                if x == target:
+                    return True
+                if x in seen:
+                    continue
+                seen.add(x)
+                stack.extend(edges[x])
+            return False
+
+        ctes = dict(ctx.ctes)
+        self.ctes = []
+        if not w.recursive:
+            for i, d in enumerate(defs):
+                if lnames[i] in refs[i] and not env.has_table(lnames[i]):
+                    raise CTEError("CYCLIC_REFERENCE", "CTE '%s' references itself (use WITH RECURSIVE)"
+                                   % d.name)
+                for j in range(i + 1, len(defs)):
+                    if lnames[j] in refs[i] and not env.has_table(lnames[j]):
+                        if reaches(j, i):
+                            raise CTEError("CYCLIC_REFERENCE", "CTEs '%s' and '%s' reference each other"
+                                           % (d.name, defs[j].name))
+                        raise CTEError("CTE_NOT_FOUND", "CTE '%s' is referenced by '%s' before it is defined"
+                                       % (defs[j].name, d.name))
+                obj = plan_cte(d, ctx.derive(ctes=ctes), False)
+                ctes = dict(ctes)
+                ctes[lnames[i]] = obj
+                self.ctes.append(obj)
+        else:
+            # reject cycles between distinct CTEs, then plan in dependency order
+            state = [0] * len(defs)
+            order = []
+
+            def visit(i, path):
+                if state[i] == 2:
+                    return
+                if state[i] == 1:
+                    cyc = path[path.index(i):] + [i]
+                    raise CTEError("CYCLIC_REFERENCE", "Cyclic reference between CTEs: %s"
+                                   % " -> ".join(defs[k].name for k in cyc))
+                state[i] = 1
+                for j in sorted(edges[i]):
+                    visit(j, path + [i])
+                state[i] = 2
+                order.append(i)
+            for i in range(len(defs)):
+                visit(i, [])
+            for i in order:
+                obj = plan_cte(defs[i], ctx.derive(ctes=ctes), True)
+                ctes = dict(ctes)
+                ctes[lnames[i]] = obj
+                self.ctes.append(obj)
+        self.body = plan_query(w.body, ctx.derive(ctes=ctes))
+        self.names = self.body.names
+
+    def run(self):
+        for c in self.ctes:
+            c.rows = None
+        _EPOCH[0] += 1
+        return self.body.run()
+
+
+# -- planning -----------------------------------------------------------------------
+
+def plan_query(q, ctx):
+    if isinstance(q, With):
+        return WithPlan(q, ctx)
+    if isinstance(q, SetQuery):
+        return SetPlan(q, ctx)
+    return SelectPlan(q, ctx)
+
+
+def sort_results(results, specs):
+    """Stable multi-key sort of (output_values, order_values) pairs.
+    specs[i] = (desc, nulls) for order value i."""
+    for i in range(len(specs) - 1, -1, -1):
+        desc, nulls = specs[i]
+        nulls_first = (not desc) if nulls is None else nulls == "FIRST"
+        nonnull = [x for x in results if x[1][i] is not None]
+        nulls_part = [x for x in results if x[1][i] is None]
+        nonnull.sort(key=lambda x: sort_key(x[1][i]), reverse=desc)
+        results = nulls_part + nonnull if nulls_first else nonnull + nulls_part
+    return results
+
+
+def dedupe(rows):
+    seen = set()
+    out = []
+    for r in rows:
+        k = tuple(group_key(v) for v in r)
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
+
+
+class SetPlan:
+    def __init__(self, q, ctx):
+        self.q = q
+        self.left = plan_query(q.left, ctx)
+        self.right = plan_query(q.right, ctx) if q.right is not None else None
+        self.names = list(self.left.names)
+        if self.right is not None and len(self.right.names) != len(self.names):
+            raise QueryError("Each %s query must have the same number of columns (%d vs %d)"
+                             % (q.op, len(self.names), len(self.right.names)))
+        self.order = []
+        for oi in q.order_by:
+            e = oi.expr
+            idx = None
+            if isinstance(e, Lit) and isinstance(e.value, int):
+                if not 1 <= e.value <= len(self.names):
+                    raise QueryError("ORDER BY position %d is out of range" % e.value)
+                idx = e.value - 1
+            elif isinstance(e, Col):
+                name = e.parts[-1]
+                hits = [i for i, n in enumerate(self.names) if n == name]
+                if not hits:
+                    hits = [i for i, n in enumerate(self.names) if n.lower() == name.lower()]
+                if hits:
+                    idx = hits[0]
+            if idx is None:
+                raise QueryError("ORDER BY term of a set operation must be an output column name "
+                                 "or position")
+            self.order.append((idx, oi.desc, oi.nulls))
+
+    def run(self):
+        q = self.q
+        left = self.left.run()
+        if self.right is None:
+            rows = list(left)
+        else:
+            right = self.right.run()
+            if q.op == "UNION":
+                rows = left + right if q.all else dedupe(left + right)
+            else:
+                from collections import Counter
+                rkeys = Counter(tuple(group_key(v) for v in r) for r in right)
+                rows = []
+                for r in left:
+                    k = tuple(group_key(v) for v in r)
+                    if q.op == "INTERSECT":
+                        if rkeys[k] > 0:
+                            rows.append(r)
+                            if q.all:
+                                rkeys[k] -= 1
+                    else:
+                        if rkeys[k] > 0:
+                            if q.all:
+                                rkeys[k] -= 1
+                        else:
+                            rows.append(r)
+                if not q.all:
+                    rows = dedupe(rows)
+        if self.order:
+            res = sort_results([(r, [r[i] for i, _, _ in self.order]) for r in rows],
+                               [(d, n) for _, d, n in self.order])
+            rows = [r[0] for r in res]
+        if q.offset:
+            rows = rows[q.offset:]
+        if q.limit is not None:
+            rows = rows[:q.limit]
+        return rows
+
+
+class SelectPlan:
+    def __init__(self, q, ctx):
+        self.q = q
+        self.ctx = ctx
+        scope = Scope()
+        self.sources = []   # (fetch, width, join kind, on)
+        if q.table is None:
+            self.sources.append((lambda: [[]], 0, None, None))
+        else:
+            fetch, name, alias, cols, derived = self.plan_from(q.table)
+            scope.add(name, alias, cols, derived)
+            self.sources.append((fetch, len(cols), None, None))
+            for j in q.joins:
+                fetch, name, alias, cols, derived = self.plan_from(j.table)
+                scope.add(name, alias, cols, derived)
+                on = Resolver(ctx, scope.copy()).resolve(j.on) if j.on is not None else None
+                self.sources.append((fetch, len(cols), j.kind, on))
+        rs = Resolver(ctx, scope)
+        self.scope = scope
+
+        # Expand select list
+        items = []
+        for it in q.select:
+            if isinstance(it.expr, Star):
+                if it.expr.qualifier is None:
+                    tlist = scope.tables
+                    if q.table is None:
+                        raise QueryError("SELECT * requires a FROM clause")
+                else:
+                    t = scope.find_table(it.expr.qualifier)
+                    if t is None:
+                        if ctx.in_sub or scope.has_derived:
+                            raise SubqueryError("INVALID_SUBQUERY_REFERENCE",
+                                                "Unknown table or alias '%s'" % it.expr.qualifier)
+                        raise QueryError("Unknown table or alias '%s'" % it.expr.qualifier)
+                    tlist = [t]
+                for t in tlist:
+                    for ci, cname in enumerate(t["columns"]):
+                        c = Col([cname])
+                        c.idx = t["offset"] + ci
+                        items.append(SelectItem(c, None, cname))
+            else:
+                it.expr = rs.resolve(it.expr)
+                items.append(it)
+        self.items = items
+        self.names = [output_name(it) for it in items]
+        aliases = {}
+        for it in items:
+            if it.alias is not None:
+                aliases.setdefault(it.alias, it.expr)
+
+        self.where = rs.resolve(q.where) if q.where is not None else None
+        group_by = [rs.resolve(g, aliases) for g in q.group_by]
+        for g in group_by:
+            if contains_agg(g):
+                raise QueryError("Aggregate functions are not allowed in GROUP BY")
+        self.group_by = group_by
+        self.having = rs.resolve(q.having, aliases) if q.having is not None else None
+
+        # ORDER BY: map to output column index or expression
+        order = []
+        for oi in q.order_by:
+            e = oi.expr
+            target = None
+            if isinstance(e, Lit) and isinstance(e.value, int) and not isinstance(e.value, bool):
+                if not 1 <= e.value <= len(items):
+                    raise QueryError("ORDER BY position %d is out of range" % e.value)
+                target = ("out", e.value - 1)
+            elif isinstance(e, Col) and len(e.parts) == 1:
+                matches = [i for i, it in enumerate(items) if it.alias is not None and it.alias == e.parts[0]]
+                if not matches:
+                    matches = [i for i, it in enumerate(items)
+                               if it.alias is not None and it.alias.lower() == e.parts[0].lower()]
+                if len(matches) == 1:
+                    target = ("out", matches[0])
+            if target is None:
+                target = ("expr", rs.resolve(e, aliases))
+            order.append((target, oi.desc, oi.nulls))
+        self.order = order
+
+        self.is_agg = bool(group_by) or self.having is not None or \
+            any(contains_agg(it.expr) for it in items) or \
+            any(t[0] == "expr" and contains_agg(t[1]) for t, _, _ in order)
+        if self.is_agg:
+            grouped_idx = set()
+            for g in group_by:
+                if isinstance(g, Col) and not g.outer:
+                    grouped_idx.add(g.idx)
+
+            def validate(node, where_txt):
+                if isinstance(node, Agg):
+                    return
+                for gexpr in group_by:
+                    if same_expr(node, gexpr):
+                        return
+                if isinstance(node, Col):
+                    if not node.outer and node.idx not in grouped_idx:
+                        raise QueryError("Column '%s' must appear in the GROUP BY clause or be used in an "
+                                         "aggregate function (%s)" % (".".join(node.parts), where_txt))
+                    return
+                for c in children(node):
+                    validate(c, where_txt)
+
+            for it in items:
+                validate(it.expr, "SELECT")
+            if self.having is not None:
+                validate(self.having, "HAVING")
+            for t, _, _ in order:
+                if t[0] == "expr":
+                    validate(t[1], "ORDER BY")
+
+        windows = []
+        seen_w = set()
+        exprs = [it.expr for it in items] + [t[1] for t, _, _ in order if t[0] == "expr"]
+        for e in exprs:
+            for nd in walk(e):
+                if isinstance(nd, Window) and id(nd) not in seen_w:
+                    seen_w.add(id(nd))
+                    windows.append(nd)
+        self.windows = windows
+
+    def plan_from(self, tref):
+        ctx = self.ctx
+        if isinstance(tref, DerivedRef):
+            p = plan_query(tref.query, ctx.derive(in_sub=True))
+            cols = tref.columns or p.names
+            if len(cols) != len(p.names):
+                raise SubqueryError("INVALID_SUBQUERY_REFERENCE",
+                                    "Derived table '%s' has %d columns but %d column names were specified"
+                                    % (tref.alias, len(p.names), len(cols)))
+            return p.run, tref.alias, tref.alias, list(cols), True
+        if len(tref.name) == 1 and tref.name[0].lower() in ctx.ctes:
+            c = ctx.ctes[tref.name[0].lower()]
+            return c.get_rows, c.name, tref.alias, c.names, False
+        env = ctx.env
+        try:
+            name = resolve_table_name(env.tables, tref.name)
+        except QueryError:
+            if env.has_with:
+                raise CTEError("CTE_NOT_FOUND", "Table or CTE '%s' not found" % ".".join(tref.name))
+            raise
+        header, _ = env.load(name)
+        return (lambda: env.load(name)[1]), name, tref.alias, header, False
+
+    def run(self):
+        saved = _CUR_CTX[0]
+        try:
+            return self._run()
+        finally:
+            _CUR_CTX[0] = saved
+
+    def _run(self):
+        q = self.q
+        fetch, width, _, _ = self.sources[0]
+        rows = fetch()
+        for fetch, w, kind, on in self.sources[1:]:
+            rows = do_join(rows, width, fetch(), w, kind, on)
+            width += w
+        if self.where is not None:
+            where = self.where
+            rows = [r for r in rows if truth(evaluate(where, r)) is True]
+        items, order, group_by, having = self.items, self.order, self.group_by, self.having
+
+        if self.is_agg:
+            groups = {}
+            gorder = []
+            if group_by:
+                for r in rows:
+                    k = tuple(group_key(evaluate(g, r)) for g in group_by)
+                    if k not in groups:
+                        groups[k] = []
+                        gorder.append(k)
+                    groups[k].append(r)
+                # deterministic order: sort by the group key values
+                gorder.sort(key=lambda k: tuple(sort_key(evaluate(g, groups[k][0])) for g in group_by))
+                glist = [groups[k] for k in gorder]
+            else:
+                glist = [rows]
+            ctxs = []
+            for grp in glist:
+                rep = grp[0] if grp else None
+                if having is not None and truth(evaluate(having, rep, grp)) is not True:
+                    continue
+                ctxs.append((rep, grp))
+        else:
+            ctxs = [(r, None) for r in rows]
+
+        seq = list(range(len(ctxs)))
+        for w in self.windows:
+            seq = compute_window(w, ctxs, seq)
+        results = []
+        for ci in seq:
+            rep, grp = ctxs[ci]
+            _CUR_CTX[0] = ci
+            outv = [evaluate(it.expr, rep, grp) for it in items]
+            ordv = [outv[t[1]] if t[0] == "out" else evaluate(t[1], rep, grp) for t, _, _ in order]
+            results.append((outv, ordv))
+        _CUR_CTX[0] = None
+
+        results = sort_results(results, [(d, n) for _, d, n in order])
+        out_rows = [r[0] for r in results]
+        if q.distinct:
+            out_rows = dedupe(out_rows)
+        if q.offset:
+            out_rows = out_rows[q.offset:]
+        if q.limit is not None:
+            out_rows = out_rows[:q.limit]
+        return out_rows
+
+
 def simple_equi(on, left_scope_width):
     """If ON is col = col across both sides, return (left_idx, right_idx)."""
-    if isinstance(on, Cmp) and on.op == "=" and isinstance(on.left, Col) and isinstance(on.right, Col):
+    if isinstance(on, Cmp) and on.op == "=" and isinstance(on.left, Col) and isinstance(on.right, Col) \
+            and not on.left.outer and not on.right.outer:
         a, b = on.left.idx, on.right.idx
         if a < left_scope_width <= b:
             return a, b
@@ -1754,211 +3057,44 @@ def output_name(item):
     return item.text
 
 
-def execute(q, data_dir, sharded=None):
+def execute(q, data_dir, sharded=None, has_with=False):
     tables = discover_tables(data_dir) if data_dir else {}
     for sname, pattern in (sharded or {}).items():
         # sharded tables take precedence over discovered tables of the same name
         for t in [t for t in tables if t.lower() == sname.lower()]:
             del tables[t]
         tables[sname] = expand_shards(sname, pattern, data_dir)
-    scope = Scope()
-
-    def load(tref):
-        name = resolve_table_name(tables, tref.name)
-        header, rows = load_table(tables[name], name)
-        return name, header, rows
-
-    name, header, rows = load(q.table)
-    scope.add(name, q.table.alias, header)
-    for j in q.joins:
-        jname, jheader, jrows = load(j.table)
-        left_width = scope.width
-        scope.add(jname, j.table.alias, jheader)
-        if j.on is not None:
-            j.on = resolve_expr(j.on, scope.copy())
-        rows = do_join(rows, left_width, jrows, len(jheader), j.kind, j.on)
-
-    # Expand select list
-    items = []
-    for it in q.select:
-        if isinstance(it.expr, Star):
-            if it.expr.qualifier is None:
-                tlist = scope.tables
-            else:
-                t = scope.find_table(it.expr.qualifier)
-                if t is None:
-                    raise QueryError("Unknown table or alias '%s'" % it.expr.qualifier)
-                tlist = [t]
-            for t in tlist:
-                for ci, cname in enumerate(t["columns"]):
-                    c = Col([cname])
-                    c.idx = t["offset"] + ci
-                    items.append(SelectItem(c, None, cname))
-        else:
-            it.expr = resolve_expr(it.expr, scope)
-            items.append(it)
-
-    names = [output_name(it) for it in items]
-    aliases = {}
-    for it in items:
-        if it.alias is not None:
-            aliases.setdefault(it.alias, it.expr)
-
-    if q.where is not None:
-        where = resolve_expr(q.where, scope)
-        rows = [r for r in rows if truth(evaluate(where, r)) is True]
-
-    group_by = [resolve_expr(g, scope, aliases) for g in q.group_by]
-    for g in group_by:
-        if contains_agg(g):
-            raise QueryError("Aggregate functions are not allowed in GROUP BY")
-    having = resolve_expr(q.having, scope, aliases) if q.having is not None else None
-
-    # ORDER BY: map to output column index or expression
-    order = []
-    for oi in q.order_by:
-        e = oi.expr
-        target = None
-        if isinstance(e, Lit) and isinstance(e.value, int) and not isinstance(e.value, bool):
-            if not 1 <= e.value <= len(items):
-                raise QueryError("ORDER BY position %d is out of range" % e.value)
-            target = ("out", e.value - 1)
-        elif isinstance(e, Col) and len(e.parts) == 1:
-            matches = [i for i, it in enumerate(items) if it.alias is not None and it.alias == e.parts[0]]
-            if not matches:
-                matches = [i for i, it in enumerate(items)
-                           if it.alias is not None and it.alias.lower() == e.parts[0].lower()]
-            if len(matches) == 1:
-                target = ("out", matches[0])
-        if target is None:
-            target = ("expr", resolve_expr(e, scope, aliases))
-        order.append((target, oi.desc, oi.nulls))
-
-    is_agg = bool(group_by) or having is not None or any(contains_agg(it.expr) for it in items) or \
-        any(t[0] == "expr" and contains_agg(t[1]) for t, _, _ in order)
-
-    results = []  # list of (output_values, order_values)
-    if is_agg:
-        grouped_idx = set()
-        for g in group_by:
-            if isinstance(g, Col):
-                grouped_idx.add(g.idx)
-
-        def validate(node, where_txt):
-            if isinstance(node, Agg):
-                return
-            for gexpr in group_by:
-                if same_expr(node, gexpr):
-                    return
-            if isinstance(node, Col):
-                if node.idx not in grouped_idx:
-                    raise QueryError("Column '%s' must appear in the GROUP BY clause or be used in an "
-                                     "aggregate function (%s)" % (".".join(node.parts), where_txt))
-                return
-            for c in children(node):
-                validate(c, where_txt)
-
-        for it in items:
-            validate(it.expr, "SELECT")
-        if having is not None:
-            validate(having, "HAVING")
-        for t, _, _ in order:
-            if t[0] == "expr":
-                validate(t[1], "ORDER BY")
-
-        groups = {}
-        gorder = []
-        if group_by:
-            for r in rows:
-                k = tuple(group_key(evaluate(g, r)) for g in group_by)
-                if k not in groups:
-                    groups[k] = []
-                    gorder.append(k)
-                groups[k].append(r)
-            # deterministic order: sort by the group key values
-            gorder.sort(key=lambda k: tuple(sort_key(evaluate(g, groups[k][0])) for g in group_by))
-            glist = [groups[k] for k in gorder]
-        else:
-            glist = [rows]
-        ctxs = []
-        for grp in glist:
-            rep = grp[0] if grp else None
-            if having is not None and truth(evaluate(having, rep, grp)) is not True:
-                continue
-            ctxs.append((rep, grp))
-    else:
-        ctxs = [(r, None) for r in rows]
-
-    windows = []
-    seen_w = set()
-    exprs = [it.expr for it in items] + [t[1] for t, _, _ in order if t[0] == "expr"]
-    for e in exprs:
-        for nd in walk(e):
-            if isinstance(nd, Window) and id(nd) not in seen_w:
-                seen_w.add(id(nd))
-                windows.append(nd)
-    seq = list(range(len(ctxs)))
-    for w in windows:
-        seq = compute_window(w, ctxs, seq)
-    for ci in seq:
-        rep, grp = ctxs[ci]
-        _CUR_CTX[0] = ci
-        outv = [evaluate(it.expr, rep, grp) for it in items]
-        ordv = [outv[t[1]] if t[0] == "out" else evaluate(t[1], rep, grp) for t, _, _ in order]
-        results.append((outv, ordv))
-    _CUR_CTX[0] = None
-
-    # sort (stable, last key first)
-    for i in range(len(order) - 1, -1, -1):
-        _, desc, nulls = order[i]
-        if nulls is None:
-            nulls_first = not desc
-        else:
-            nulls_first = nulls == "FIRST"
-        nonnull = [x for x in results if x[1][i] is not None]
-        nulls_part = [x for x in results if x[1][i] is None]
-        nonnull.sort(key=lambda x: sort_key(x[1][i]), reverse=desc)
-        if desc:
-            # keep stability for equal keys under reverse sort
-            nonnull = stable_desc(nonnull, i)
-        results = nulls_part + nonnull if nulls_first else nonnull + nulls_part
-
-    out_rows = [r[0] for r in results]
-    if q.distinct:
-        seen = set()
-        uniq = []
-        for r in out_rows:
-            k = tuple(group_key(v) for v in r)
-            if k not in seen:
-                seen.add(k)
-                uniq.append(r)
-        out_rows = uniq
-    if q.offset:
-        out_rows = out_rows[q.offset:]
-    if q.limit is not None:
-        out_rows = out_rows[:q.limit]
-    return names, out_rows
-
-
-def stable_desc(lst, i):
-    # Python's sort with reverse=True is already stable for equal elements,
-    # this function exists for clarity and returns the list unchanged.
-    return lst
+    del OUTER[:]
+    env = Env(tables, has_with)
+    plan = plan_query(q, Ctx(env))
+    rows = plan.run()
+    return plan.names, rows
 
 
 def same_expr(a, b):
     if type(a) is not type(b):
         return False
     if isinstance(a, Col):
-        return a.idx == b.idx
+        return a.idx == b.idx and a.level == b.level
     if isinstance(a, Lit):
         return a.value == b.value and type(a.value) is type(b.value)
+    if isinstance(a, SubqueryExpr):
+        return a is b
     if isinstance(a, Agg):
-        return a.func == b.func and a.distinct == b.distinct and \
-            ((a.arg is None and b.arg is None) or (a.arg is not None and b.arg is not None and same_expr(a.arg, b.arg)))
-    if isinstance(a, (Cmp, BoolOp)) and a.op != b.op:
+        if a.func != b.func or a.distinct != b.distinct:
+            return False
+    if isinstance(a, Window):
+        return a is b
+    if isinstance(a, (Cmp, BoolOp, Arith)) and a.op != b.op:
         return False
-    if isinstance(a, (Like, IsNull, InList)) and a.negate != b.negate:
+    if isinstance(a, Func) and a.name != b.name:
+        return False
+    if isinstance(a, Cast) and a.typ != b.typ:
+        return False
+    if isinstance(a, (Like, IsNull, InList, Between)) and a.negate != b.negate:
+        return False
+    if isinstance(a, Case) and ((a.operand is None) != (b.operand is None)
+                                or (a.default is None) != (b.default is None)):
         return False
     ca, cb = children(a), children(b)
     return len(ca) == len(cb) and all(same_expr(x, y) for x, y in zip(ca, cb))
@@ -2022,8 +3158,9 @@ def main(argv=None):
             raise QueryError("Data directory not found: %s" % args.data)
         sharded = parse_sharded(args.sharded)
         sql = read_sql(args.sql)
-        q = Parser(sql).parse()
-        names, rows = execute(q, args.data, sharded)
+        parser = Parser(sql)
+        q = parser.parse()
+        names, rows = execute(q, args.data, sharded, parser.saw_with)
         print(to_markdown(names, rows))
         if args.out:
             write_csv(args.out, names, rows)
