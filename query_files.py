@@ -753,7 +753,8 @@ def load_delimited(text, name, delim, kind):
             header = row
             break
     if header is None:
-        raise QueryError("Invalid %s file for table '%s': missing header" % (kind, name))
+        # empty file: no schema, no rows
+        return None, []
     header = [h.strip() for h in header]
     if any(h == "" for h in header):
         raise QueryError("Invalid %s file for table '%s': empty column name in header" % (kind, name))
@@ -818,6 +819,8 @@ def records_to_table(records, name, kind):
 
 def load_json(text, name):
     import json
+    if not text.strip():
+        return None, []
     try:
         obj = json.loads(text, parse_float=Decimal)
     except ValueError as e:
@@ -883,6 +886,8 @@ def load_jsonl(text, name):
             records.append(json.loads(s, parse_float=Decimal))
         except ValueError as e:
             raise QueryError("Invalid JSONL file for table '%s' (line %d): %s" % (name, ln, e))
+    if not records:
+        return None, []
     return records_to_table(records, name, "JSONL")
 
 
@@ -919,19 +924,68 @@ def load_file(path, fmt, comp, name):
 
 
 def load_table(files, name):
+    """Load and concatenate the given files. Empty files (no header/records)
+    contribute nothing; all other files must share the same set of columns.
+    Columns are ordered as in the first non-empty file."""
     header, rows = None, []
     first = None
     for path, fmt, comp in files:
         h, r = load_file(path, fmt, comp, name)
+        if h is None:
+            continue
         if header is None:
             header, first = h, path
-        elif h != header:
+            rows.extend(r)
+        elif h == header:
+            rows.extend(r)
+        elif len(h) == len(header) and set(h) == set(header):
+            perm = [h.index(c) for c in header]
+            rows.extend([row[i] for i in perm] for row in r)
+        else:
             raise QueryError(
                 "Files for table '%s' have different columns: '%s' has [%s] but '%s' has [%s]"
                 % (name, os.path.basename(first), ", ".join(header),
                    os.path.basename(path), ", ".join(h)))
-        rows.extend(r)
+    if header is None:
+        header = []
     return header, rows
+
+
+def parse_sharded(specs):
+    """Parse --sharded NAME=GLOB values into an ordered dict name -> glob."""
+    out = {}
+    for spec in specs or []:
+        if "=" not in spec:
+            raise QueryError("Invalid --sharded value '%s': expected <table_name>=<glob path>" % spec)
+        name, pattern = spec.split("=", 1)
+        name, pattern = name.strip(), pattern.strip()
+        if not name:
+            raise QueryError("Invalid --sharded value '%s': empty table name" % spec)
+        if not pattern:
+            raise QueryError("Invalid --sharded value '%s': empty glob path" % spec)
+        if any(n.lower() == name.lower() for n in out):
+            raise QueryError("Table '%s' specified more than once with --sharded" % name)
+        out[name] = pattern
+    return out
+
+
+def expand_shards(name, pattern, data_dir=None):
+    """Return the list of (path, fmt, compression) matched by a shard glob,
+    in lexicographic order by path."""
+    import glob
+    pattern = os.path.expanduser(pattern)
+    paths = [p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
+    if not paths and data_dir and not os.path.isabs(pattern):
+        # fall back to resolving the pattern relative to the data directory
+        paths = [p for p in glob.glob(os.path.join(data_dir, pattern), recursive=True)
+                 if os.path.isfile(p)]
+    files = []
+    for p in sorted(paths):
+        info = split_data_file(os.path.basename(p))
+        if info is None:
+            raise QueryError("Shard file '%s' for table '%s' has an unsupported format" % (p, name))
+        files.append((p, info[1], info[2]))
+    return files
 
 
 # ---------------------------------------------------------------------------
@@ -1269,8 +1323,13 @@ def output_name(item):
     return item.text
 
 
-def execute(q, data_dir):
-    tables = discover_tables(data_dir)
+def execute(q, data_dir, sharded=None):
+    tables = discover_tables(data_dir) if data_dir else {}
+    for sname, pattern in (sharded or {}).items():
+        # sharded tables take precedence over discovered tables of the same name
+        for t in [t for t in tables if t.lower() == sname.lower()]:
+            del tables[t]
+        tables[sname] = expand_shards(sname, pattern, data_dir)
     scope = Scope()
 
     def load(tref):
@@ -1472,7 +1531,7 @@ def to_markdown(names, rows):
     body = [[md_escape(to_str(v)) for v in r] for r in rows]
     widths = [max([len(hdr[i])] + [len(r[i]) for r in body] + [1]) for i in range(len(hdr))]
     lines = ["| " + " | ".join(h.ljust(w) for h, w in zip(hdr, widths)) + " |",
-             "|" + "|".join("-" * (w + 2) for w in widths) + "|"]
+             "| " + " | ".join("-" * w for w in widths) + " |"]
     for r in body:
         lines.append("| " + " | ".join(v.ljust(w) for v, w in zip(r, widths)) + " |")
     return "\n".join(lines)
@@ -1502,17 +1561,23 @@ def read_sql(arg):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Run read-only SQL queries over CSV/TSV/JSON/JSONL/Parquet files.")
-    ap.add_argument("--data", required=True, help="Directory containing data files (may be nested)")
+    ap.add_argument("--data", help="Directory containing data files (may be nested)")
     ap.add_argument("--sql", required=True, help="SQL query string or path to a .sql file")
     ap.add_argument("--out", help="Optional path to write the result as CSV")
+    ap.add_argument("--sharded", action="append", default=[], metavar="TABLE=GLOB",
+                    help="Combine all files matching GLOB (lexicographic order) into table TABLE; "
+                         "may be given multiple times")
     args = ap.parse_args(argv)
 
     try:
-        if not os.path.isdir(args.data):
+        if args.data is None and not args.sharded:
+            raise QueryError("--data is required unless --sharded is given")
+        if args.data is not None and not os.path.isdir(args.data):
             raise QueryError("Data directory not found: %s" % args.data)
+        sharded = parse_sharded(args.sharded)
         sql = read_sql(args.sql)
         q = Parser(sql).parse()
-        names, rows = execute(q, args.data)
+        names, rows = execute(q, args.data, sharded)
         print(to_markdown(names, rows))
         if args.out:
             write_csv(args.out, names, rows)
