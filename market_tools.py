@@ -12,8 +12,10 @@ import csv
 import gzip
 import io
 import json
+import math
 import os
 import re
+import secrets
 import sys
 import threading
 import zlib
@@ -45,6 +47,10 @@ PRICE_COLUMNS = [
 ]
 STATION_COLUMNS = ["location_id", "type", "name"]
 
+SHIP_CATEGORY = 6
+ASTEROID_CATEGORY = 25  # ore, ice, moon ore (compressed variants included)
+GAS_GROUPS = {711, 4168}  # Harvestable Cloud, Compressed Gas
+
 
 class ApiError(Exception):
     def __init__(self, status: int, error: str, details: str):
@@ -52,6 +58,15 @@ class ApiError(Exception):
         self.status = status
         self.error = error
         self.details = details
+
+
+class JsonError(Exception):
+    """Error with a fully custom JSON payload."""
+
+    def __init__(self, status: int, payload: dict):
+        super().__init__(str(payload))
+        self.status = status
+        self.payload = payload
 
 
 # --------------------------------------------------------------------------- SDE
@@ -75,15 +90,51 @@ class SDE:
         self.station_names: dict[int, str] = {}
         self.station_system: dict[int, int] = {}
         self.station_by_name: dict[str, int] = {}
+        # reprocessing data
+        self.type_group: dict[int, int] = {}
+        self.type_volume: dict[int, float] = {}
+        self.type_portion: dict[int, int] = {}
+        self.type_by_name: dict[str, int] = {}
+        self.type_by_lname: dict[str, int] = {}
+        self.group_category: dict[int, int] = {}
+        self.group_names: dict[int, str] = {}
+        self.materials: dict[int, list[tuple[int, int]]] = {}
+        self.reprocess_skill: dict[int, int] = {}
+        self.ship_volumes: dict[str, float] = {}
 
+        names_rank: dict[str, tuple] = {}
+        lnames_rank: dict[str, tuple] = {}
         f = _open_sde(sde_dir, "invTypes")
         if f:
             with f:
                 for row in csv.DictReader(f):
                     try:
-                        self.type_names[int(row["typeID"])] = row["typeName"]
+                        tid = int(row["typeID"])
+                        self.type_names[tid] = row["typeName"]
                     except (ValueError, KeyError, TypeError):
                         continue
+                    try:
+                        self.type_group[tid] = int(row["groupID"])
+                    except (ValueError, KeyError, TypeError):
+                        pass
+                    try:
+                        self.type_volume[tid] = float(row["volume"])
+                    except (ValueError, KeyError, TypeError):
+                        self.type_volume[tid] = 0.0
+                    try:
+                        self.type_portion[tid] = max(1, int(float(row["portionSize"])))
+                    except (ValueError, KeyError, TypeError):
+                        self.type_portion[tid] = 1
+                    published = row.get("published") == "1"
+                    name = row["typeName"]
+                    rank = (0 if published else 1, tid)
+                    for d, k in ((names_rank, name), (lnames_rank, name.lower())):
+                        cur = d.get(k)
+                        if cur is None or rank < cur:
+                            d[k] = rank
+        self.type_by_name = {k: v[1] for k, v in names_rank.items()}
+        self.type_by_lname = {k: v[1] for k, v in lnames_rank.items()}
+        self._load_reprocessing(sde_dir)
         f = _open_sde(sde_dir, "mapRegions")
         if f:
             with f:
@@ -114,6 +165,93 @@ class SDE:
                         self.station_by_name[row["stationName"]] = st
                     except (ValueError, KeyError, TypeError):
                         continue
+
+    def _load_reprocessing(self, sde_dir: str):
+        f = _open_sde(sde_dir, "invGroups")
+        if f:
+            with f:
+                for row in csv.DictReader(f):
+                    try:
+                        gid = int(row["groupID"])
+                        self.group_category[gid] = int(row["categoryID"])
+                        self.group_names[gid] = row["groupName"]
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        f = _open_sde(sde_dir, "invTypeMaterials")
+        if f:
+            with f:
+                for row in csv.DictReader(f):
+                    try:
+                        tid = int(row["typeID"])
+                        mid = int(row["materialTypeID"])
+                        q = int(float(row["quantity"]))
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    if q > 0:
+                        self.materials.setdefault(tid, []).append((mid, q))
+        f = _open_sde(sde_dir, "dgmTypeAttributes")
+        if f:
+            with f:
+                header = f.readline().strip().split(",")
+                try:
+                    ti, ai = header.index("typeID"), header.index("attributeID")
+                    vi, vf = header.index("valueInt"), header.index("valueFloat")
+                except ValueError:
+                    ti = None
+                if ti is not None:
+                    for line in f:
+                        if ",790," not in line:
+                            continue
+                        parts = line.strip().split(",")
+                        if len(parts) <= max(ti, ai, vi, vf) or parts[ai] != "790":
+                            continue
+                        val = None
+                        for raw in (parts[vi], parts[vf]):
+                            try:
+                                val = int(float(raw))
+                                break
+                            except ValueError:
+                                continue
+                        if val:
+                            try:
+                                self.reprocess_skill[int(parts[ti])] = val
+                            except ValueError:
+                                pass
+        path = os.path.join(sde_dir, "ship_volumes.yaml")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.split("#", 1)[0].rstrip()
+                    if ":" not in line:
+                        continue
+                    k, v = line.rsplit(":", 1)
+                    k = k.strip().strip("'\"")
+                    try:
+                        self.ship_volumes[k] = float(v.strip().strip("'\""))
+                    except ValueError:
+                        continue
+
+    def resolve(self, name: str):
+        tid = self.type_by_name.get(name)
+        if tid is None:
+            tid = self.type_by_lname.get(name.strip().lower())
+        return tid
+
+    def volume(self, tid: int) -> float:
+        gid = self.type_group.get(tid)
+        if gid is not None and self.group_category.get(gid) == SHIP_CATEGORY:
+            gname = self.group_names.get(gid)
+            if gname in self.ship_volumes:
+                return self.ship_volumes[gname]
+        return self.type_volume.get(tid, 0.0)
+
+    def reprocess_class(self, tid: int) -> str:
+        gid = self.type_group.get(tid)
+        if gid in GAS_GROUPS:
+            return "gas"
+        if self.group_category.get(gid) == ASTEROID_CATEGORY or tid in self.reprocess_skill:
+            return "ore"
+        return "scrap"
 
 
 # --------------------------------------------------------------------------- parsing
@@ -311,6 +449,176 @@ def apply_filter(buys, sells, bt, st):
     return fb, fs
 
 
+# --------------------------------------------------------------------------- reprocessing
+
+STRUCTURE_SM = {"npc_station": 0.0, "citadel": 0.0, "athanor": 0.02, "tatara": 0.055}
+RIG_RM = {None: 0.0, "t1": 1.0, "t2": 3.0}
+SECURITY_SEC = {"highsec": 0.0, "lowsec": 0.06, "nullsec": 0.12}
+IMPLANT_IM = {None: 0.0, "RX-801": 0.01, "RX-802": 0.02, "RX-804": 0.04}
+MARKETS = {"jita": "jita", "amarr": "amarr", "dodixie": "dodixie", "rens": "rens", "hek": "hek"}
+DEFAULT_EFFICIENCY = {"ore": 0.9063, "gas": 0.95, "scrap": 0.55}
+
+
+def _invalid(path: str, message: str):
+    return JsonError(404, {"code": "INVALID_VALUE", "path": path, "message": message})
+
+
+def _bad_request(path: str, message: str):
+    return JsonError(400, {"error": "INVALID_FORMAT", "details": message,
+                           "code": "INVALID_VALUE", "path": path, "message": message})
+
+
+def _enum(value, allowed, path, default):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        if value in allowed:
+            return value
+        low = {a.lower(): a for a in allowed if isinstance(a, str)}
+        if value.strip().lower() in low:
+            return low[value.strip().lower()]
+    opts = ", ".join("null" if a is None else repr(a) for a in allowed)
+    raise _invalid(path, f"Invalid value {value!r} for {path}; expected one of: {opts}")
+
+
+def parse_config(body) -> dict:
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise _invalid("", "Config body must be a JSON object")
+    structure = body.get("structure")
+    if structure is None:
+        structure = {}
+    if not isinstance(structure, dict):
+        raise _invalid("structure", "structure must be an object or null")
+    stype = _enum(structure.get("type"), list(STRUCTURE_SM), "structure.type", "npc_station")
+    rig_raw = structure.get("rig")
+    rig = _enum(rig_raw, [r for r in RIG_RM if r is not None], "structure.rig", None) if rig_raw is not None else None
+    if stype == "npc_station" and rig is not None:
+        raise _invalid("structure.rig", "npc_station cannot specify a rig; rig must be null")
+    sec = _enum(structure.get("security"), list(SECURITY_SEC), "structure.security", "highsec")
+    skills_raw = body.get("skills")
+    if skills_raw is None:
+        skills_raw = {}
+    if not isinstance(skills_raw, dict):
+        raise _invalid("skills", "skills must be an object mapping skill names to levels 0-5")
+    skills = {}
+    for name, lvl in skills_raw.items():
+        path = f"skills.{name}"
+        if lvl is None:
+            lvl = 0
+        if isinstance(lvl, bool) or not isinstance(lvl, (int, float)) or (isinstance(lvl, float) and not lvl.is_integer()):
+            raise _invalid(path, f"Skill level for {name!r} must be an integer 0-5, got {lvl!r}")
+        lvl = int(lvl)
+        if lvl < 0 or lvl > 5:
+            raise _invalid(path, f"Skill level for {name!r} must be between 0 and 5, got {lvl}")
+        skills[name] = lvl
+    imp_raw = body.get("implant")
+    implant = _enum(imp_raw, [i for i in IMPLANT_IM if i is not None], "implant", None) if imp_raw is not None else None
+    return {"type": stype, "rig": rig, "security": sec, "skills": skills, "implant": implant}
+
+
+def _skill(skills: dict, name: str) -> int:
+    if name in skills:
+        return skills[name]
+    low = name.lower()
+    for k, v in skills.items():
+        if k.lower() == low:
+            return v
+    return 0
+
+
+def config_yield(cfg: dict, op_level: int) -> float:
+    rm = RIG_RM[cfg["rig"]]
+    sec = SECURITY_SEC[cfg["security"]]
+    sm = STRUCTURE_SM[cfg["type"]]
+    r = _skill(cfg["skills"], "Reprocessing")
+    re_ = _skill(cfg["skills"], "Reprocessing Efficiency")
+    im = IMPLANT_IM[cfg["implant"]]
+    y = ((50 + rm) * (1 + sec) * (1 + sm) * (1 + r * 0.03) * (1 + re_ * 0.02)
+         * (1 + op_level * 0.02) * (1 + im))
+    return round(round(y, 2) / 100.0, 4)
+
+
+def config_scrap_yield(cfg: dict) -> float:
+    return round((50 + _skill(cfg["skills"], "Scrapmetal Processing")) / 100.0, 4)
+
+
+class YieldModel:
+    def __init__(self, sde: SDE, efficiency: dict | None = None, cfg: dict | None = None):
+        self.sde = sde
+        self.eff = efficiency
+        self.cfg = cfg
+        self.used: dict[str, list[float]] = {"ore": [], "gas": [], "scrap": []}
+
+    def for_type(self, tid: int) -> float:
+        cls = self.sde.reprocess_class(tid)
+        if self.cfg is None:
+            y = self.eff[cls]
+        elif cls == "scrap":
+            y = config_scrap_yield(self.cfg)
+        else:
+            op = 0
+            sk = self.sde.reprocess_skill.get(tid)
+            if sk is not None and cls == "ore":
+                sname = self.sde.type_names.get(sk)
+                if sname:
+                    op = _skill(self.cfg["skills"], sname)
+            y = config_yield(self.cfg, op)
+        self.used[cls].append(y)
+        return y
+
+    def report(self) -> dict:
+        out = {}
+        for cls in ("ore", "gas", "scrap"):
+            if self.used[cls]:
+                out[cls] = min(self.used[cls])
+            elif self.cfg is None:
+                out[cls] = self.eff[cls]
+            elif cls == "scrap":
+                out[cls] = config_scrap_yield(self.cfg)
+            else:
+                out[cls] = config_yield(self.cfg, 0)
+        return out
+
+
+def reprocess(sde: SDE, items: dict[int, int], model: YieldModel, drill_down: bool) -> dict[int, int]:
+    def can(tid, q):
+        return tid in sde.materials and q >= sde.type_portion.get(tid, 1)
+
+    products: dict[int, int] = {}
+    pending = dict(items)
+    while True:
+        work = {t: q for t, q in pending.items() if can(t, q)}
+        if not work:
+            for t, q in pending.items():
+                if q > 0:
+                    products[t] = products.get(t, 0) + q
+            break
+        new: dict[int, int] = {}
+        for t, q in pending.items():
+            if t not in work and q > 0:
+                new[t] = new.get(t, 0) + q
+        for t, q in work.items():
+            portion = sde.type_portion.get(t, 1)
+            n = q // portion
+            left = q - n * portion
+            if left:
+                new[t] = new.get(t, 0) + left
+            y = model.for_type(t)
+            for mid, mq in sde.materials[t]:
+                out = int(math.floor(mq * n * y + 1e-9))
+                if out > 0:
+                    new[mid] = new.get(mid, 0) + out
+        if not drill_down:
+            for t, q in new.items():
+                if q > 0:
+                    products[t] = products.get(t, 0) + q
+            break
+        pending = new
+    return products
+
+
 # --------------------------------------------------------------------------- state
 
 
@@ -324,6 +632,7 @@ class State:
         self._cache_version = -1
         self._merged: dict[int, Order] = {}
         self._by_region: dict[int, list[Order]] = {}
+        self.api_keys: dict[str, dict] = {}
 
         self.hub_ids: dict[str, int] = {}
         for key, name in HUBS:
@@ -403,6 +712,134 @@ class State:
     def region_orders(self, region_id: int) -> list[Order]:
         self._rebuild()
         return self._by_region.get(region_id, [])
+
+    # ---- reprocessing
+    def create_config(self, body) -> str:
+        cfg = parse_config(body)
+        key = secrets.token_hex(16)
+        with self.lock:
+            self.api_keys[key] = cfg
+        return key
+
+    def _hub_prices(self, market_key: str):
+        """Return a pricing function for the hub, or None if no data loaded."""
+        with self.lock:
+            self._rebuild()
+            hid = self.hub_ids[market_key]
+            at_hub = [o for o in self._merged.values() if o.location_id == hid]
+            if not at_hub and market_key in self.books:
+                at_hub = list(self.books[market_key].values())
+            if not at_hub:
+                return None
+        by_type: dict[int, tuple[list, list]] = {}
+        for o in at_hub:
+            b, s_ = by_type.setdefault(o.type_id, ([], []))
+            (b if o.is_buy else s_).append(o)
+        cache: dict[int, tuple] = {}
+
+        def price(tid: int):
+            if tid in cache:
+                return cache[tid]
+            buys, sells = by_type.get(tid, ([], []))
+            bt, st = thresholds(buys, sells)
+            fb, fs = apply_filter(buys, sells, bt, st)
+            res = (
+                max((o.price for o in fb), default=None),
+                min((o.price for o in fs), default=None),
+                five_pct(fb, True),
+                five_pct(fs, False),
+            )
+            cache[tid] = res
+            return res
+
+        return price
+
+    def reprocess(self, body, api_key):
+        cfg = None
+        if api_key is not None and api_key.strip() != "":
+            with self.lock:
+                cfg = self.api_keys.get(api_key.strip())
+            if cfg is None:
+                raise JsonError(401, {"code": "BAD_API_KEY"})
+        if not isinstance(body, dict):
+            raise _bad_request("", "Request body must be a JSON object")
+        items = body.get("items")
+        if not isinstance(items, dict) or not items:
+            raise _bad_request("items", "items must be a non-empty object mapping item names to quantities")
+        for name, q in items.items():
+            if isinstance(q, bool) or not isinstance(q, (int, float)) or (isinstance(q, float) and not q.is_integer()) or q <= 0:
+                raise _bad_request(f"items.{name}", f"Quantity for {name!r} must be a positive integer, got {q!r}")
+        eff_raw = body.get("efficiency")
+        if eff_raw is None:
+            eff_raw = {}
+        if not isinstance(eff_raw, dict):
+            raise _bad_request("efficiency", "efficiency must be an object")
+        eff = dict(DEFAULT_EFFICIENCY)
+        for k in ("ore", "gas", "scrap"):
+            v = eff_raw.get(k)
+            if v is None:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 <= v <= 1):
+                raise _bad_request(f"efficiency.{k}", f"efficiency.{k} must be a number between 0 and 1, got {v!r}")
+            eff[k] = float(v)
+        drill = body.get("drill_down", False)
+        if drill is None:
+            drill = False
+        if not isinstance(drill, bool):
+            raise _bad_request("drill_down", "drill_down must be a boolean")
+        if "market" in body:
+            mraw = body["market"]
+            if mraw is None:
+                market = None
+            elif isinstance(mraw, str) and mraw.strip().lower() in MARKETS:
+                market = MARKETS[mraw.strip().lower()]
+            else:
+                raise _bad_request("market", f"market must be one of Jita, Amarr, Dodixie, Rens, Hek or null, got {mraw!r}")
+        else:
+            market = "jita"
+
+        resolved: dict[int, int] = {}
+        unknown = []
+        for name, q in items.items():
+            tid = self.sde.resolve(name) if isinstance(name, str) else None
+            if tid is None:
+                unknown.append(name)
+                continue
+            resolved[tid] = resolved.get(tid, 0) + int(q)
+        if unknown:
+            raise JsonError(404, {"error": "UNKNOWN_ITEMS", "details": sorted(unknown)})
+
+        model = YieldModel(self.sde, efficiency=eff, cfg=cfg)
+        products = reprocess(self.sde, resolved, model, drill)
+        price = self._hub_prices(market) if market is not None else None
+
+        def summary(qtys: dict[int, int]):
+            vol = sum(q * self.sde.volume(t) for t, q in qtys.items())
+            out = {"volume": round(vol, 2), "buy": None, "sell": None, "buy_5pct": None, "sell_5pct": None}
+            if price is not None:
+                tot = [0.0, 0.0, 0.0, 0.0]
+                for t, q in qtys.items():
+                    for i, p in enumerate(price(t)):
+                        if p is not None:
+                            tot[i] += q * p
+                out["buy"], out["sell"], out["buy_5pct"], out["sell_5pct"] = (round(x, 2) for x in tot)
+            return out
+
+        prod_out = {}
+        for t, q in sorted(products.items(), key=lambda kv: self.sde.type_names.get(kv[0], "")):
+            entry = {"quantity": q, "volume": round(q * self.sde.volume(t), 2), "buy": None, "sell": None}
+            if price is not None:
+                b, s_, _b5, _s5 = price(t)
+                entry["buy"] = round(q * b, 2) if b is not None else None
+                entry["sell"] = round(q * s_, 2) if s_ is not None else None
+            prod_out[self.sde.type_names.get(t, str(t))] = entry
+
+        return {
+            "inputs": summary(resolved),
+            "outputs": summary(products),
+            "yields": model.report(),
+            "products": prod_out,
+        }
 
     # ---- endpoints
     def _check_region(self, region_id: int):
@@ -651,6 +1088,15 @@ def make_handler(state: State):
                 return b"".join(chunks)
             return b""
 
+        def _json_body(self, err):
+            raw = self._body()
+            if not raw.strip():
+                return None
+            try:
+                return json.loads(raw.decode("utf-8-sig"))
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise err(f"Request body is not valid JSON: {exc}")
+
         def _opt(self, params, name, default=None):
             if name in params and params[name]:
                 return params[name][-1]
@@ -703,9 +1149,18 @@ def make_handler(state: State):
                     except ValueError:
                         raise ApiError(404, "UNKNOWN_ITEMS", f"Unknown type: {parts[2]}")
                     return self._send(200, state.hub_compare(type_id))
+                if method == "POST" and parts == ["v1", "config"]:
+                    body = self._json_body(lambda m: _invalid("", m))
+                    return self._send(201, {"key": state.create_config(body)})
+                if method == "POST" and parts == ["v1", "reprocess"]:
+                    api_key = self.headers.get("X-API-Key")
+                    body = self._json_body(lambda m: _bad_request("", m))
+                    return self._send(201, state.reprocess(body, api_key))
                 if method == "POST":
                     self._body()
                 return self._send(404, {"error": "NOT_FOUND", "details": f"No route for {method} {url.path}"})
+            except JsonError as exc:
+                return self._send(exc.status, exc.payload)
             except ApiError as exc:
                 return self._send(exc.status, {"error": exc.error, "details": exc.details})
             except Exception as exc:  # pragma: no cover
